@@ -1,3 +1,13 @@
+<a name="2.4.1"></a>
+## 2.4.1 (next)
+
+#### Features
+
+* Add `sasl_server_principal` to `kazoo.client.Client`, which enables kazoo to
+  authenticate against a kerberized Zookeeper.
+
+
+
 <a name="2.4.0"></a>
 ## 2.4.0 (2017-06-14)
 
@@ -29,6 +39,7 @@ multiple endpoint support for KazooClient may not work correctly on 2.6.
 
 *   update MANIFEST.in to reflect changes to filenames ([c9a38c5d](https://github.com/python-zk/kazoo/commit/c9a38c5d650d6d92ff30fd3c1c792fc71db9ce02))
 *   add travis deployment and update ZK versions ([7d5d59cb](https://github.com/python-zk/kazoo/commit/7d5d59cb049244b89625d621c9d91d9a44c4b051), closes [#436](https://github.com/python-zk/kazoo/issues/436))
+
 
 2.3.0 (2017-05-31)
 ------------------
@@ -640,4 +651,3 @@ and/or the C binding.
     under the name 'Zookeeper'.
 -   Base client library with handler support for threading and gevent
     async environments.
-

@@ -104,8 +104,8 @@ class KazooClient(object):
     """
     def __init__(self, hosts='127.0.0.1:2181',
                  timeout=10.0, client_id=None, handler=None,
-                 default_acl=None, auth_data=None, read_only=None,
-                 randomize_hosts=True, connection_retry=None,
+                 default_acl=None, auth_data=None, sasl_data=None,
+                 read_only=None, randomize_hosts=True, connection_retry=None,
                  command_retry=None, logger=None, **kwargs):
         """Create a :class:`KazooClient` instance. All time arguments
         are in seconds.
@@ -123,6 +123,10 @@ class KazooClient(object):
             A list of authentication credentials to use for the
             connection. Should be a list of (scheme, credential)
             tuples as :meth:`add_auth` takes.
+        :param sasl_data:
+            SASL options for the connection. Should be a dict of SASL options
+            passed to the underlying mechs.
+            XXX
         :param read_only: Allow connections to read only servers.
         :param randomize_hosts: By default randomize host selection.
         :param connection_retry:
@@ -262,7 +266,8 @@ class KazooClient(object):
 
         self._conn_retry.interrupt = lambda: self._stopped.is_set()
         self._connection = ConnectionHandler(
-            self, self._conn_retry.copy(), logger=self.logger)
+            self, self._conn_retry.copy(), logger=self.logger,
+            sasl_data=sasl_data)
 
         # Every retry call should have its own copy of the retry helper
         # to avoid shared retry counts

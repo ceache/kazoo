@@ -37,6 +37,7 @@ if on_rtd:
     install_requires.extend([
         'gevent',
         'eventlet',
+        'pure-sasl'
     ])
 
 setup(
@@ -75,5 +76,6 @@ setup(
     tests_require=tests_require,
     extras_require={
         'test': tests_require,
+        'sasl': ['pure-sasl'],
     },
 )
