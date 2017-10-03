@@ -44,6 +44,7 @@ from kazoo.retry import (
 
 try:
     import puresasl as sasl
+    from puresasl import client as sasl_client
     _has_sasl = True
 except ImportError:
     _has_sasl = False
@@ -676,7 +677,7 @@ class ConnectionHandler(object):
         # XXX:     # For GSSAPI:
         # XXX:     'client_principal': '<principal to use from keytab>'
         # XXX: }
-        saslc = sasl.client.SASLClient(
+        saslc = sasl_client.SASLClient(
             host,
             service=self.sasl_data['service'],
             principal=self.sasl_data.get('client_principal', None),
