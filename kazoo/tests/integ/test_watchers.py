@@ -1,28 +1,23 @@
-import time
 import threading
+import time
 import uuid
 
 import pytest
 
+from kazoo.client import KazooClient
 from kazoo.exceptions import KazooException
 from kazoo.protocol.states import EventType
-from kazoo.testing import KazooTestCase
 
-
-class KazooDataWatcherTests(KazooTestCase):
-    def setUp(self):
-        super(KazooDataWatcherTests, self).setUp()
-        self.path = "/" + uuid.uuid4().hex
-        self.client.ensure_path(self.path)
-
-    def test_data_watcher(self):
-        update = threading.Event()
+class KazooDataWatcherTests:
+    def test_data_watcher(self, zkensemble):
+        client: KazooClient = zkensemble.get_client()
+        update = client.handler.event_object()
         data = [True]
 
         # Make it a non-existent path
         self.path += "f"
 
-        @self.client.DataWatch(self.path)
+        @client.DataWatch(self.path)
         def changed(d, stat):
             data.pop()
             data.append(d)
@@ -279,12 +274,7 @@ class KazooDataWatcherTests(KazooTestCase):
         assert b is False
 
 
-class KazooChildrenWatcherTests(KazooTestCase):
-    def setUp(self):
-        super(KazooChildrenWatcherTests, self).setUp()
-        self.path = "/" + uuid.uuid4().hex
-        self.client.ensure_path(self.path)
-
+class KazooChildrenWatcherTests:
     def test_child_watcher(self):
         update = threading.Event()
         all_children = ["fred"]
@@ -494,11 +484,7 @@ class KazooChildrenWatcherTests(KazooTestCase):
         assert sorted(children) == ["george", "smith"]
 
 
-class KazooPatientChildrenWatcherTests(KazooTestCase):
-    def setUp(self):
-        super(KazooPatientChildrenWatcherTests, self).setUp()
-        self.path = "/" + uuid.uuid4().hex
-
+class KazooPatientChildrenWatcherTests:
     def _makeOne(self, *args, **kwargs):
         from kazoo.recipe.watchers import PatientChildrenWatch
 

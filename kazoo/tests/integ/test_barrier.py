@@ -1,41 +1,44 @@
+from __future__ import annotations
+
 import threading
 
-from kazoo.testing import KazooTestCase
+# from kazoo.testing import KazooTestCase
+import pytest
 
 
-class KazooBarrierTests(KazooTestCase):
-    def test_barrier_not_exist(self):
-        b = self.client.Barrier("/some/path")
+class TestKazooBarrier:
+    def test_barrier_not_exist(self, zkclient):
+        b = zkclient.Barrier("/some/path")
         assert b.wait()
 
-    def test_barrier_exists(self):
-        b = self.client.Barrier("/some/path")
+    def test_barrier_exists(self, zkclient):
+        b = zkclient.Barrier("/some/path")
         b.create()
         assert not b.wait(0)
         b.remove()
         assert b.wait()
 
-    def test_remove_nonexistent_barrier(self):
-        b = self.client.Barrier("/some/path")
+    def test_remove_nonexistent_barrier(self, zkclient):
+        b = zkclient.Barrier("/some/path")
         assert not b.remove()
 
 
-class KazooDoubleBarrierTests(KazooTestCase):
-    def test_basic_barrier(self):
-        b = self.client.DoubleBarrier("/some/path", 1)
+class TestKazooDoubleBarrierTests:
+    def test_basic_barrier(self, zkclient):
+        b = zkclient.DoubleBarrier("/some/path", 1)
         assert not b.participating
         b.enter()
         assert b.participating
         b.leave()
         assert not b.participating
 
-    def test_two_barrier(self):
+    def test_two_barrier(self, zkclient):
         av = threading.Event()
         ev = threading.Event()
         bv = threading.Event()
         release_all = threading.Event()
-        b1 = self.client.DoubleBarrier("/some/path", 2)
-        b2 = self.client.DoubleBarrier("/some/path", 2)
+        b1 = zkclient.DoubleBarrier("/some/path", 2)
+        b2 = zkclient.DoubleBarrier("/some/path", 2)
 
         def make_barrier_one():
             b1.enter()
@@ -78,14 +81,14 @@ class KazooDoubleBarrierTests(KazooTestCase):
         t1.join()
         t2.join()
 
-    def test_three_barrier(self):
+    def test_three_barrier(self, zkclient):
         av = threading.Event()
         ev = threading.Event()
         bv = threading.Event()
         release_all = threading.Event()
-        b1 = self.client.DoubleBarrier("/some/path", 3)
-        b2 = self.client.DoubleBarrier("/some/path", 3)
-        b3 = self.client.DoubleBarrier("/some/path", 3)
+        b1 = zkclient.DoubleBarrier("/some/path", 3)
+        b2 = zkclient.DoubleBarrier("/some/path", 3)
+        b3 = zkclient.DoubleBarrier("/some/path", 3)
 
         def make_barrier_one():
             b1.enter()
@@ -135,19 +138,19 @@ class KazooDoubleBarrierTests(KazooTestCase):
         t1.join()
         t2.join()
 
-    def test_barrier_existing_parent_node(self):
-        b = self.client.DoubleBarrier("/some/path", 1)
+    def test_barrier_existing_parent_node(self, zkclient):
+        b = zkclient.DoubleBarrier("/some/path", 1)
         assert b.participating is False
-        self.client.create("/some", ephemeral=True)
+        zkclient.create("/some", ephemeral=True)
         # the barrier cannot create children under an ephemeral node
         b.enter()
         assert b.participating is False
 
-    def test_barrier_existing_node(self):
-        b = self.client.DoubleBarrier("/some", 1)
+    def test_barrier_existing_node(self, zkclient):
+        b = zkclient.DoubleBarrier("/some", 1)
         assert b.participating is False
-        self.client.ensure_path(b.path)
-        self.client.create(b.create_path, ephemeral=True)
+        zkclient.ensure_path(b.path)
+        zkclient.create(b.create_path, ephemeral=True)
         # the barrier will re-use an existing node
         b.enter()
         assert b.participating is True

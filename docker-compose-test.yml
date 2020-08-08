@@ -1,0 +1,42 @@
+version: '3'
+
+volumes:
+ # kdc_data_vol:
+ #   driver_opts:
+ #     type: tmpfs
+ #     device: tmpfs
+
+  zoo1_data_vol:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+
+  zoo2_data_vol:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+
+  zoo3_data_vol:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+
+services:
+    # kdc:
+    #   build:
+    #     context: ../dockerfiles/kdc
+    #     dockerfile: Dockerfile
+    #   container_name: kdc
+    #   image: kdc-latest
+    #   hostname: kdc
+    #   ports:
+    #     - 1088:1088
+    #   environment:
+    #     SPNS: "client server/zoo1 server/zoo2 server/zoo3"
+    #   volumes:
+    #     - kdc_data_vol:/kdc-data
+
+  foo:
+    image: alpine:3.12
+    command: /bin/sleep 300
+    restart: always

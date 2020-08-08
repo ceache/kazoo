@@ -1,11 +1,12 @@
 """Kazoo Zookeeper Client"""
-from collections import defaultdict, deque
-from functools import partial
+
 import inspect
 import logging
-from os.path import split
 import re
 import warnings
+from collections import defaultdict, deque
+from functools import partial
+from os.path import split
 
 from kazoo.exceptions import (
     AuthFailedError,
@@ -13,8 +14,8 @@ from kazoo.exceptions import (
     ConnectionClosedError,
     ConnectionLoss,
     KazooException,
-    NoNodeError,
     NodeExistsError,
+    NoNodeError,
     SessionExpiredError,
     WriterNotClosedException,
 )
@@ -32,12 +33,12 @@ from kazoo.protocol.serialization import (
     Create2,
     Delete,
     Exists,
+    GetACL,
     GetChildren,
     GetChildren2,
-    GetACL,
-    SetACL,
     GetData,
     Reconfig,
+    SetACL,
     SetData,
     Sync,
     Transaction,
@@ -49,20 +50,19 @@ from kazoo.protocol.states import (
     KeeperState,
     WatchedEvent,
 )
-from kazoo.retry import KazooRetry
-from kazoo.security import ACL, OPEN_ACL_UNSAFE
 
 # convenience API
 from kazoo.recipe.barrier import Barrier, DoubleBarrier
 from kazoo.recipe.counter import Counter
 from kazoo.recipe.election import Election
-from kazoo.recipe.lease import NonBlockingLease, MultiNonBlockingLease
-from kazoo.recipe.lock import Lock, ReadLock, WriteLock, Semaphore
+from kazoo.recipe.lease import MultiNonBlockingLease, NonBlockingLease
+from kazoo.recipe.lock import Lock, ReadLock, Semaphore, WriteLock
 from kazoo.recipe.partitioner import SetPartitioner
 from kazoo.recipe.party import Party, ShallowParty
-from kazoo.recipe.queue import Queue, LockingQueue
+from kazoo.recipe.queue import LockingQueue, Queue
 from kazoo.recipe.watchers import ChildrenWatch, DataWatch
-
+from kazoo.retry import KazooRetry
+from kazoo.security import ACL, OPEN_ACL_UNSAFE
 
 CLOSED_STATES = (
     KeeperState.EXPIRED_SESSION,
@@ -287,8 +287,7 @@ class KazooClient(object):
         if type(self._conn_retry) is KazooRetry:
             if self.handler.sleep_func != self._conn_retry.sleep_func:
                 raise ConfigurationError(
-                    "Retry handler and event handler "
-                    " must use the same sleep func"
+                    "Retry handler and event handler  must use the same sleep func"
                 )
 
         if type(self.retry) is KazooRetry:
@@ -332,9 +331,7 @@ class KazooClient(object):
             if scheme != "sasl":
                 continue
             if sasl_options:
-                raise ConfigurationError(
-                    "Multiple SASL configurations provided"
-                )
+                raise ConfigurationError("Multiple SASL configurations provided")
             warnings.warn(
                 "Passing SASL configuration as part of the auth_data is "
                 "deprecated, please use the sasl_options configuration "
@@ -353,11 +350,7 @@ class KazooClient(object):
             }
         # Cleanup
         self.auth_data = set(
-            [
-                (scheme, auth)
-                for scheme, auth in self.auth_data
-                if scheme != "sasl"
-            ]
+            [(scheme, auth) for scheme, auth in self.auth_data if scheme != "sasl"]
         )
 
         self._conn_retry.interrupt = lambda: self._stopped.is_set()
@@ -398,8 +391,7 @@ class KazooClient(object):
         # If we got any unhandled keywords, complain like Python would
         if kwargs:
             raise TypeError(
-                "__init__() got unexpected keyword arguments: %s"
-                % (kwargs.keys(),)
+                "__init__() got unexpected keyword arguments: %s" % (kwargs.keys(),)
             )
 
     def _reset(self):
@@ -499,7 +491,7 @@ class KazooClient(object):
 
         if self.chroot is not None and new_chroot != self.chroot:
             raise ConfigurationError(
-                "Changing chroot at runtime is not " "currently supported"
+                "Changing chroot at runtime is not currently supported"
             )
 
         self.chroot = new_chroot
@@ -562,9 +554,7 @@ class KazooClient(object):
             return
 
         if state in (KeeperState.CONNECTED, KeeperState.CONNECTED_RO):
-            self.logger.info(
-                "Zookeeper connection established, " "state: %s", state
-            )
+            self.logger.info("Zookeeper connection established, state: %s", state)
             self._live.set()
             self._make_state_change(KazooState.CONNECTED)
         elif state in CLOSED_STATES:
@@ -1038,12 +1028,8 @@ class KazooClient(object):
 
         if not isinstance(path, str):
             raise TypeError("Invalid type for 'path' (string expected)")
-        if acl and (
-            isinstance(acl, ACL) or not isinstance(acl, (tuple, list))
-        ):
-            raise TypeError(
-                "Invalid type for 'acl' (acl must be a tuple/list" " of ACL's"
-            )
+        if acl and (isinstance(acl, ACL) or not isinstance(acl, (tuple, list))):
+            raise TypeError("Invalid type for 'acl' (acl must be a tuple/list of ACL's")
         if value is not None and not isinstance(value, bytes):
             raise TypeError("Invalid type for 'value' (must be a byte string)")
         if not isinstance(ephemeral, bool):
@@ -1213,9 +1199,7 @@ class KazooClient(object):
             raise TypeError("Invalid type for 'watch' (must be a callable)")
 
         async_result = self.handler.async_result()
-        self._call(
-            Exists(_prefix_root(self.chroot, path), watch), async_result
-        )
+        self._call(Exists(_prefix_root(self.chroot, path), watch), async_result)
         return async_result
 
     def get(self, path, watch=None):
@@ -1256,9 +1240,7 @@ class KazooClient(object):
             raise TypeError("Invalid type for 'watch' (must be a callable)")
 
         async_result = self.handler.async_result()
-        self._call(
-            GetData(_prefix_root(self.chroot, path), watch), async_result
-        )
+        self._call(GetData(_prefix_root(self.chroot, path), watch), async_result)
         return async_result
 
     def get_children(self, path, watch=None, include_data=False):
@@ -1395,7 +1377,7 @@ class KazooClient(object):
             raise TypeError("Invalid type for 'path' (string expected)")
         if isinstance(acls, ACL) or not isinstance(acls, (tuple, list)):
             raise TypeError(
-                "Invalid type for 'acl' (acl must be a tuple/list" " of ACL's)"
+                "Invalid type for 'acl' (acl must be a tuple/list of ACL's)"
             )
         if not isinstance(version, int):
             raise TypeError("Invalid type for 'version' (int expected)")
@@ -1530,9 +1512,7 @@ class KazooClient(object):
         if not isinstance(version, int):
             raise TypeError("Invalid type for 'version' (int expected)")
         async_result = self.handler.async_result()
-        self._call(
-            Delete(_prefix_root(self.chroot, path), version), async_result
-        )
+        self._call(Delete(_prefix_root(self.chroot, path), version), async_result)
         return async_result
 
     def _delete_recursive(self, path):
@@ -1622,9 +1602,7 @@ class KazooClient(object):
             returns a non-zero error code.
 
         """
-        result = self.reconfig_async(
-            joining, leaving, new_members, from_config
-        )
+        result = self.reconfig_async(joining, leaving, new_members, from_config)
         return result.get()
 
     def reconfig_async(self, joining, leaving, new_members, from_config):
@@ -1639,9 +1617,7 @@ class KazooClient(object):
         if leaving and not isinstance(leaving, str):
             raise TypeError("Invalid type for 'leaving' (string expected)")
         if new_members and not isinstance(new_members, str):
-            raise TypeError(
-                "Invalid type for 'new_members' (string " "expected)"
-            )
+            raise TypeError("Invalid type for 'new_members' (string expected)")
         if not isinstance(from_config, int):
             raise TypeError("Invalid type for 'from_config' (int expected)")
 
@@ -1679,9 +1655,7 @@ class TransactionRequest(object):
         self.operations = []
         self.committed = False
 
-    def create(
-        self, path, value=b"", acl=None, ephemeral=False, sequence=False
-    ):
+    def create(self, path, value=b"", acl=None, ephemeral=False, sequence=False):
         """Add a create ZNode to the transaction. Takes the same
         arguments as :meth:`KazooClient.create`, with the exception
         of `makepath`.
@@ -1695,9 +1669,7 @@ class TransactionRequest(object):
         if not isinstance(path, str):
             raise TypeError("Invalid type for 'path' (string expected)")
         if acl and not isinstance(acl, (tuple, list)):
-            raise TypeError(
-                "Invalid type for 'acl' (acl must be a tuple/list" " of ACL's"
-            )
+            raise TypeError("Invalid type for 'acl' (acl must be a tuple/list of ACL's")
         if not isinstance(value, bytes):
             raise TypeError("Invalid type for 'value' (must be a byte string)")
         if not isinstance(ephemeral, bool):
@@ -1741,9 +1713,7 @@ class TransactionRequest(object):
             raise TypeError("Invalid type for 'value' (must be a byte string)")
         if not isinstance(version, int):
             raise TypeError("Invalid type for 'version' (int expected)")
-        self._add(
-            SetData(_prefix_root(self.client.chroot, path), value, version)
-        )
+        self._add(SetData(_prefix_root(self.client.chroot, path), value, version))
 
     def check(self, path, version):
         """Add a Check Version to the transaction.
@@ -1756,9 +1726,7 @@ class TransactionRequest(object):
             raise TypeError("Invalid type for 'path' (string expected)")
         if not isinstance(version, int):
             raise TypeError("Invalid type for 'version' (int expected)")
-        self._add(
-            CheckVersion(_prefix_root(self.client.chroot, path), version)
-        )
+        self._add(CheckVersion(_prefix_root(self.client.chroot, path), version))
 
     def commit_async(self):
         """Commit the transaction asynchronously.

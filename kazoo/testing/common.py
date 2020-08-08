@@ -21,9 +21,6 @@
 
 
 import code
-from collections import namedtuple
-from glob import glob
-from itertools import chain
 import logging
 import os
 import os.path
@@ -33,10 +30,12 @@ import signal
 import subprocess
 import tempfile
 import traceback
+from collections import namedtuple
+from glob import glob
+from itertools import chain
 
-import OpenSSL
 import jks
-
+import OpenSSL
 
 log = logging.getLogger(__name__)
 
@@ -120,8 +119,9 @@ class ManagedZooKeeper(object):
         """
         if self.running:
             return
-        config_path = os.path.join(self.working_path, "zoo.cfg")
-        jaas_config_path = os.path.join(self.working_path, "jaas.conf")
+        config_path = os.path.join(self.working_path, "conf")
+        zoo_config_path = os.path.join(config_path, "zoo.cfg")
+        jaas_config_path = os.path.join(config_path, "jaas.conf")
         log_path = os.path.join(self.working_path, "log")
         log4j_path = os.path.join(self.working_path, "log4j.properties")
         data_path = os.path.join(self.working_path, "data")
@@ -131,21 +131,23 @@ class ManagedZooKeeper(object):
         # various setup steps
         if not os.path.exists(self.working_path):
             os.mkdir(self.working_path)
+        if not os.path.exists(config_path):
+            os.mkdir(config_path)
         if not os.path.exists(log_path):
             os.mkdir(log_path)
         if not os.path.exists(data_path):
             os.mkdir(data_path)
 
-        try:
-            self.ssl_configuration["truststore"].save(
-                truststore_path, "apassword"
-            )
-            self.ssl_configuration["keystore"].save(keystore_path, "apassword")
-        except Exception:
-            log.exception("Unable to perform SSL configuration: ")
-            raise
+        # try:
+        #     self.ssl_configuration["truststore"].save(
+        #         truststore_path, "apassword"
+        #     )
+        #     self.ssl_configuration["keystore"].save(keystore_path, "apassword")
+        # except Exception:
+        #     log.exception("Unable to perform SSL configuration: ")
+        #     raise
 
-        with open(config_path, "w") as config:
+        with open(zoo_config_path, "w") as config:
             config.write(
                 """
 tickTime=2000
@@ -272,20 +274,12 @@ log4j.appender.ROLLINGFILE.File="""
             jars.extend(glob(os.path.join(self.install_path, "*.jar")))
             # support for different file locations on Debian/Ubuntu
             jars.extend(glob(os.path.join(self.install_path, "log4j-*.jar")))
-            jars.extend(
-                glob(os.path.join(self.install_path, "slf4j-api-*.jar"))
-            )
-            jars.extend(
-                glob(os.path.join(self.install_path, "slf4j-log4j*.jar"))
-            )
+            jars.extend(glob(os.path.join(self.install_path, "slf4j-api-*.jar")))
+            jars.extend(glob(os.path.join(self.install_path, "slf4j-log4j*.jar")))
         else:
             # Development build (plain `ant`)
-            jars = glob(
-                (os.path.join(self.install_path, "build", "zookeeper-*.jar"))
-            )
-            jars.extend(
-                glob(os.path.join(self.install_path, "build", "lib", "*.jar"))
-            )
+            jars = glob((os.path.join(self.install_path, "build", "zookeeper-*.jar")))
+            jars.extend(glob(os.path.join(self.install_path, "build", "lib", "*.jar")))
 
         return os.pathsep.join(jars)
 
