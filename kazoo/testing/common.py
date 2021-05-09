@@ -100,8 +100,9 @@ class ManagedZooKeeper(object):
         """
         if self.running:
             return
-        config_path = os.path.join(self.working_path, "zoo.cfg")
-        jaas_config_path = os.path.join(self.working_path, "jaas.conf")
+        config_path = os.path.join(self.working_path, "conf")
+        zoo_config_path = os.path.join(config_path, "zoo.cfg")
+        jaas_config_path = os.path.join(config_path, "jaas.conf")
         log_path = os.path.join(self.working_path, "log")
         log4j_path = os.path.join(self.working_path, "log4j.properties")
         data_path = os.path.join(self.working_path, "data")
@@ -109,12 +110,14 @@ class ManagedZooKeeper(object):
         # various setup steps
         if not os.path.exists(self.working_path):
             os.mkdir(self.working_path)
+        if not os.path.exists(config_path):
+            os.mkdir(config_path)
         if not os.path.exists(log_path):
             os.mkdir(log_path)
         if not os.path.exists(data_path):
             os.mkdir(data_path)
 
-        with open(config_path, "w") as config:
+        with open(zoo_config_path, "w") as config:
             config.write("""
 tickTime=2000
 dataDir=%s

@@ -1,10 +1,10 @@
 version: '3'
 
 volumes:
-  kdc_data_vol:
-    driver_opts:
-      type: tmpfs
-      device: tmpfs
+ # kdc_data_vol:
+ #   driver_opts:
+ #     type: tmpfs
+ #     device: tmpfs
 
   zoo1_data_vol:
     driver_opts:
@@ -22,29 +22,29 @@ volumes:
       device: tmpfs
 
 services:
-  kdc:
-    build:
-      context: ../dockerfiles/kdc
-      dockerfile: Dockerfile
-    container_name: kdc
-    image: kdc-latest
-    hostname: kdc
-    ports:
-      - 1088:1088
-    environment:
-      SPNS: "client server/zoo1 server/zoo2 server/zoo3"
-    volumes:
-      - kdc_data_vol:/kdc-data
+    # kdc:
+    #   build:
+    #     context: ../dockerfiles/kdc
+    #     dockerfile: Dockerfile
+    #   container_name: kdc
+    #   image: kdc-latest
+    #   hostname: kdc
+    #   ports:
+    #     - 1088:1088
+    #   environment:
+    #     SPNS: "client server/zoo1 server/zoo2 server/zoo3"
+    #   volumes:
+    #     - kdc_data_vol:/kdc-data
 
   zoo1:
-    image: zookeeper:3.5
+    image: zookeeper:${ZK_VERSION}
     container_name: zoo1
     restart: always
     hostname: zoo1
     ports:
       - 2181:2181
     healthcheck:
-      test: ["CMD-SHELL", "echo 'srvr' | nc localhost 2181 | grep -q 'imok'"]
+      test: ["CMD-SHELL", "echo 'srvr' | nc localhost 2181 | grep -q 'Zookeeper version'"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -56,15 +56,15 @@ services:
       JVMFLAGS: "-Dzookeeper.extendedTypesEnabled=true"
     volumes:
       - zoo1_data_vol:/data
-      - kdc_data_vol:/kdc-data
-      - ./tmp/logs/zk1:/logs
+      - ${ZK_WORK_DIR}/logs/zk1:/logs
+      #- kdc_data_vol:/kdc-data
     tmpfs:
       - "/datalog"
-    depends_on:
-      - kdc
+    #depends_on:
+    #  - kdc
 
   zoo2:
-    image: zookeeper:3.5
+    image: zookeeper:${ZK_VERSION}
     container_name: zoo2
     restart: always
     hostname: zoo2
@@ -77,21 +77,21 @@ services:
       ZOO_LOG4J_PROP: "DEBUG,ROLLINGFILE"
       JVMFLAGS: "-Dzookeeper.extendedTypesEnabled=true"
     healthcheck:
-      test: ["CMD-SHELL", "echo 'srvr' | nc localhost 2181 | grep -q 'imok'"]
+      test: ["CMD-SHELL", "echo 'srvr' | nc localhost 2181 | grep -q 'Zookeeper version'"]
       interval: 30s
       timeout: 5s
       retries: 3
     volumes:
       - zoo2_data_vol:/data
-      - kdc_data_vol:/kdc-data
-      - ./tmp/logs/zk2:/logs
+      - ${ZK_WORK_DIR}/logs/zk2:/logs
+      #- kdc_data_vol:/kdc-data
     tmpfs:
       - "/datalog"
-    depends_on:
-      - kdc
+    #depends_on:
+    #  - kdc
 
   zoo3:
-    image: zookeeper:3.5
+    image: zookeeper:${ZK_VERSION}
     container_name: zoo3
     restart: always
     hostname: zoo3
@@ -104,27 +104,27 @@ services:
       ZOO_LOG4J_PROP: "DEBUG,ROLLINGFILE"
       JVMFLAGS: "-Dzookeeper.extendedTypesEnabled=true"
     healthcheck:
-      test: ["CMD-SHELL", "echo 'srvr' | nc localhost 2181 | grep -q 'imok'"]
+      test: ["CMD-SHELL", "echo 'srvr' | nc localhost 2181 | grep -q 'Zookeeper version'"]
       interval: 30s
       timeout: 5s
       retries: 3
     volumes:
       - zoo3_data_vol:/data
-      - kdc_data_vol:/kdc-data
-      - ./tmp/logs/zk3:/logs
+      - ${ZK_WORK_DIR}/logs/zk3:/logs
+      #- kdc_data_vol:/kdc-data
     tmpfs:
       - "/datalog"
-    depends_on:
-      - kdc
+    #depends_on:
+    #  - kdc
 
   dev:
     image: python:3.7-slim-buster
     hostname: dev
     volumes:
       - .:/code
-      - kdc_data_vol:/kdc-data:ro
       - zoo1_data_vol:/zk-data/zoo1:ro
       - zoo2_data_vol:/zk-data/zoo2:ro
       - zoo3_data_vol:/zk-data/zoo3:ro
+      #- kdc_data_vol:/kdc-data:ro
     working_dir: /code
     command: python3 -c 'import pip;pip.main(args=["install", "ipython"]);import os,sys; os.execvp(sys.executable, [sys.executable, "-mIPython"])'
