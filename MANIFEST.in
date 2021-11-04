@@ -1,6 +1,7 @@
 global-exclude *pyc *pyo __pycache__
 # Git files
 exclude .gitignore
+exclude .git-blame-ignore-revs
 # CI/CD files
 exclude .travis.yml.bak
 exclude .clog.toml
