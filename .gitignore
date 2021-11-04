@@ -32,3 +32,6 @@ zookeeper/
 .tox
 /.settings
 /.metadata
+
+!.gitignore
+!.git-blame-ignore-revs
