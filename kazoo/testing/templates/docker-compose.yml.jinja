@@ -1,0 +1,75 @@
+version: "3"
+
+networks:
+  default:
+    name: "kazoo-harness"
+
+volumes:
+{% if use_kdc -%}
+  kdc_data_vol:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+{% endif -%}
+{% for i in range(1, num_servers+1) %}
+  "zoo{{ i }}_data_vol":
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+{% endfor %}
+
+services:
+{% if use_kdc -%}
+  kdc:
+    build:
+      context: "{{ kdc_dockerfile_context }}"
+      dockerfile: Dockerfile
+    container_name: kdc
+    image: kdc
+    hostname: kdc
+    ports:
+      - 1088:1088
+    environment:
+      SPNS: "client server/zoo1 server/zoo2 server/zoo3"
+    volumes:
+      - kdc_data_vol:/kdc-data
+{% endif -%}
+
+
+{% for i in range(1, num_servers+1) %}
+{% set cur_zk = loop.index %}
+  "zoo{{ i }}":
+    image: zookeeper:{{ zookeeper_version }}
+    container_name: "zoo{{ i }}"
+    restart: always
+    hostname: "zoo{{ i }}"
+    ports:
+      - {{ 2181 + loop.index0 }}:2181
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'srvr' | nc localhost 2181 | grep -q 'Zookeeper version'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    environment:
+      ZOO_MY_ID: "{{ i }}"
+      ZOO_4LW_COMMANDS_WHITELIST: "*"
+      ZOO_SERVERS: {% for i in range(1, num_servers+1) -%}
+      server.{{ i }}=
+      {%- if loop.index == cur_zk %}0.0.0.0{% else %}zoo{{ i }}{% endif -%}
+      :2888:3888;2181 {% endfor %}
+      ZOO_LOG4J_PROP: "DEBUG,ROLLINGFILE"
+      JVMFLAGS: "-Dzookeeper.extendedTypesEnabled=true"
+    volumes:
+      - "zoo{{ i }}_data_vol:/data"
+      - "{{ zookeeper_work_dir }}/logs/zk{{ i }}:/logs"
+{% if use_kdc %}
+      - kdc_data_vol:/kdc-data
+{% endif %}
+    tmpfs:
+      - "/datalog"
+{% if use_kdc %}
+    depends_on:
+      - kdc
+{% endif %}
+
+{% endfor %}
