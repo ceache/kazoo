@@ -5,21 +5,21 @@ networks:
     name: "kazoo-harness"
 
 volumes:
-{% if use_kdc -%}
+{%- if use_kdc %}
   kdc_data_vol:
     driver_opts:
       type: tmpfs
       device: tmpfs
-{% endif -%}
-{% for i in range(1, num_servers+1) %}
+{%- endif %}
+{%- for i in range(1, num_servers+1) %}
   "zoo{{ i }}_data_vol":
     driver_opts:
       type: tmpfs
       device: tmpfs
-{% endfor %}
+{%- endfor %}
 
 services:
-{% if use_kdc -%}
+{%- if use_kdc %}
   kdc:
     build:
       context: "{{ kdc_dockerfile_context }}"
@@ -33,11 +33,11 @@ services:
       SPNS: "client server/zoo1 server/zoo2 server/zoo3"
     volumes:
       - kdc_data_vol:/kdc-data
-{% endif -%}
+{%- endif %}
 
 
-{% for i in range(1, num_servers+1) %}
-{% set cur_zk = loop.index %}
+{%- for i in range(1, num_servers+1) %}
+{%- set cur_zk = loop.index %}
   "zoo{{ i }}":
     image: zookeeper:{{ zookeeper_version }}
     container_name: "zoo{{ i }}"
@@ -62,14 +62,14 @@ services:
     volumes:
       - "zoo{{ i }}_data_vol:/data"
       - "{{ zookeeper_work_dir }}/logs/zk{{ i }}:/logs"
-{% if use_kdc %}
+{%- if use_kdc %}
       - kdc_data_vol:/kdc-data
-{% endif %}
+{%- endif %}
     tmpfs:
       - "/datalog"
-{% if use_kdc %}
+{%- if use_kdc %}
     depends_on:
       - kdc
-{% endif %}
+{%- endif %}
 
-{% endfor %}
+{%- endfor %}
