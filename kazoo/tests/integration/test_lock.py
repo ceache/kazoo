@@ -1,7 +1,7 @@
 import collections
-import mock
 import threading
 import unittest
+from unittest import mock
 import uuid
 
 import pytest

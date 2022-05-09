@@ -2,7 +2,7 @@ import uuid
 import threading
 import time
 
-import mock
+from unittest import mock
 
 from kazoo.exceptions import LockTimeout
 from kazoo.testing import KazooTestCase

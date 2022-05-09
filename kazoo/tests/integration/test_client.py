@@ -4,9 +4,8 @@ import threading
 import time
 import uuid
 import unittest
+from unittest import mock
 
-import mock
-from mock import patch
 import pytest
 
 from kazoo.testing import KazooTestCase
@@ -274,7 +273,7 @@ class TestConnection(KazooTestCase):
         k = self._get_nonchroot_client()
         k.chroot = 'abba'
         try:
-            with patch('warnings.warn') as mock_func:
+            with mock.patch('warnings.warn') as mock_func:
                 k.start()
                 assert mock_func.called
         finally:

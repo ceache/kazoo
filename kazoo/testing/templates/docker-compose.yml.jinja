@@ -1,3 +1,17 @@
+{#- Parameters:                                                             -#}
+{#-   * zookeeper_version (str): zookeeper container image tag to use       -#}
+{#-   * zookeeker_num_servers (int): # of instances to stand up             -#}
+{#-   * zookeeker_num_parts(int): # of instances participating in ensemble  -#}
+{#-   * zookeeper_work_dir (str):                                           -#}
+{#-   * zookeeper_options (list[str]):                                      -#}
+{#-   * use_kdc (bool):                                                     -#}
+{#-   * enable_extended_types (bool):                                       -#}
+
+#{%- set zookeeker_num_servers = zookeeker_num_servers|default(3, true) -%}
+#{%- set zookeeker_num_parts = zookeeker_num_parts|default(3, true) -%}
+#{%- set zookeeker_num_servers = [zookeeker_num_servers, zookeeker_num_parts]|max -%}
+
+# {{ zookeeper_num_parts }} <= {{ zookeeper_num_members }} <= {{ zookeeper_num_servers }}
 version: "3"
 
 networks:
@@ -11,7 +25,7 @@ volumes:
       type: tmpfs
       device: tmpfs
 {%- endif %}
-{%- for i in range(1, num_servers+1) %}
+{%- for i in range(1, zookeeper_num_servers+1) %}
   "zoo{{ i }}_data_vol":
     driver_opts:
       type: tmpfs
@@ -36,7 +50,7 @@ services:
 {%- endif %}
 
 
-{%- for i in range(1, num_servers+1) %}
+{%- for i in range(1, zookeeper_num_servers+1) %}
 {%- set cur_zk = loop.index %}
   "zoo{{ i }}":
     image: zookeeper:{{ zookeeper_version }}
@@ -46,19 +60,42 @@ services:
     ports:
       - {{ 2181 + loop.index0 }}:2181
     healthcheck:
-      test: ["CMD-SHELL", "echo 'srvr' | nc localhost 2181 | grep -q 'Zookeeper version'"]
-      interval: 30s
-      timeout: 5s
+      test: ["CMD-SHELL", "echo 'ruok' | nc localhost 2181 | grep -q 'imok'"]
+      interval: 5s
+      timeout: 1s
       retries: 3
+      start_period: 10s
     environment:
       ZOO_MY_ID: "{{ i }}"
       ZOO_4LW_COMMANDS_WHITELIST: "*"
-      ZOO_SERVERS: {% for i in range(1, num_servers+1) -%}
-      server.{{ i }}=
-      {%- if loop.index == cur_zk %}0.0.0.0{% else %}zoo{{ i }}{% endif -%}
-      :2888:3888;2181 {% endfor %}
+      ZOO_STANDALONE_ENABLED: "false"
+      ZOO_SERVERS: "
+        {%- for i in range(1, zookeeper_num_members+1) -%}
+        server.{{ i }}=
+          {%- if loop.index == cur_zk -%}
+          0.0.0.0
+          {%- else -%}
+          zoo{{ i }}
+          {%- endif -%}
+        :2888:3888:
+          {%- if loop.index <= zookeeker_num_parts -%}
+          participant
+          {%- else -%}
+          observer
+          {%- endif -%}
+        ;2181 {% endfor %}
+        {%- if cur_zk > zookeeper_num_members -%}
+        server.{{ i }}=0.0.0.0:2888:3888:observer;2181
+        {%- endif -%}"
       ZOO_LOG4J_PROP: "DEBUG,ROLLINGFILE"
+{%- if zookeeper_options %}
+      ZOO_CFG_EXTRA: "{% for option in zookeeper_options -%}
+      {{ option }} 
+      {%- endfor %}"
+{%- endif %}
+{%- if enable_extended_types %}
       JVMFLAGS: "-Dzookeeper.extendedTypesEnabled=true"
+{%- endif %}
     volumes:
       - "zoo{{ i }}_data_vol:/data"
       - "{{ zookeeper_work_dir }}/logs/zk{{ i }}:/logs"

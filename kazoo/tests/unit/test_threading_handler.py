@@ -1,7 +1,7 @@
 import threading
 import unittest
+from unittest import mock
 
-import mock
 import pytest
 
 

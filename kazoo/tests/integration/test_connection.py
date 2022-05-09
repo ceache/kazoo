@@ -5,9 +5,9 @@ import time
 import uuid
 import struct
 import sys
+from unittest import mock
 
 import pytest
-import mock
 
 from kazoo.exceptions import ConnectionLoss
 from kazoo.protocol.serialization import (
