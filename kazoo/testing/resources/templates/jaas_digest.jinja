@@ -1,0 +1,9 @@
+{# JAAS config suitable for Digest SASL auth -#}
+{#- Parameters: -#}
+
+Server {
+  org.apache.zookeeper.server.auth.DigestLoginModule required
+{%- for account in accounts %}
+  user_{{ account.username }}="{{ account.password }}"
+{%- endfor %}
+};

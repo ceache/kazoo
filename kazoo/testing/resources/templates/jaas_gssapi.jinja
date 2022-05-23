@@ -1,0 +1,14 @@
+{# JAAS config suitable for GSSAPI SASL auth -#}
+{#- Parameters: -#}
+{#-  -#}
+
+Server {
+  com.sun.security.auth.module.Krb5LoginModule required
+  debug=true
+  isInitiator=false
+  useKeyTab=true
+  keyTab="{{ keytab_file }}"
+  storeKey=true
+  useTicketCache=false
+  principal="zookeeper/{{ hostname }}@{{ kerberos_realm }}";
+};

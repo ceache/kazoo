@@ -1,111 +1,26 @@
 """Kazoo testing harnesses"""
+
 import logging
 import os
 import uuid
 import unittest
 
 from kazoo import python2atexit as atexit
+
 from kazoo.client import KazooClient
 from kazoo.exceptions import KazooException
 from kazoo.protocol.connection import _CONNECTION_DROP, _SESSION_EXPIRED
 from kazoo.protocol.states import (
     KazooState
 )
-from kazoo.testing.common import ZookeeperCluster
+from . import zkcluster
 
 log = logging.getLogger(__name__)
 
 CLUSTER = None
-CLUSTER_CONF = None
-CLUSTER_DEFAULTS = {
-    "ZOOKEEPER_PORT_OFFSET": 20000,
-    "ZOOKEEPER_CLUSTER_SIZE": 3,
-    "ZOOKEEPER_OBSERVER_START_ID": -1,
-}
-
 
 def get_global_cluster():
-    global CLUSTER, CLUSTER_CONF
-    cluster_conf = {
-        k: os.environ.get(k, CLUSTER_DEFAULTS.get(k))
-        for k in ["ZOOKEEPER_PATH",
-                  "ZOOKEEPER_CLASSPATH",
-                  "ZOOKEEPER_PORT_OFFSET",
-                  "ZOOKEEPER_CLUSTER_SIZE",
-                  "ZOOKEEPER_VERSION",
-                  "ZOOKEEPER_OBSERVER_START_ID",
-                  "ZOOKEEPER_JAAS_AUTH"]
-    }
-    if CLUSTER is not None:
-        if CLUSTER_CONF == cluster_conf:
-            return CLUSTER
-        else:
-            log.info('Config change detected. Reconfiguring cluster...')
-            CLUSTER.terminate()
-            CLUSTER = None
-    # Create a new cluster
-    ZK_HOME = cluster_conf.get("ZOOKEEPER_PATH")
-    ZK_CLASSPATH = cluster_conf.get("ZOOKEEPER_CLASSPATH")
-    ZK_PORT_OFFSET = int(cluster_conf.get("ZOOKEEPER_PORT_OFFSET"))
-    ZK_CLUSTER_SIZE = int(cluster_conf.get("ZOOKEEPER_CLUSTER_SIZE"))
-    ZK_VERSION = cluster_conf.get("ZOOKEEPER_VERSION")
-    if '-' in ZK_VERSION:
-        # Ignore pre-release markers like -alpha
-        ZK_VERSION = ZK_VERSION.split('-')[0]
-    ZK_VERSION = tuple([int(n) for n in ZK_VERSION.split('.')])
-    ZK_OBSERVER_START_ID = int(cluster_conf.get("ZOOKEEPER_OBSERVER_START_ID"))
-
-    assert ZK_HOME or ZK_CLASSPATH or ZK_VERSION, (
-        "Either ZOOKEEPER_PATH or ZOOKEEPER_CLASSPATH or "
-        "ZOOKEEPER_VERSION environment variable must be defined.\n"
-        "For deb package installations this is /usr/share/java")
-
-    if ZK_VERSION >= (3, 5):
-        additional_configuration_entries = [
-            "4lw.commands.whitelist=*",
-            "reconfigEnabled=true"
-        ]
-        # If defined, this sets the superuser password to "test"
-        additional_java_system_properties = [
-            "-Dzookeeper.DigestAuthenticationProvider.superDigest="
-            "super:D/InIHSb7yEEbrWz8b9l71RjZJU="
-        ]
-    else:
-        additional_configuration_entries = []
-        additional_java_system_properties = []
-    ZOOKEEPER_JAAS_AUTH = cluster_conf.get("ZOOKEEPER_JAAS_AUTH")
-    if ZOOKEEPER_JAAS_AUTH == "digest":
-        jaas_config = """
-Server {
-    org.apache.zookeeper.server.auth.DigestLoginModule required
-    user_super="super_secret"
-    user_jaasuser="jaas_password";
-};"""
-    elif ZOOKEEPER_JAAS_AUTH == "gssapi":
-        # Configure Zookeeper to use our test KDC.
-        additional_java_system_properties += [
-            "-Djava.security.krb5.conf=%s" % os.path.expandvars(
-                "${KRB5_CONFIG}"
-            ),
-            "-Dsun.security.krb5.debug=true",
-        ]
-        jaas_config = """
-Server {
-  com.sun.security.auth.module.Krb5LoginModule required
-  debug=true
-  isInitiator=false
-  useKeyTab=true
-  keyTab="%s"
-  storeKey=true
-  useTicketCache=false
-  principal="zookeeper/127.0.0.1@KAZOOTEST.ORG";
-};""" % os.path.expandvars("${KRB5_TEST_ENV}/server.keytab")
-    else:
-        jaas_config = None
-
-    CLUSTER = ZookeeperCluster(
-        install_path=ZK_HOME,
-        classpath=ZK_CLASSPATH,
+    CLUSTER = zkcluster.ZookeeperCluster(
         port_offset=ZK_PORT_OFFSET,
         size=ZK_CLUSTER_SIZE,
         observer_start_id=ZK_OBSERVER_START_ID,
@@ -113,7 +28,6 @@ Server {
         java_system_properties=additional_java_system_properties,
         jaas_config=jaas_config
     )
-    CLUSTER_CONF = cluster_conf
     atexit.register(lambda cluster: cluster.terminate(), CLUSTER)
     return CLUSTER
 
