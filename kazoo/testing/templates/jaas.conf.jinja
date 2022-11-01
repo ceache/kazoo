@@ -1,0 +1,19 @@
+{%- if zookeeper_auth == 'digest' %}
+Server {
+    org.apache.zookeeper.server.auth.DigestLoginModule required
+    {%- for user, password in zookeeper_digest_accounts %}
+    user_{{ user }}="{{ password }}"
+    {%- endfor %}
+};
+{%- elif zookeeper_auth == 'gssapi' %}
+Server {
+  com.sun.security.auth.module.Krb5LoginModule required
+  debug=true
+  isInitiator=false
+  useKeyTab=true
+  keyTab="{{ kerberos_keytab_file }}"
+  storeKey=true
+  useTicketCache=false
+  principal="zookeeper/{{ zookeeper_hostname }}@{{ kerberos_realm|upper }}";
+};
+{%- endif %}

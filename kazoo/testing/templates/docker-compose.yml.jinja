@@ -36,6 +36,10 @@ services:
 {% endif -%}
 
 
+{#- Per https://zookeeper.apache.org/doc/r3.8.0/zookeeperReconfig.html#sc_reconfig_general -#}
+{#- instances not yet in the ensemble should be configured as observers but -#}
+{#- omitted from the joinned members' config. -#}
+{%- set num_joined_servers = (num_participants + num_observers) %}
 {% for i in range(1, num_servers+1) %}
 {% set cur_zk = loop.index %}
   "zoo{{ i }}":
@@ -52,13 +56,34 @@ services:
       retries: 3
     environment:
       ZOO_MY_ID: "{{ i }}"
+      ZOO_STANDALONE_ENABLED: "false"
+      ZOO_ADMINSERVER_ENABLED: "false"
+      ZOO_MAX_CLIENT_CNXNS: "0"
       ZOO_4LW_COMMANDS_WHITELIST: "*"
-      ZOO_SERVERS: {% for i in range(1, num_servers+1) -%}
-      server.{{ i }}=
-      {%- if loop.index == cur_zk %}0.0.0.0{% else %}zoo{{ i }}{% endif -%}
-      :2888:3888;2181 {% endfor %}
+      # server.id=<address1>:<port1>:<port2>[:role];[<client port address>:]<client port>
+      ZOO_SERVERS: "
+      {%- for i in range(1, num_joined_servers+1) -%}
+      server.{{ i }}=zoo{{ i }}:2888:3888:
+      {%- if i <= num_participants %}participant{% else  %}observer{% endif -%}
+      ;2181 {% endfor -%}
+      {%- if cur_zk > num_joined_servers %}
+      {%- for i in range(num_joined_servers+1, num_servers+1) -%}
+      server.{{ i }}=zoo{{ i }}:2888:3888:observer;2181 {% endfor -%}
+      {%- endif -%}
+      "
       ZOO_LOG4J_PROP: "DEBUG,ROLLINGFILE"
-      JVMFLAGS: "-Dzookeeper.extendedTypesEnabled=true"
+      {%- if zookeeper_extra_opts %}
+      ZOO_CFG_EXTRA: "
+      {%- for key, value in zookeeper_extra_opts.items() -%}
+      {{ key }}={{ value }} {% endfor -%}
+      "
+      {%- endif %}
+      {%- if zookeeper_extra_jvmflags %}
+      JVMFLAGS: "
+      {%- for key, value in zookeeper_extra_jvmflags.items() -%}
+      -D{{ key }}={{ value }} {% endfor -%}
+      "
+      {%- endif %}
     volumes:
       - "zoo{{ i }}_data_vol:/data"
       - "{{ zookeeper_work_dir }}/logs/zk{{ i }}:/logs"
