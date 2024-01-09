@@ -1,0 +1,20 @@
+tickTime=2000
+dataDir={{ zookeeper_data_dir }}
+clientPort={{ zookeeper_client_port }}
+maxClientCnxns=0
+admin.serverPort={{ zookeeper_admin_port }}
+{%- if zookeeper_use_sasl %}
+authProvider.1=org.apache.zookeeper.server.auth.SASLAuthenticationProvider
+{%- endif %}
+{%- if zookeeper_version in ">=3.5"|as_specifier %}
+4lw.commands.whitelist=*
+reconfigEnabled=true
+# required to avoid session validation error
+# in read only test
+localSessionsEnabled={{ zookeeper_local_session }}
+localSessionsUpgradingEnabled={{ zookeeper_local_session }}
+{%- endif %}
+{%- for conf_entry in zookeeper_extra_conf_entries %}
+{{ conf_entry }}
+{%- endfor %}
+

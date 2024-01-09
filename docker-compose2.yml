@@ -1,0 +1,110 @@
+version: "3"
+
+networks:
+  default:
+    name: "kazoo-harness"
+
+volumes:
+
+  "zoo1_data_vol":
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+
+  "zoo2_data_vol":
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+
+  "zoo3_data_vol":
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+
+
+services:
+
+
+  "zoo1":
+    image: zookeeper:3.6
+    container_name: "zoo1"
+    restart: always
+    hostname: "zoo1"
+    ports:
+      - 2181:2181
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'srvr' | nc localhost 2181 | grep -q 'Zookeeper version'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    environment:
+      ZOO_MY_ID: "1"
+      ZOO_4LW_COMMANDS_WHITELIST: "*"
+      ZOO_SERVERS: server.1=0.0.0.0:2888:3888;2181 server.2=zoo2:2888:3888;2181 server.3=zoo3:2888:3888;2181 
+      ZOO_LOG4J_PROP: "DEBUG,ROLLINGFILE"
+      JVMFLAGS: "-Dzookeeper.extendedTypesEnabled=true"
+    volumes:
+      - "zoo1_data_vol:/data"
+      - "/tmp/logs/zk1:/logs"
+
+    tmpfs:
+      - "/datalog"
+
+
+
+
+  "zoo2":
+    image: zookeeper:3.6
+    container_name: "zoo2"
+    restart: always
+    hostname: "zoo2"
+    ports:
+      - 2182:2181
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'srvr' | nc localhost 2181 | grep -q 'Zookeeper version'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    environment:
+      ZOO_MY_ID: "2"
+      ZOO_4LW_COMMANDS_WHITELIST: "*"
+      ZOO_SERVERS: server.1=zoo1:2888:3888;2181 server.2=0.0.0.0:2888:3888;2181 server.3=zoo3:2888:3888;2181 
+      ZOO_LOG4J_PROP: "DEBUG,ROLLINGFILE"
+      JVMFLAGS: "-Dzookeeper.extendedTypesEnabled=true"
+    volumes:
+      - "zoo2_data_vol:/data"
+      - "/tmp/logs/zk2:/logs"
+
+    tmpfs:
+      - "/datalog"
+
+
+
+
+  "zoo3":
+    image: zookeeper:3.6
+    container_name: "zoo3"
+    restart: always
+    hostname: "zoo3"
+    ports:
+      - 2183:2181
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'srvr' | nc localhost 2181 | grep -q 'Zookeeper version'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    environment:
+      ZOO_MY_ID: "3"
+      ZOO_4LW_COMMANDS_WHITELIST: "*"
+      ZOO_SERVERS: server.1=zoo1:2888:3888;2181 server.2=zoo2:2888:3888;2181 server.3=0.0.0.0:2888:3888;2181 
+      ZOO_LOG4J_PROP: "DEBUG,ROLLINGFILE"
+      JVMFLAGS: "-Dzookeeper.extendedTypesEnabled=true"
+    volumes:
+      - "zoo3_data_vol:/data"
+      - "/tmp/logs/zk3:/logs"
+
+    tmpfs:
+      - "/datalog"
+
+
+
