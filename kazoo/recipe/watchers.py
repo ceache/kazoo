@@ -10,6 +10,7 @@
     will result in an exception being thrown.
 
 """
+
 from functools import partial, wraps
 import logging
 import time
@@ -108,9 +109,7 @@ class DataWatch(object):
         self._stopped = False
         self._run_lock = client.handler.lock_object()
         self._version = None
-        self._retry = KazooRetry(
-            max_tries=None, sleep_func=client.handler.sleep_func
-        )
+        self._retry = KazooRetry(max_tries=-1, handler=client.handler)
         self._include_event = None
         self._ever_called = False
         self._used = False

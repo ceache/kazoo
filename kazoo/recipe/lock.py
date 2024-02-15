@@ -14,6 +14,7 @@ changes and re-act appropriately. In the event that a
 and/or the lease has been lost.
 
 """
+
 import re
 import time
 import uuid
@@ -124,9 +125,7 @@ class Lock(object):
         self.is_acquired = False
         self.assured_path = False
         self.cancelled = False
-        self._retry = KazooRetry(
-            max_tries=None, sleep_func=client.handler.sleep_func
-        )
+        self._retry = KazooRetry(max_tries=-1, handler=client.handler)
         self._acquire_method_lock = client.handler.lock_object()
 
     def _ensure_path(self):
@@ -167,13 +166,13 @@ class Lock(object):
             The ephemeral option.
         """
 
-        retry = self._retry.copy()
-        retry.deadline = timeout
+        retry = self._retry.copy(deadline=timeout)
 
         # Ensure we are locked so that we avoid multiple threads in
         # this acquistion routine at the same time...
         method_locked = self._acquire_method_lock.acquire(
-            blocking=blocking, timeout=timeout if timeout is not None else -1
+            blocking=blocking,
+            timeout=(timeout if timeout is not None else -1),
         )
         if not method_locked:
             return False
