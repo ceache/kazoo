@@ -17,7 +17,7 @@ import time
 import warnings
 
 from kazoo.exceptions import ConnectionClosedError, NoNodeError, KazooException
-from kazoo.protocol.states import KazooState
+from kazoo.protocol.states import KazooState, WatchedEvent, 
 from kazoo.retry import KazooRetry
 
 
@@ -110,9 +110,8 @@ class DataWatch(object):
         self._run_lock = client.handler.lock_object()
         self._version = None
         self._retry = KazooRetry(max_tries=-1, handler=client.handler)
-        self._include_event = None
         self._ever_called = False
-        self._used = False
+        self._use_async = use_async
 
         if args or kwargs:
             warnings.warn(
@@ -127,9 +126,11 @@ class DataWatch(object):
         # Register our session listener if we're going to resume
         # across session losses
         if func is not None:
-            self._used = True
             self._client.add_listener(self._session_watcher)
-            self._get_data()
+            if self._use_async:
+                self._get_data_async()
+            else:
+                self._get_data()
 
     def __call__(self, func):
         """Callable version for use as a decorator
@@ -141,36 +142,37 @@ class DataWatch(object):
         :type func: callable
 
         """
-        if self._used:
+        if self._func is not None:
             raise KazooException(
                 "A function has already been associated with this "
                 "DataWatch instance."
             )
 
         self._func = func
-
-        self._used = True
         self._client.add_listener(self._session_watcher)
-        self._get_data()
+        if self._use_async:
+            self._get_data_async()
+        else:
+            self._get_data()
         return func
 
     def _log_func_exception(self, data, stat, event=None):
+        if not self._ever_called:
+            self._ever_called = True
+
         try:
-            # For backwards compatibility, don't send event to the
-            # callback unless the send_event is set in constructor
-            if not self._ever_called:
-                self._ever_called = True
             try:
                 result = self._func(data, stat, event)
             except TypeError:
                 result = self._func(data, stat)
-            if result is False:
-                self._stopped = True
-                self._func = None
-                self._client.remove_listener(self._session_watcher)
         except Exception as exc:
             log.exception(exc)
             raise
+
+        if result is False:
+            self._stopped = True
+            self._func = None
+            self._client.remove_listener(self._session_watcher)
 
     @_ignore_closed
     def _get_data(self, event=None):
@@ -187,16 +189,7 @@ class DataWatch(object):
                     self._client.get, self._path, self._watcher
                 )
             except NoNodeError:
-                data = None
-
-                # This will set 'stat' to None if the node does not yet
-                # exist.
-                stat = self._retry(
-                    self._client.exists, self._path, self._watcher
-                )
-                if stat:
-                    self._client.handler.spawn(self._get_data)
-                    return
+                data = stat = None
 
             # No node data, clear out version
             if stat is None:
@@ -209,16 +202,87 @@ class DataWatch(object):
             if initial_version != self._version or not self._ever_called:
                 self._log_func_exception(data, stat, event)
 
-    def _watcher(self, event):
-        self._get_data(event=event)
+            if not self._stopped:
+                # This will set 'stat' to None if the node does not yet
+                # exist.
+                stat = self._retry(
+                    self._client.exists, self._path, self._watcher
+                )
+                if stat:
+                    # Note reappeared
+                    self._client.handler.spawn(self._get_data)
 
-    def _set_watch(self, state):
+    def _get_data_async(self, event=None):
+        async_res = self._retry.async_call(
+            self._client.get_async, self._path, self._watcher
+        )
+        async_res.rawlink(
+            functools.partial(
+                self._process_data_async,
+                event=event,
+            )
+        )
+
+    def _process_data_async(self, async_res: AsyncResult, event=None):
+        # Ensure this runs one at a time, possible because the session
+        # watcher may trigger a run
         with self._run_lock:
-            self._watch_established = state
+            if self._stopped:
+                return
+
+            initial_version = self._version
+
+            try:
+                data, stat = async_res.get()
+            except ConnectionClosedError:
+                return
+            except NoNodeError:
+                data = stat = None
+
+            # No node data, clear out version
+            if stat is None:
+                self._version = None
+            else:
+                self._version = stat.mzxid
+
+            # Call our function if its the first time ever, or if the
+            # version has changed
+            if initial_version != self._version or not self._ever_called:
+                self._log_func_exception(data, stat, event)
+
+            if not self._stopped:
+                # This will set 'stat' to None if the node does not yet
+                # exist.
+                stat_async_res = self._retry.async_call(
+                    self._client.exists_async, self._path, self._watcher
+                )
+                stat_async_res.rawlink(
+                    self._process_stat_async
+                )
+
+    def _process_stat_async(self, stat_async_res: AsyncResult):
+        try:
+            stat = stat_async_res.get()
+        except ConnectionClosedError:
+            return
+        if stat:
+            # Note reappeared
+            self._client.handler.spawn(self._get_data_async)
+
+    def _watcher(self, event):
+        if self._use_async:
+            self._get_data_async(event=event)
+        else:
+            self._get_data(event=event)
 
     def _session_watcher(self, state):
         if state == KazooState.CONNECTED:
-            self._client.handler.spawn(self._get_data)
+            self._client.handler.spawn(
+                (
+                    self._get_data_async
+                    if self._use_async else self._get_data
+                )
+            )
 
 
 class ChildrenWatch(object):
