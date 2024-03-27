@@ -220,39 +220,76 @@ log4j.appender.ROLLINGFILE.File="""
                 )
             )
 
-        args = (
-            [
-                "java",
-                "-cp",
-                self.classpath,
-                # make_digest_acl_credential assumes UTF-8, but ZK decodes
-                # digest auth packets using the JVM's default "charset"--which
-                # depends on the environment.  Force it to use UTF-8 to avoid
-                # test failures.
-                "-Dfile.encoding=UTF-8",
-                # "-Dlog4j.debug",
-                "-Dreadonlymode.enabled=true",
-                "-Dzookeeper.log.dir=%s" % log_path,
-                "-Dzookeeper.root.logger=INFO,CONSOLE",
-                "-Dlog4j.configuration=file:%s" % log4j_path,
-                # OS X: Prevent java from appearing in menu bar, process dock
-                # and from activation of the main workspace on run.
-                "-Djava.awt.headless=true",
-                # JAAS configuration for SASL authentication
-                "-Djava.security.auth.login.config=%s" % jaas_config_path,
-            ]
-            + list(self.java_system_properties)
-            + [
-                "org.apache.zookeeper.server.quorum.QuorumPeerMain",
-                config_path,
-            ]
+        environ = os.environ.copy()
+        environ.update(
+            {
+                "JMXDISABLE": "true",
+                "SERVER_JVMFLAGS": (
+                    # make_digest_acl_credential assumes UTF-8, but ZK decodes
+                    # digest auth packets using the JVM's default "charset"--which
+                    # depends on the environment. Force it to use UTF-8 to avoid
+                    # test failures.
+                    " -Dfile.encoding=UTF-8"
+                    # "-Dlog4j.debug",
+                    " -Dreadonlymode.enabled=true"
+                    f" -Dzookeeper.log.dir={log_path}"
+                    " -Dzookeeper.root.logger=INFO,CONSOLE"
+                    f" -Dlog4j.configuration=file:{log4j_path}"
+                    # OS X: Prevent java from appearing in menu bar, process dock
+                    # and from activation of the main workspace on run.
+                    " -Djava.awt.headless=true"
+                    # JAAS configuration for SASL authentication
+                    f" -Djava.security.auth.login.config={jaas_config_path}"
+                    " "
+                    + " ".join(self.java_system_properties)
+                ),
+                "ZK_SERVER_HEAP": "256",
+                "ZOOCFGDIR": self.working_path,
+                "ZOO_LOG_DIR": log_path,
+            }
         )
-        self.process = subprocess.Popen(args=args)
+        args = (
+            self.install_path + "/bin/zkServer.sh",
+            "--config",
+            self.working_path,
+            "start-foreground",
+            ##  "java",
+            ##  "-cp",
+            ##  self.classpath,
+            ##  # make_digest_acl_credential assumes UTF-8, but ZK decodes
+            ##  # digest auth packets using the JVM's default "charset"--which
+            ##  # depends on the environment.  Force it to use UTF-8 to avoid
+            ##  # test failures.
+            ##  "-Dfile.encoding=UTF-8",
+            ##  # "-Dlog4j.debug",
+            ##  "-Dreadonlymode.enabled=true",
+            ##  "-Dzookeeper.log.dir=%s" % log_path,
+            ##  "-Dzookeeper.root.logger=INFO,CONSOLE",
+            ##  "-Dlog4j.configuration=file:%s" % log4j_path,
+            ##  # OS X: Prevent java from appearing in menu bar, process dock
+            ##  # and from activation of the main workspace on run.
+            ##  "-Djava.awt.headless=true",
+            ##  # JAAS configuration for SASL authentication
+            ##  "-Djava.security.auth.login.config=%s" % jaas_config_path,
+            ## ]
+            ## + list(self.java_system_properties)
+            ## + [
+            ##     "org.apache.zookeeper.server.quorum.QuorumPeerMain",
+            ##     config_path,
+            ## ]
+        )
+        self.process = subprocess.Popen(
+            args=args,
+            env=environ,
+            stdout=open(os.path.join(self.working_path, "stdout.txt"), "w"),
+            stderr=open(os.path.join(self.working_path, "stderr.txt"), "w"),
+        )
         log.info(
-            "Started zookeeper process %s on port %s using args %s",
+            "Started zookeeper process %s on port %s using args %s(env:%r)",
             self.process.pid,
             self.server_info.client_port,
             args,
+            environ,
         )
         self._running = True
 
