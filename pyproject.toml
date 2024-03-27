@@ -1,12 +1,97 @@
+[project]
+name = "kazoo"
+authors = [
+    {name = "Kazoo team", email = "python-zk@googlegroups.com"}
+]
+description = "Higher Level Zookeeper Client"
+license = {file = "LICENSE"}
+requires-python = ">=3.8"
+dependencies = []
+keywords = ["zookeeper", "lock", "leader", "configuration"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "License :: OSI Approved :: Apache Software License",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+    "Topic :: Communications",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: System :: Networking",
+]
+dynamic = ["version", "readme"]
+
+[project.urls]
+Homepage = "https://kazoo.readthedocs.io"
+Documentation = "https://kazoo.readthedocs.io"
+Changelog = "https://github.com/python-zk/kazoo/releases"
+Repository = "https://github.com/python-zk/kazoo"
+"Bug Tracker" = "https://github.com/python-zk/kazoo/issues"
+
+[project.optional-dependencies]
+eventlet = ["eventlet>=0.17.1; implementation_name!='pypy'"]
+gevent = [
+    "gevent>=20.6.2",
+]
+sasl = ["pure_sasl>=0.5.1"]
+test = [
+    "pytest>=8.1.1",
+    "objgraph>=3.6.1",
+]
+testing = [
+    "pyjks>=20.0.0",
+    "pyopenssl>=24.1.0",
+]
+
 [build-system]
 build-backend = 'setuptools.build_meta'
 requires = [
-    'setuptools >= 46.4.0',
+    'setuptools >= 46.4.0', "setuptools_scm"
 ]
 
-[tool.black]
+[tool.setuptools]
+packages = ["kazoo"]
+
+[tool.setuptools.dynamic]
+version = {attr= "kazoo.version.__version__"}
+readme = {file = ["README.md", "CHANGES.md"], content-type = "text/markdown"}
+
+[tool.pdm.dev-dependencies]
+dev = [
+    "ruff>=0.3.4",
+    "mypy>=1.9.0",
+]
+docs = [
+    "sphinx>=7.1.2",
+    "sphinx-autodoc-typehints>=2.0.0",
+]
+ci = [
+    "pytest-cov>=5.0.0",
+    "pytest-timeout>=2.3.1",
+    "tox>=4.14.2",
+    "tox-pdm>=0.7.2",
+]
+
+[tool.ruff]
+builtins = ["_"]
+extend-exclude = [
+    "build/",
+    "docs/conf.py",
+    "*egg",
+    "__pycache__",
+    "zookeeper/",
+]
 line-length = 79
-target-version = ['py37', 'py38', 'py39', 'py310']
+
+[tool.black]
+target-version = ['py38', 'py39', 'py310']
 include = '\.pyi?$'
 # 'extend-exclude' excludes files or directories in addition to the defaults
 # A regex preceded with ^/ will apply only to files and directories
@@ -149,3 +234,4 @@ module = [
     'kazoo.version'
 ]
 ignore_errors = true
+
