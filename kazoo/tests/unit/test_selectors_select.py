@@ -1,0 +1,105 @@
+"""
+The official python select function test case copied from python source
+ to test the selector_select function.
+"""
+
+import os
+import socket
+import sys
+
+import pytest
+
+from kazoo.handlers.utils import selector_select
+
+select = selector_select
+
+
+pytestmark = pytest.mark.skipif(
+    sys.platform.startswith("win"),
+    reason="can't easily test on this system",
+)
+
+
+def test_error_conditions():
+    class Nope:
+        pass
+
+    class Almost:
+        def fileno(self):
+            return "fileno"
+
+    with pytest.raises(TypeError):
+        select(1, 2, 3)
+    with pytest.raises(TypeError):
+        select([Nope()], [], [])
+    with pytest.raises(TypeError):
+        select([Almost()], [], [])
+    with pytest.raises(TypeError):
+        select([], [], [], "not a number")
+    with pytest.raises(ValueError):
+        select([], [], [], -1)
+
+
+# Issue #12367: http://www.freebsd.org/cgi/query-pr.cgi?pr=kern/155606
+@pytest.mark.skipif(
+    sys.platform.startswith("freebsd"),
+    reason="skip because of a FreeBSD bug: kern/155606",
+)
+def test_errno():
+    with open(__file__, "rb") as fp:
+        fd = fp.fileno()
+    # fp is now closed
+    with pytest.raises(ValueError):
+        select([fd], [], [], 0)
+
+
+def test_returned_list_identity():
+    # See issue #8329
+    r, w, x = select([], [], [], 1)
+    assert r is not w
+    assert r is not x
+    assert w is not x
+
+
+def test_select():
+    cmd = "for i in 0 1 2 3 4 5 6 7 8 9; do echo testing...; sleep 1; done"
+    p = os.popen(cmd, "r")
+    try:
+        for tout in (0, 1, 2, 4, 8, 16) + (None,) * 10:
+            rfd, wfd, xfd = select([p], [], [], tout)
+            if (rfd, wfd, xfd) == ([], [], []):
+                continue
+            if (rfd, wfd, xfd) == ([p], [], []):
+                line = p.readline()
+                if not line:
+                    break
+                continue
+            pytest.fail(
+                f"Unexpected return values from select(): {rfd}, {wfd}, {xfd}"
+            )
+    finally:
+        p.close()
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("darwin"),
+    reason="skip because deadlocks on macos",
+)
+# Issue 16230: Crash on select resized list
+def test_select_mutated():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        a = []
+
+        class F:
+            def fileno(self):
+                del a[-1]
+                return s.fileno()
+
+        a[:] = [F()] * 10
+        r, w, x = select([], a, [])
+
+        # The list 'a' is mutated during the select call by F.fileno().
+        # The original unittest asserted that the result of select() is
+        # equal to ([], a[:5], []), where a[:5] is evaluated after 'a'
+        # has been mutated (and has 5 items).
+        assert (r, w, x) == ([], a[:5], [])
