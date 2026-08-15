@@ -1,99 +1,76 @@
 from __future__ import annotations
 
-import functools
 import os
-import uuid
 from typing import TYPE_CHECKING
 
 import pytest
 
-from kazoo.client import KazooClient
 from kazoo.testing.kazoo_ensemble import (
+    FEATURE_JVM_PROPERTIES,
     KazooZkEnv,
-    ZkEnsemble,
     check_skip_version_marker,
     docker_env,
-    pytest_configure,
-)
-from kazoo.testing.kazoo_ensemble import (
+    pytest_addoption as kazoo_ensemble_pytest_addoption,
     pytest_configure as kazoo_ensemble_pytest_configure,
+    zkchroot,
+    zkclient,
+    zkensemble,
+    zksuperadmin_client,
 )
 
 if TYPE_CHECKING:
-    from typing import Generator
-
-    from pytest_docker import Services
-
-    from kazoo.client import KazooClient
+    from typing import Any
 
 
-# This function is now imported from kazoo.testing.kazoo_ensemble,
-# but we need a local stub to satisfy pytest's plugin discovery.
+# These hooks are implemented in kazoo.testing.kazoo_ensemble; local stubs
+# re-expose them through this conftest module for pytest's plugin discovery.
+def pytest_addoption(parser):
+    kazoo_ensemble_pytest_addoption(parser)
+
+
 def pytest_configure(config):
     kazoo_ensemble_pytest_configure(config)
 
 
 @pytest.fixture(scope="session")
-def docker_compose_file(pytestconfig) -> str:
-    del pytestconfig
-    return os.path.join(os.path.dirname(__file__), "docker-compose.yml")
+def docker_compose_config(
+    docker_env: KazooZkEnv,
+) -> dict[str, Any]:
+    """Resolve the docker-compose file for the active auth axis.
+
+    Test-specific selection: compose files are organized per authentication
+    flavor under ``docker-compose/<auth>/docker-compose.yml``. If no such
+    flavor directory exists yet, fall back to the default compose file in this
+    directory.
+    """
+    auth = docker_env.auth
+    flavor_dir = os.path.join(os.path.dirname(__file__), "docker-compose", auth)
+    flavor_compose = os.path.join(flavor_dir, "docker-compose.yml")
+    if os.path.exists(flavor_compose):
+        compose_path = flavor_compose
+    else:
+        compose_path = os.path.join(os.path.dirname(__file__), "docker-compose.yml")
+
+    # Expose resolved axis values to docker-compose interpolation.
+    os.environ["ZK_VERSION"] = docker_env.version
+    os.environ["ZK_AUTH"] = auth
+    os.environ["ZK_FEATURES"] = ",".join(docker_env.features)
+    jvm_flags = []
+    for feature in docker_env.features:
+        for prop in FEATURE_JVM_PROPERTIES.get(feature, ()):
+            jvm_flags.append(prop)
+    os.environ["ZK_FEATURES_JVMFLAGS"] = " ".join(jvm_flags)
+
+    return {
+        "version": docker_env.version,
+        "auth": auth,
+        "features": docker_env.features,
+        "compose_path": compose_path,
+    }
 
 
 @pytest.fixture(scope="session")
-def zkensemble(
-    docker_ip: str,
-    docker_services: Services,
-    docker_env: KazooZkEnv,
-) -> ZkEnsemble:
-    """Ensure that HTTP service is up and responsive."""
-
-    # `port_for` takes a container port and returns the corresponding host port
-    zk1_port = docker_services.port_for("zoo1", 2181)
-    zk2_port = docker_services.port_for("zoo2", 2181)
-    zk3_port = docker_services.port_for("zoo3", 2181)
-
-    return ZkEnsemble(
-        zk_ip=docker_ip,
-        zk1_port=zk1_port,
-        zk2_port=zk2_port,
-        zk3_port=zk3_port,
-        version=docker_env.version,
-        docker_services=docker_services,
-    )
-
-
-@pytest.fixture(scope="function")
-def zkclient(
-    request: pytest.FixtureRequest,
-    zkensemble: ZkEnsemble,
-) -> Generator[KazooClient, None, None]:
-    """Create a KazooClient instance connected to the ensemble."""
-    chroot = f"/{os.path.basename(request.node.nodeid)}"
-    client = zkensemble.get_client()
-    client.harness_expire_session = functools.partial(
-        zkensemble.expire_session,
-        client=client,
-        event_factory=client.handler.event_object,
-    )
-    client.start()
-    client.ensure_path(chroot)
-    client.chroot = chroot
-    yield client
-    client.stop()
-    client.close()
-
-
-@pytest.fixture(scope="function")
-def zksuperadmin_client(
-    request: pytest.FixtureRequest,
-    zkensemble: ZkEnsemble,
-) -> KazooClient:
-    """Create a KazooClient instance connected as superadmin to the ensemble."""
-    chroot = f"/{request.node.name}-{uuid.uuid4()}-superadmin"
-    client = zkensemble.get_client(superadmin=True)
-    client.start()
-    client.ensure_path(chroot)
-    client.chroot = chroot
-    yield client
-    client.stop()
-    client.close()
+def docker_compose_file(
+    docker_compose_config: dict[str, Any],
+) -> str:
+    return docker_compose_config["compose_path"]
