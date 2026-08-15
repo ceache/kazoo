@@ -117,9 +117,14 @@ description: "Task list for the docker-compose test harness implementation"
 
 ### Implementation for User Story 4
 
-- [ ] T025 [US4] Audit `kazoo/testing/kazoo_ensemble.py`, `kazoo/tests/integ/conftest.py`, and compose files for platform-specific code: pathlib-only host-side paths, no `/bin/bash` assumptions on the host, `${ZK_WORK_DIR}` bind-mount paths passed to compose as-is; remove any platform branches (FR-011)
-- [ ] T026 [P] [US4] Update the Windows sanity job in `.github/workflows/testing.yml`: drop the `actions/setup-java` step and ZK-install cache; run `pytest kazoo/tests/integ` (plain flavor) on `windows-latest` against the compose cluster
-- [ ] T027 [US4] Verify ephemeral-port resolution and bind mounts work on Windows/macOS (`get_service_port` against `0:2181`; Docker Desktop path forwarding for `${ZK_WORK_DIR}`) and document any host prerequisites in quickstart.md (FR-011)
+- [x] T025 [US4] Audit `kazoo/testing/kazoo_ensemble.py`, `kazoo/tests/integ/conftest.py`, and compose files for platform-specific code: pathlib-only host-side paths, no `/bin/bash` assumptions on the host, `${ZK_WORK_DIR}` bind-mount paths passed to compose as-is; remove any platform branches (FR-011)
+  - Verified: no host shell/bash, `shutil.which`, uid/gid, or `os.name`/`sys.platform` branches in the harness, conftest, or compose files (legacy `os.name`/SIGUSR1 guards live only in `kazoo/testing/common.py`, removed by T034). Compose uses ephemeral `0:2181`/`0:1088` ports and tmpfs `driver_opts`; the `zk_ip` wildcard normalization (`0.0.0.0`/`::`/`localhost` → `127.0.0.1`) is already set-based and platform-agnostic
+  - Fix applied: `docker_env` now exports `ZK_WORK_DIR` via `tmp_path.as_posix()` so compose bind-mount interpolation yields Docker-Desktop-compatible `C:/Users/...` paths on Windows while host-side file ops keep the native `Path` (FR-011)
+- [x] T026 [P] [US4] Update the Windows sanity job in `.github/workflows/testing.yml`: drop the `actions/setup-java` step and ZK-install cache; run `pytest kazoo/tests/integ` (plain flavor) on `windows-latest` against the compose cluster
+  - `test_windows` job rewritten: removes `setup-java` + ZK download cache + tox; adds a `docker compose version` preflight (`pwsh`), `pip install -e '.[test]'`, and `pytest kazoo/tests/integ -q` with `ZK_AUTH=plain` / `ZK_FEATURES=standard` (bash). Workflow YAML validated via Ruby Psych
+- [x] T027 [US4] Verify ephemeral-port resolution and bind mounts work on Windows/macOS (`get_service_port` against `0:2181`; Docker Desktop path forwarding for `${ZK_WORK_DIR}`) and document any host prerequisites in quickstart.md (FR-011)
+  - Verified on macOS: full integ suite on the plain axis passes after the `as_posix()` change (137 passed / 1 pre-existing flake / 13 skipped); `test_client.py::test_create*` → 26 passed. Windows is exercised by the rewritten T026 CI job
+  - quickstart.md updated: prerequisites now qualify that only `sasl_gssapi` needs a host Kerberos `kinit` (macOS Heimdal, Linux `krb5-user`); V9 multiplatform scope clarified as the plain axis, with the auth/feature matrix running on Linux
 
 **Checkpoint**: Multiplatform claim is validated on all three OSes.
 

@@ -562,7 +562,10 @@ def docker_env(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[KazooZkEnv]:
     with tmp_path_factory.getbasetemp() as tmp_path:
-        os.environ["ZK_WORK_DIR"] = str(tmp_path)
+        # Compose interpolates ${ZK_WORK_DIR} into bind-mount sources; on
+        # Windows the host path must be POSIX-style (C:/Users/...) for Docker
+        # Desktop, while host-side file ops below keep the native Path (FR-011).
+        os.environ["ZK_WORK_DIR"] = tmp_path.as_posix()
         # Unique per-session compose project name keeps parallel test runs (and
         # any stray stacks from other projects) isolated from each other.
         os.environ["COMPOSE_PROJECT_NAME"] = f"kazoo-{uuid.uuid4().hex[:8]}"

@@ -16,8 +16,13 @@ implementation details live in `tasks.md` and the implementation phase.
   ```bash
   pip install -e '.[test]'        # now includes testcontainers
   ```
-- No ZooKeeper binary, Java, keytool, or host Kerberos tools are required
-  (FR-001, FR-011) — everything runs in containers.
+- No ZooKeeper binary, Java, keytool, or (for the plain, digest, sasl_digest,
+  and tls axes) host Kerberos tools are required (FR-001, FR-011) — everything
+  for those axes runs in containers.
+- The `sasl_gssapi` axis additionally requires a host Kerberos client (`kinit`;
+  macOS ships Heimdal, Linux uses `krb5-user`) to mint a fresh per-run FILE
+  credential cache (see `research.md` R-06); this axis is exercised in CI on
+  Linux.
 
 ## Validation scenarios (map to Success Criteria)
 
@@ -94,7 +99,10 @@ pytest kazoo/tests/ -q   # full suite
 ### V9 — Multiplatform (FR-011, SC-004)
 
 Run **V1** on Linux, macOS, and Windows hosts with `docker compose`.
-**Expected**: identical behavior; no platform-specific harness branches.
+**Expected**: identical behavior; no platform-specific harness branches (FR-011).
+Multiplatform scope is the plain auth/feature axis — the Windows CI sanity job
+proves it on `windows-latest`, while the auth/feature matrix runs on Linux
+(FR-017).
 
 ### V10 — Fresh environment dependency declaration (FR-014)
 
