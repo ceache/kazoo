@@ -410,15 +410,25 @@ def docker_compose(
         context=context,
         compose_file_name=docker_compose_config["compose_files"],
     )
-    compose.start()
 
     global _COMPOSE_HANDLE
-    _COMPOSE_HANDLE = compose
     try:
+        compose.start()
+        _COMPOSE_HANDLE = compose
+        # Belt-and-suspenders beyond `up --wait`: fail fast with a precise
+        # message if any ensemble member is not actually healthy.
+        for node in ("zoo1", "zoo2", "zoo3"):
+            container = compose.get_container(node)
+            if container.Health != "healthy":
+                raise RuntimeError(
+                    f"{node} did not become healthy after `docker compose up "
+                    f"--wait` (state={container.State!r}, "
+                    f"health={container.Health!r})"
+                )
         yield compose
     finally:
-        # Session-scoped fixtures are finalized *before* pytest_sessionfinish,
-        # so dump logs here (stack still running) when any test failed.
+        # Runs even when `start()` itself raised partway (e.g. one node never
+        # became healthy), so `down --volumes` always cleans up the stack.
         if request.session.testsfailed:
             dump_ensemble_logs()
         _COMPOSE_HANDLE = None
