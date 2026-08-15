@@ -34,9 +34,6 @@ from collections import namedtuple
 from glob import glob
 from itertools import chain
 
-import jks
-import OpenSSL
-
 log = logging.getLogger(__name__)
 
 
@@ -443,6 +440,22 @@ class ZookeeperCluster(object):
     def perform_ssl_certs_generation(self):
         if self._ssl_configuration:
             return
+
+        # Lazy imports: 'pyjks' and 'pyOpenSSL' are no longer part of the
+        # 'test' extras (this in-process TLS certificate generation is replaced
+        # by the docker-compose harness certgen sidecar). Importing
+        # kazoo.testing must keep working without them; only this legacy path
+        # needs them.
+        try:
+            import jks
+            import OpenSSL
+        except ImportError:  # pragma: no cover - legacy TLS certgen path only
+            raise ImportError(
+                "In-process TLS certificate generation "
+                "(kazoo.testing.common) requires 'pyjks' and 'pyOpenSSL', "
+                "which are no longer part of the 'test' extras. Migrate to "
+                "the docker-compose harness TLS flavor."
+            ) from None
 
         # generate CA key
         ca_key = OpenSSL.crypto.PKey()
