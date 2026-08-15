@@ -77,12 +77,12 @@ description: "Task list for the docker-compose test harness implementation"
 
 ### Implementation for User Story 2
 
-- [ ] T011 [US2] Create `kazoo/tests/integ/docker-compose.auth-digest.yml` as a minimal overlay (digest is configured purely through `ZK_AUTH_JVMFLAGS` interpolation in the base file; the overlay documents the flavor selection and is the file `docker_compose_config` resolves for `--zk-auth=digest`)
-- [ ] T012 [P] [US2] Validate the version axis (SC-002): run V2 with `--zk-version=3.8.3` and `3.7.2`, confirming `zookeeper:${ZK_VERSION}` interpolation in `docker-compose.base.yml` selects the tag; fix any base-file incompatibilities across 3.7–3.9
-- [ ] T013 [US2] Wire the feature axis into the compose path: confirm `ZK_FEATURES_JVMFLAGS` (from `FEATURE_JVM_PROPERTIES` in `kazoo/testing/kazoo_ensemble.py`: ttl/readonly/reconfig JVM props) renders into `SERVER_JVMFLAGS` via the base file interpolation (FR-005)
-- [ ] T014 [P] [US2] Implement the richer skip-marker surface from contracts/markers.md in `kazoo/testing/kazoo_ensemble.py`: `@pytest.mark.zk_version("<3.8")`, `@pytest.mark.zk_auth("digest", "tls")`, `@pytest.mark.zk_features(require=[...], skip=[...])`; register them in `pytest_configure` alongside the existing `skip_if_zk_version`
-- [ ] T015 [US2] Implement collection-time skip evaluation (`pytest_collection_modifyitems`) against the active `Test Run Configuration` in `kazoo/testing/kazoo_ensemble.py`, producing actionable skip reasons (FR-008, SC-005); keep the existing per-test `check_skip_version_marker` autouse fixture working
-- [ ] T016 [US2] Add auth-axis skip integration: tests declaring `zk_auth("sasl_gssapi")` (or requiring GSSAPI) are skipped on plain/digest runs; verify against the `test_sasl.py`/auth scenarios from PYTEST_INTEG.md
+- [x] T011 [US2] Create `kazoo/tests/integ/docker-compose.auth-digest.yml` as a minimal overlay (digest is configured purely through `ZK_AUTH_JVMFLAGS` interpolation in the base file; the overlay documents the flavor selection and is the file `docker_compose_config` resolves for `--zk-auth=digest`)
+- [x] T012 [P] [US2] Validate the version axis (SC-002): run V2 with `--zk-version=3.8.3` and `3.7.2`, confirming `zookeeper:${ZK_VERSION}` interpolation in `docker-compose.base.yml` selects the tag; fix any base-file incompatibilities across 3.7–3.9
+- [x] T013 [US2] Wire the feature axis into the compose path: confirm `ZK_FEATURES_JVMFLAGS` (from `FEATURE_JVM_PROPERTIES` in `kazoo/testing/kazoo_ensemble.py`: ttl/readonly/reconfig JVM props) renders into `SERVER_JVMFLAGS` via the base file interpolation (FR-005)
+- [x] T014 [P] [US2] Implement the richer skip-marker surface from contracts/markers.md in `kazoo/testing/kazoo_ensemble.py`: `@pytest.mark.zk_version("<3.8")`, `@pytest.mark.zk_auth("digest", "tls")`, `@pytest.mark.zk_features(require=[...], skip=[...])`; register them in `pytest_configure` alongside the existing `skip_if_zk_version`
+- [x] T015 [US2] Implement collection-time skip evaluation (`pytest_collection_modifyitems`) against the active `Test Run Configuration` in `kazoo/testing/kazoo_ensemble.py`, producing actionable skip reasons (FR-008, SC-005); keep the existing per-test `check_skip_version_marker` autouse fixture working
+- [x] T016 [US2] Add auth-axis skip integration: tests declaring `zk_auth("sasl_gssapi")` (or requiring GSSAPI) are skipped on plain/digest runs; verify against the `test_sasl.py`/auth scenarios from PYTEST_INTEG.md
 
 **Checkpoint**: User Stories 1 AND 2 both work independently — axes selectable, skipping correct.
 

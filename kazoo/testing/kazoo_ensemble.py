@@ -110,12 +110,91 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 def pytest_configure(config):
     """
-    Registers our custom marker so pytest knows about it.
+    Registers our custom markers so pytest knows about them.
     """
     config.addinivalue_line(
         "markers",
         "skip_if_zk_version(condition): Skip test based on the 'zkensemble' fixture's version.",
     )
+    config.addinivalue_line(
+        "markers",
+        "zk_version(spec): Run only when the active ZK version matches the PEP 440 SpecifierSet.",
+    )
+    config.addinivalue_line(
+        "markers",
+        "zk_auth(*allowed, skip=None): Run only under the listed auth schemes, "
+        "or skip the listed ones.",
+    )
+    config.addinivalue_line(
+        "markers",
+        "zk_features(require=None, skip=None): Run only when all `require` "
+        "features are active and none of `skip` are.",
+    )
+
+
+def _evaluate_axis_markers(
+    item: pytest.Item,
+    zk_version: str,
+    auth: str,
+    features: tuple[str, ...],
+) -> str | None:
+    """Evaluate the zk_version/zk_auth/zk_features markers on a test item.
+
+    Returns an actionable skip reason string, or ``None`` when the item is
+    compatible with the active run configuration.
+    """
+    reasons: list[str] = []
+
+    marker = item.get_closest_marker("zk_version")
+    if marker:
+        spec = marker.args[0]
+        if version.Version(zk_version) not in specifiers.SpecifierSet(spec):
+            reasons.append(f"Requires ZK {spec} (active: {zk_version})")
+
+    marker = item.get_closest_marker("zk_auth")
+    if marker:
+        allowed = marker.args or ()
+        skip = marker.kwargs.get("skip") or ()
+        if allowed and auth not in allowed:
+            reasons.append(
+                f"Requires auth in {sorted(allowed)} (active: {auth})"
+            )
+        if auth in skip:
+            reasons.append(f"Incompatible with auth {auth}")
+
+    marker = item.get_closest_marker("zk_features")
+    if marker:
+        require = marker.kwargs.get("require") or ()
+        skip_features = marker.kwargs.get("skip") or ()
+        missing = [f for f in require if f not in features]
+        if missing:
+            reasons.append(f"Missing required feature(s): {missing}")
+        incompatible = [f for f in skip_features if f in features]
+        if incompatible:
+            reasons.append(
+                f"Incompatible with active feature(s): {incompatible}"
+            )
+
+    return "; ".join(reasons) if reasons else None
+
+
+def pytest_collection_modifyitems(
+    session: pytest.Session,
+    config: pytest.Config,
+    items: list[pytest.Item],
+) -> None:
+    """Apply collection-time skip evaluation for the axis markers.
+
+    Incompatible tests are skipped before any client/ensemble is spun up, so
+    they never attempt connections (FR-008, SC-005). The legacy
+    ``skip_if_zk_version`` marker keeps its function-scoped evaluation via the
+    ``check_skip_version_marker`` autouse fixture.
+    """
+    version, auth, features = _resolve_axis_options(config)
+    for item in items:
+        reason = _evaluate_axis_markers(item, version, auth, features)
+        if reason is not None:
+            item.add_marker(pytest.mark.skip(reason=reason))
 
 
 @attrs.frozen(kw_only=True, auto_attribs=True)

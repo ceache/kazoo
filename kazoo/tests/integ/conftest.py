@@ -12,6 +12,7 @@ from kazoo.testing.kazoo_ensemble import (
     docker_compose,
     docker_env,
     pytest_addoption as kazoo_ensemble_pytest_addoption,
+    pytest_collection_modifyitems as kazoo_ensemble_pytest_collection_modifyitems,
     pytest_configure as kazoo_ensemble_pytest_configure,
     zkchroot,
     zkclient,
@@ -31,6 +32,10 @@ def pytest_addoption(parser):
 
 def pytest_configure(config):
     kazoo_ensemble_pytest_configure(config)
+
+
+def pytest_collection_modifyitems(session, config, items):
+    kazoo_ensemble_pytest_collection_modifyitems(session, config, items)
 
 
 @pytest.fixture(scope="session")
