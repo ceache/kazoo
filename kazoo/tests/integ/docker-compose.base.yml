@@ -1,0 +1,122 @@
+# Base docker-compose overlay for the kazoo integration-test ZooKeeper
+# ensemble.
+#
+# This file defines a fixed 3-node ZooKeeper ensemble using the official
+# `zookeeper` image (hub.docker.com/_/zookeeper), configured exclusively
+# through the image's public environment-variable interface:
+#
+#   * ZOO_MY_ID / ZOO_SERVERS          -> ensemble membership
+#   * SERVER_JVMFLAGS / ZOO_LOG4J_PROP -> JVM/server logging configuration
+#   * ZOO_LOG_DIR                      -> log output location (mounted to host)
+#
+# Authentication/feature overlays are applied on top of this base file via
+# docker-compose multi-file support (`docker compose -f base.yml -f overlay.yml`).
+# Feature JVM flags (ttl/readonly/reconfig) and auth JVM flags (e.g. the digest
+# superDigest) are interpolated into SERVER_JVMFLAGS **here**, in the base file,
+# from the host-computed environment variables ZK_FEATURES_JVMFLAGS and
+# ZK_AUTH_JVMFLAGS. This deliberately avoids composing SERVER_JVMFLAGS across
+# overlay files, where docker-compose's wholesale environment-merge would
+# silently override the base value.
+#
+# The host side (see kazoo/testing/kazoo_ensemble.py) sets:
+#   * ZK_VERSION            -> image tag (e.g. "3.9.4")
+#   * ZK_WORK_DIR           -> host directory mounted at /logs (per node)
+#   * ZK_FEATURES_JVMFLAGS  -> space-separated feature JVM flags ("" for plain)
+#   * ZK_AUTH_JVMFLAGS      -> space-separated auth JVM flags ("" for plain)
+#   * COMPOSE_PROJECT_NAME  -> unique per-session project name (isolation)
+#
+# Service names are stable: zoo1, zoo2, zoo3 (hostnames and DNS names match).
+
+volumes:
+  zoo1_data_vol:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+
+  zoo2_data_vol:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+
+  zoo3_data_vol:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+
+x-zoo-environment: &zoo_env
+  ZOO_4LW_COMMANDS_WHITELIST: "*"
+  # Zk 3.8+ Logback uses ZOO_LOG_DIR and JVMFLAGS for configuration
+  ZOO_LOG_DIR: "/logs"
+  # Feature flags (ZK_FEATURES_JVMFLAGS) and auth flags (ZK_AUTH_JVMFLAGS) are
+  # interpolated here from the host environment; never override
+  # SERVER_JVMFLAGS from an overlay file.
+  SERVER_JVMFLAGS: >-
+    -Dzookeeper.root.logger=INFO,CONSOLE,ROLLINGFILE
+    ${ZK_FEATURES_JVMFLAGS}
+    ${ZK_AUTH_JVMFLAGS}
+  # Zk 3.7 LOG4J writes logs to /logs/zookeeper.log
+  ZOO_LOG4J_PROP: "DEBUG,ROLLINGFILE"
+
+x-zoo-healthcheck: &zoo_healthcheck
+  test:
+    [
+      "CMD-SHELL",
+      "echo 'srvr' | nc localhost 2181 | grep -q 'Zookeeper version'",
+    ]
+  # Aggressive timing so `docker compose up --wait` completes quickly even when
+  # several ZooKeeper nodes must all become healthy before tests start.
+  interval: 3s
+  timeout: 3s
+  retries: 20
+
+services:
+  zoo1:
+    image: zookeeper:${ZK_VERSION}
+    restart: always
+    hostname: zoo1
+    ports:
+      - 0:2181
+    healthcheck: *zoo_healthcheck
+    environment:
+      <<: *zoo_env
+      ZOO_MY_ID: 1
+      ZOO_SERVERS: server.1=0.0.0.0:2888:3888;2181 server.2=zoo2:2888:3888;2181 server.3=zoo3:2888:3888;2181
+    volumes:
+      - zoo1_data_vol:/data
+      - ${ZK_WORK_DIR}/logs/zk1:/logs
+    tmpfs:
+      - "/datalog"
+
+  zoo2:
+    image: zookeeper:${ZK_VERSION}
+    restart: always
+    hostname: zoo2
+    ports:
+      - 0:2181
+    healthcheck: *zoo_healthcheck
+    environment:
+      <<: *zoo_env
+      ZOO_MY_ID: 2
+      ZOO_SERVERS: server.1=zoo1:2888:3888;2181 server.2=0.0.0.0:2888:3888;2181 server.3=zoo3:2888:3888;2181
+    volumes:
+      - zoo2_data_vol:/data
+      - ${ZK_WORK_DIR}/logs/zk2:/logs
+    tmpfs:
+      - "/datalog"
+
+  zoo3:
+    image: zookeeper:${ZK_VERSION}
+    restart: always
+    hostname: zoo3
+    ports:
+      - 0:2181
+    healthcheck: *zoo_healthcheck
+    environment:
+      <<: *zoo_env
+      ZOO_MY_ID: 3
+      ZOO_SERVERS: server.1=zoo1:2888:3888;2181 server.2=zoo2:2888:3888;2181 server.3=0.0.0.0:2888:3888;2181
+    volumes:
+      - zoo3_data_vol:/data
+      - ${ZK_WORK_DIR}/logs/zk3:/logs
+    tmpfs:
+      - "/datalog"

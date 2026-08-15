@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import os
 import pathlib
+import subprocess
 import uuid
 from typing import TYPE_CHECKING
 
@@ -30,7 +31,7 @@ if TYPE_CHECKING:
         Literal,
     )
     from threading import Event
-    from pytest_docker import Services
+    from testcontainers.compose import DockerCompose
 
     from kazoo.client import KazooClient
 
@@ -58,6 +59,20 @@ FEATURE_JVM_PROPERTIES: dict[str, tuple[str, ...]] = {
     "ttl": ("-Dzookeeper.extendedTypesEnabled=true",),
     "readonly": ("-Dzookeeper.readonlymode.enabled=true",),
     "reconfig": ("-Dzookeeper.reconfigEnabled=true",),
+}
+
+# auth -> JVM/system properties (injected into the server environment).
+# These are exported to the compose environment as ZK_AUTH_JVMFLAGS and
+# interpolated into SERVER_JVMFLAGS by the base compose file.
+AUTH_JVM_FLAGS: dict[str, str] = {
+    "plain": "",
+    "digest": (
+        "-Dzookeeper.DigestAuthenticationProvider.superDigest="
+        '"super:D/InIHSb7yEEbrWz8b9l71RjZJU="'
+    ),
+    "sasl_digest": "",
+    "sasl_gssapi": "",
+    "tls": "",
 }
 
 
@@ -119,7 +134,7 @@ class ZkEnsemble:
     zk3_port: int
     # ports: list[int]
     version: str
-    docker_services: Services
+    compose: DockerCompose
     auth: str = "plain"
     features: tuple[str, ...] = ("standard",)
 
@@ -238,13 +253,92 @@ class ZkEnsemble:
 
         client.retry(client.get_async, "/")
 
+    def _run_compose(self, *args: str) -> None:
+        """Run a ``docker compose`` command against this ensemble's stack."""
+        subprocess.run(
+            [*self.compose.compose_command_property, *args],
+            cwd=self.compose.context,
+            check=True,
+        )
+
     def stop(self, name: str) -> None:
         """Stop the specified ZK node."""
-        self.docker_services._docker_compose.execute(f"stop {name}")
+        self._run_compose("stop", name)
 
     def start(self, name: str) -> None:
-        """Stop the specified ZK node."""
-        self.docker_services._docker_compose.execute(f"start {name}")
+        """Start the specified ZK node."""
+        self._run_compose("start", name)
+
+
+#: Module-global handle on the running compose stack, set by the
+#: :func:`docker_compose` fixture and consumed by :func:`dump_ensemble_logs`
+#: while the stack is still up.
+_COMPOSE_HANDLE: DockerCompose | None = None
+
+
+def _ensure_docker_available(context: str) -> None:
+    """Fail fast with an actionable message if docker compose is unavailable."""
+    try:
+        subprocess.run(
+            ["docker", "compose", "version"],
+            cwd=context,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            "The 'docker' CLI was not found on PATH; the kazoo integration "
+            "tests require a Docker Engine with the Compose v2 plugin "
+            "(see https://docs.docker.com/compose/install/)."
+        ) from None
+    except subprocess.CalledProcessError:
+        raise RuntimeError(
+            "`docker compose version` failed; the Compose v2 plugin is "
+            "required (Compose v2.12+ for `up --wait`)."
+        ) from None
+
+    try:
+        subprocess.run(
+            ["docker", "info"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        raise RuntimeError(
+            "`docker info` failed; is the Docker daemon running? The kazoo "
+            "integration tests require a running Docker Engine."
+        ) from None
+
+
+def dump_ensemble_logs() -> None:
+    """Dump stdout/stderr of every ensemble member to aid failure diagnosis.
+
+    Best-effort only: a stack that is mid-teardown or already removed will
+    simply log nothing. Called while the compose stack is still running.
+    """
+    compose = _COMPOSE_HANDLE
+    if compose is None:
+        return
+
+    def _print_logs(service: str) -> None:
+        try:
+            stdout, stderr = compose.get_logs(service)
+        except Exception as exc:  # noqa: BLE001 - best-effort log dump
+            print(f"\n[kazoo] failed to fetch logs for {service}: {exc!r}")
+            return
+        for label, stream in (("stdout", stdout), ("stderr", stderr)):
+            text = (
+                stream.decode("utf-8", "replace")
+                if isinstance(stream, bytes)
+                else stream
+            )
+            print(f"\n===== {service} {label} =====")
+            print(text)
+
+    for service in ("zoo1", "zoo2", "zoo3"):
+        _print_logs(service)
 
 
 def _resolve_axis_options(
@@ -265,6 +359,7 @@ def _resolve_axis_options(
     os.environ["ZK_VERSION"] = version
     os.environ["ZK_AUTH"] = auth
     os.environ["ZK_FEATURES"] = ",".join(features)
+    os.environ["ZK_AUTH_JVMFLAGS"] = AUTH_JVM_FLAGS.get(auth, "")
     return version, auth, features
 
 
@@ -275,6 +370,9 @@ def docker_env(
 ) -> Iterator[KazooZkEnv]:
     with tmp_path_factory.getbasetemp() as tmp_path:
         os.environ["ZK_WORK_DIR"] = str(tmp_path)
+        # Unique per-session compose project name keeps parallel test runs (and
+        # any stray stacks from other projects) isolated from each other.
+        os.environ["COMPOSE_PROJECT_NAME"] = f"kazoo-{uuid.uuid4().hex[:8]}"
         version, auth, features = _resolve_axis_options(pytestconfig)
         yield KazooZkEnv(
             version=version,
@@ -284,10 +382,52 @@ def docker_env(
         )
 
 
+@pytest.fixture(scope="session")
+def docker_compose(
+    request: pytest.FixtureRequest,
+    docker_compose_config: dict[str, Any],
+) -> Iterator[DockerCompose]:
+    """Start the ZooKeeper ensemble stack via docker-compose (testcontainers).
+
+    Session-scoped: the ensemble is brought up once before the first test and
+    torn down (including volumes) after the last test. Individual ensemble
+    members are controlled per-test through :meth:`ZkEnsemble.stop` /
+    :meth:`ZkEnsemble.start`.
+
+    The ``testcontainers.compose.DockerCompose`` driver is imported lazily so
+    that ``kazoo.testing`` stays importable in environments where the test-only
+    dependency is not installed.
+    """
+    from testcontainers.compose import DockerCompose
+
+    # compose files live next to the integration tests (conftest.py location).
+    context = str(
+        pathlib.Path(__file__).resolve().parent.parent / "tests" / "integ"
+    )
+    _ensure_docker_available(context)
+
+    compose = DockerCompose(
+        context=context,
+        compose_file_name=docker_compose_config["compose_files"],
+    )
+    compose.start()
+
+    global _COMPOSE_HANDLE
+    _COMPOSE_HANDLE = compose
+    try:
+        yield compose
+    finally:
+        # Session-scoped fixtures are finalized *before* pytest_sessionfinish,
+        # so dump logs here (stack still running) when any test failed.
+        if request.session.testsfailed:
+            dump_ensemble_logs()
+        _COMPOSE_HANDLE = None
+        compose.stop()
+
+
 @pytest.fixture(scope="function")
 def zkensemble(
-    docker_ip: str,
-    docker_services: Services,
+    docker_compose: DockerCompose,
     docker_env: KazooZkEnv,
 ) -> ZkEnsemble:
     """Provide a per-test handle on the running ZooKeeper ensemble.
@@ -297,20 +437,21 @@ def zkensemble(
     ensemble members (e.g. stop/start via :meth:`ZkEnsemble.stop`).
     """
 
-    # `port_for` takes a container port and returns the corresponding host port
-    zk1_port = docker_services.port_for("zoo1", 2181)
-    zk2_port = docker_services.port_for("zoo2", 2181)
-    zk3_port = docker_services.port_for("zoo3", 2181)
+    # The ensemble exposes its client ports on ephemeral host ports; resolve
+    # the actual host address/ports via the running compose stack.
+    zk1_port = docker_compose.get_service_port("zoo1", 2181)
+    zk2_port = docker_compose.get_service_port("zoo2", 2181)
+    zk3_port = docker_compose.get_service_port("zoo3", 2181)
 
     return ZkEnsemble(
-        zk_ip=docker_ip,
+        zk_ip=docker_compose.get_service_host("zoo1", 2181),
         zk1_port=zk1_port,
         zk2_port=zk2_port,
         zk3_port=zk3_port,
         version=docker_env.version,
         auth=docker_env.auth,
         features=docker_env.features,
-        docker_services=docker_services,
+        compose=docker_compose,
     )
 
 

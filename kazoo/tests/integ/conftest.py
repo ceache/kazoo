@@ -9,6 +9,7 @@ from kazoo.testing.kazoo_ensemble import (
     FEATURE_JVM_PROPERTIES,
     KazooZkEnv,
     check_skip_version_marker,
+    docker_compose,
     docker_env,
     pytest_addoption as kazoo_ensemble_pytest_addoption,
     pytest_configure as kazoo_ensemble_pytest_configure,
@@ -36,20 +37,22 @@ def pytest_configure(config):
 def docker_compose_config(
     docker_env: KazooZkEnv,
 ) -> dict[str, Any]:
-    """Resolve the docker-compose file for the active auth axis.
+    """Resolve the docker-compose overlay files for the active axis.
 
-    Test-specific selection: compose files are organized per authentication
-    flavor under ``docker-compose/<auth>/docker-compose.yml``. If no such
-    flavor directory exists yet, fall back to the default compose file in this
-    directory.
+    The base file (``docker-compose.base.yml``) is always included. For any
+    non-plain authentication flavor an overlay file
+    (``docker-compose.auth-<auth>.yml``) is layered on top via docker-compose
+    multi-file support. Interpolation variables (ZK_VERSION, ZK_FEATURES_JVMFLAGS,
+    ZK_AUTH_JVMFLAGS, ZK_WORK_DIR, COMPOSE_PROJECT_NAME) are exported to the
+    process environment by :func:`~kazoo.testing.kazoo_ensemble.docker_env`
+    and :func:`~kazoo.testing.kazoo_ensemble._resolve_axis_options` before this
+    fixture runs.
     """
     auth = docker_env.auth
-    flavor_dir = os.path.join(os.path.dirname(__file__), "docker-compose", auth)
-    flavor_compose = os.path.join(flavor_dir, "docker-compose.yml")
-    if os.path.exists(flavor_compose):
-        compose_path = flavor_compose
-    else:
-        compose_path = os.path.join(os.path.dirname(__file__), "docker-compose.yml")
+
+    compose_files = ["docker-compose.base.yml"]
+    if auth != "plain":
+        compose_files.append(f"docker-compose.auth-{auth}.yml")
 
     # Expose resolved axis values to docker-compose interpolation.
     os.environ["ZK_VERSION"] = docker_env.version
@@ -65,12 +68,5 @@ def docker_compose_config(
         "version": docker_env.version,
         "auth": auth,
         "features": docker_env.features,
-        "compose_path": compose_path,
+        "compose_files": compose_files,
     }
-
-
-@pytest.fixture(scope="session")
-def docker_compose_file(
-    docker_compose_config: dict[str, Any],
-) -> str:
-    return docker_compose_config["compose_path"]
