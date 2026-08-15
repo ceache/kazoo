@@ -1,0 +1,41 @@
+# Authentication overlay: sasl_digest
+#
+# Enables SASL DIGEST-MD5 client authentication via the official image's
+# public interfaces:
+#   * JVMFLAGS            -> -Djava.security.auth.login.config=<JAAS file>
+#   * ZOO_CFG_EXTRA       -> SASLAuthenticationProvider (fully-qualified) +
+#     enforce.auth.enabled + enforce.auth.schemes=sasl
+#   * a read-only bind of the JAAS config (./jaas/sasl-digest.conf) at
+#     /conf/jaas.conf
+#
+# The JAAS config registers the DigestLoginModule users
+# (user_super / user_jaasuser); clients authenticate with
+# sasl_options={"mechanism": "DIGEST-MD5", "username": "jaasuser",
+# "password": "jaas_password"} (see contracts/client-connection.md).
+#
+# NOTE: never set SERVER_JVMFLAGS here — compose merges environment maps
+# wholesale per key and would silently override the base interpolation.
+
+x-sasl-digest-environment: &sasl_digest_environment
+  JVMFLAGS: "-Djava.security.auth.login.config=/conf/jaas.conf"
+  ZOO_CFG_EXTRA: |
+    authProvider.1=org.apache.zookeeper.server.auth.SASLAuthenticationProvider
+    enforce.auth.enabled=true
+    enforce.auth.schemes=sasl
+
+services:
+  zoo1:
+    environment:
+      <<: *sasl_digest_environment
+    volumes:
+      - ./jaas/sasl-digest.conf:/conf/jaas.conf:ro
+  zoo2:
+    environment:
+      <<: *sasl_digest_environment
+    volumes:
+      - ./jaas/sasl-digest.conf:/conf/jaas.conf:ro
+  zoo3:
+    environment:
+      <<: *sasl_digest_environment
+    volumes:
+      - ./jaas/sasl-digest.conf:/conf/jaas.conf:ro

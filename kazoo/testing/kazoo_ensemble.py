@@ -214,6 +214,7 @@ class ZkEnsemble:
     # ports: list[int]
     version: str
     compose: DockerCompose
+    workdir: pathlib.Path
     auth: str = "plain"
     features: tuple[str, ...] = ("standard",)
 
@@ -225,6 +226,40 @@ class ZkEnsemble:
             ]
         )
         return client_hosts
+
+    def _client_implied_options(self) -> dict[str, Any]:
+        """Connection options implied by the active auth axis.
+
+        Each implied option is returned under its KazooClient kwarg name and
+        is applied independently (see ``get_client``) so that, for example, a
+        superadmin client (which supplies its own ``auth_data``) still gets the
+        ``sasl_options``/``use_ssl`` implied by a SASL or TLS axis (FR-004,
+        contracts/client-connection.md).
+        """
+        opts: dict[str, Any] = {}
+        if self.auth == "digest":
+            opts["auth_data"] = [("digest", "super:super_secret")]
+        elif self.auth == "sasl_digest":
+            opts["sasl_options"] = {
+                "mechanism": "DIGEST-MD5",
+                # DigestServerCallback in the server JAAS config only accepts
+                # the hardcoded test users (see jaas/sasl-digest.conf).
+                "username": "jaasuser",
+                "password": "jaas_password",
+            }
+        elif self.auth in ("tls", "sasl_gssapi"):
+            # TLS transport: client cert + CA produced by the certgen sidecar
+            # (see dockerfiles/certgen; sasl_gssapi tunnels GSSAPI over TLS per
+            # FR-012). The bundle carries the key followed by the certificate,
+            # so it serves as both certfile and keyfile.
+            certs = self.workdir / "certs" / "client"
+            opts["use_ssl"] = True
+            opts["certfile"] = str(certs / "client.pem")
+            opts["keyfile"] = str(certs / "client.pem")
+            opts["ca"] = str(certs / "cacert.pem")
+            if self.auth == "sasl_gssapi":
+                opts["sasl_options"] = {"mechanism": "GSSAPI"}
+        return opts
 
     def get_client(self, /, superadmin: bool = False, **kwargs: Any) -> KazooClient:
         if "hosts" in kwargs:
@@ -250,26 +285,13 @@ class ZkEnsemble:
                         "Existing 'auth_data' in kwargs must be a list of (scheme, credentials) tuples if 'superadmin' is True."
                     )
 
-        # Apply connection options implied by the active auth axis, unless the
-        # caller has already provided an explicit value.
-        if self.auth != "plain":
-            if (
-                "use_ssl" not in kwargs
-                and "auth_data" not in kwargs
-                and "sasl_options" not in kwargs
-            ):
-                if self.auth == "tls":
-                    kwargs["use_ssl"] = True
-                elif self.auth == "digest":
-                    kwargs["auth_data"] = [("digest", "super:super_secret")]
-                elif self.auth in ("sasl_digest", "sasl_gssapi"):
-                    kwargs["sasl_options"] = {
-                        "mechanism": (
-                            "DIGEST-MD5"
-                            if self.auth == "sasl_digest"
-                            else "GSSAPI"
-                        )
-                    }
+        # Apply connection options implied by the active auth axis. Each option
+        # is set only if the caller did not already provide it explicitly, so
+        # an explicit override always wins and no implied option silently
+        # clobbers another (e.g. superadmin's auth_data coexists with the
+        # sasl_options a SASL axis requires).
+        for key, value in self._client_implied_options().items():
+            kwargs.setdefault(key, value)
 
         client = kazoo.client.KazooClient(
             hosts=client_hosts,
@@ -420,6 +442,98 @@ def dump_ensemble_logs() -> None:
         _print_logs(service)
 
 
+def _export_krb5_client_env(
+    docker_env: KazooZkEnv,
+    docker_compose: DockerCompose,
+) -> None:
+    """Export the client-side Kerberos environment for the sasl_gssapi axis.
+
+    The KDC sidecar writes a *server-view* ``krb5.conf`` (advertising
+    ``kdc = kdc:1088``, resolvable only on the compose network) into the
+    shared ``${ZK_WORK_DIR}`` bind mount. Host-side client processes cannot
+    resolve the ``kdc`` compose service name, so this writes a *host-view*
+    ``krb5.conf`` that points at the published KDC port and points the client
+    at its keytab (FR-012, contracts/client-connection.md).
+
+    The KDC publishes both TCP and UDP (``0:1088`` + ``0:1088/udp``) on the
+    same host port; Docker Compose assigns both transports the same ephemeral
+    port, so a single ``kdc = host:port`` line serves both. We resolve that
+    port via the container's TCP publisher (``get_service_port`` itself would
+    raise "not exactly 1 publisher" because the same TargetPort maps both
+    protocols).
+
+    The transport prefix is written explicitly as ``tcp/``: on macOS, Docker
+    Desktop's userland proxy silently drops the KDC's UDP replies, so a
+    plain ``kdc = host:port`` entry leaves Heimdal stuck waiting for a UDP
+    datagram that never arrives (``unable to reach any KDC``). Forcing TCP
+    makes the client reach the KDC reliably on every platform (FR-012).
+
+    The client is pointed at a *fresh per-run* FILE credential cache. Without
+    this, macOS defaults to the shared ``API:...`` cache, which may still hold
+    a TGT + service ticket (``zookeeper/127.0.0.1@EXAMPLE.ORG``) minted by a
+    *previous* KDC instance (each compose stack runs its own realm with new
+    keys). The client would reuse that stale ticket, and the fresh server
+    cannot decrypt it (``Checksum failed`` / ``GSS initiate failed``). Heimdal
+    ``kinit`` ignores ``KRB5CCNAME=FILE:...`` from the environment, so the
+    cache is created explicitly with ``kinit -c <file> -kt <client.keytab>``.
+    """
+    from testcontainers.compose import PublishedPortModel
+
+    container = docker_compose.get_container("kdc")
+    publishers: list[PublishedPortModel] = container.Publishers
+    tcp = [p for p in publishers if (p.Protocol or "").lower() == "tcp"]
+    if not tcp:
+        raise RuntimeError(
+            "sasl_gssapi: no TCP publisher found for the KDC service; "
+            "is docker-compose.auth-sasl-gssapi.yml being used?"
+        )
+    kdc_port = tcp[0].PublishedPort
+    kdc_host = tcp[0].normalize().URL or docker_compose.get_service_host(
+        "zoo1", 2181
+    )
+
+    host_krb5 = docker_env.workdir / "krb5.client.conf"
+    host_krb5.write_text(
+        f"[libdefaults]\n"
+        f" default_realm = EXAMPLE.ORG\n"
+        f" dns_lookup_realm = false\n"
+        f" rdns = false\n"
+        f"[realms]\n"
+        f" EXAMPLE.ORG = {{\n"
+        f"  kdc = tcp/{kdc_host}:{kdc_port}\n"
+        f" }}\n",
+        encoding="utf-8",
+    )
+    os.environ["KRB5_CONFIG"] = str(host_krb5)
+    os.environ["KRB5_CLIENT_KTNAME"] = str(
+        docker_env.workdir / "keytabs" / "client.keytab"
+    )
+
+    # Fresh per-run FILE credential cache for the client. See the docstring.
+    ccache = docker_env.workdir / f"krb5cc-{os.getpid()}"
+    ccache.unlink(missing_ok=True)
+    kinit_env = dict(os.environ)
+    # KRB5CCNAME must be a FILE cache for a kinit -c target; do not inherit a
+    # stale API: cache location or the default macOS shared cache.
+    kinit_env.pop("KRB5CCNAME", None)
+    kinit_rc = subprocess.run(
+        [
+            "kinit", "-c", str(ccache), "-kt",
+            os.environ["KRB5_CLIENT_KTNAME"], "client@EXAMPLE.ORG",
+        ],
+        capture_output=True,
+        text=True,
+        env=kinit_env,
+    ).returncode
+    if kinit_rc != 0:
+        raise RuntimeError(
+            "sasl_gssapi: host-side kinit failed; KDC unreachable from "
+            f"client context (rc={kinit_rc}). See {host_krb5} and the "
+            "tcp/ transport note in the kazoo_ensemble module docstring."
+        )
+    os.environ["KRB5CCNAME"] = f"FILE:{ccache}"
+
+
 def _resolve_axis_options(
     pytestconfig: pytest.Config,
 ) -> tuple[str, str, tuple[str, ...]]:
@@ -526,18 +640,37 @@ def zkensemble(
     ensemble members (e.g. stop/start via :meth:`ZkEnsemble.stop`).
     """
 
+    # TLS-transport axes (tls, sasl_gssapi) expose the client port only on the
+    # secureClientPort (2281, published as an ephemeral host port); plain,
+    # digest and sasl_digest talk to the plain client port (2181).
+    client_port = 2281 if docker_env.auth in ("tls", "sasl_gssapi") else 2181
+
     # The ensemble exposes its client ports on ephemeral host ports; resolve
     # the actual host address/ports via the running compose stack.
-    zk1_port = docker_compose.get_service_port("zoo1", 2181)
-    zk2_port = docker_compose.get_service_port("zoo2", 2181)
-    zk3_port = docker_compose.get_service_port("zoo3", 2181)
+    zk1_port = docker_compose.get_service_port("zoo1", client_port)
+    zk2_port = docker_compose.get_service_port("zoo2", client_port)
+    zk3_port = docker_compose.get_service_port("zoo3", client_port)
+
+    if docker_env.auth == "sasl_gssapi":
+        _export_krb5_client_env(docker_env, docker_compose)
+
+    # ``get_service_host`` returns the publisher's bind address (``0.0.0.0`` /
+    # ``::`` on macOS/Linux; testcontainers only rewrites those to 127.0.0.1 on
+    # Windows). Clients must connect over the loopback interface where the
+    # published ports actually listen, and the GSSAPI service principal for
+    # sasl_gssapi is derived from the connect host (``zookeeper@<host>``), so a
+    # wildcard host there yields ``zookeeper@0.0.0.0`` and a PROCESS_TGS error.
+    zk_ip = docker_compose.get_service_host("zoo1", client_port)
+    if zk_ip in ("0.0.0.0", "::", "::1", "localhost"):
+        zk_ip = "127.0.0.1"
 
     return ZkEnsemble(
-        zk_ip=docker_compose.get_service_host("zoo1", 2181),
+        zk_ip=zk_ip,
         zk1_port=zk1_port,
         zk2_port=zk2_port,
         zk3_port=zk3_port,
         version=docker_env.version,
+        workdir=docker_env.workdir,
         auth=docker_env.auth,
         features=docker_env.features,
         compose=docker_compose,

@@ -57,7 +57,11 @@ def docker_compose_config(
 
     compose_files = ["docker-compose.base.yml"]
     if auth != "plain":
-        compose_files.append(f"docker-compose.auth-{auth}.yml")
+        # The overlay files use a hyphenated flavor name
+        # (docker-compose.auth-sasl-digest.yml) while the auth axis value uses
+        # an underscore (sasl_digest); map between the two.
+        overlay = auth.replace("_", "-")
+        compose_files.append(f"docker-compose.auth-{overlay}.yml")
 
     # Expose resolved axis values to docker-compose interpolation.
     os.environ["ZK_VERSION"] = docker_env.version
