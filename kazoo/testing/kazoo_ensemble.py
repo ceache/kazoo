@@ -4,8 +4,14 @@ import functools
 import os
 import pathlib
 import subprocess
+import sys
 import uuid
 from typing import TYPE_CHECKING
+
+if sys.version_info >= (3, 11):
+    from enum import StrEnum
+else:
+    from backports.strenum import StrEnum
 
 import attrs
 import pytest
@@ -35,44 +41,47 @@ if TYPE_CHECKING:
 
     from kazoo.client import KazooClient
 
+
 # The three testing axes. The "auth" axis selects the docker-compose flavor
 # (and therefore which client-side connection options make sense), while the
 # "features" axis controls ZooKeeper JVM/system flags.
-ZK_AUTH_MODES: tuple[str, ...] = (
-    "plain",
-    "digest",
-    "sasl_digest",
-    "sasl_gssapi",
-    "tls",
-)
-ZK_FEATURES: tuple[str, ...] = (
-    "standard",
-    "ttl",
-    "readonly",
-    "reconfig",
-)
-ZK_DEFAULT_VERSION = "3.9.4"
+class ZKAuthMode(StrEnum):
+    PLAIN = "plain"
+    DIGEST = "digest"
+    SASL_DIGEST = "sasl_digest"
+    SASL_GSSAPI = "sasl_gssapi"
+    TLS = "tls"
+
+
+class ZKFeature(StrEnum):
+    STANDARD = "standard"
+    TTL = "ttl"
+    READONLY = "readonly"
+    RECONFIG = "reconfig"
+
+
+ZK_DEFAULT_VERSION = "3.9.5"
 
 # feature -> JVM/system properties (injected into the server environment)
-FEATURE_JVM_PROPERTIES: dict[str, tuple[str, ...]] = {
-    "standard": (),
-    "ttl": ("-Dzookeeper.extendedTypesEnabled=true",),
-    "readonly": ("-Dzookeeper.readonlymode.enabled=true",),
-    "reconfig": ("-Dzookeeper.reconfigEnabled=true",),
+FEATURE_JVM_PROPERTIES: dict[ZKFeature, tuple[str, ...]] = {
+    ZKFeature.STANDARD: (),
+    ZKFeature.TTL: ("-Dzookeeper.extendedTypesEnabled=true",),
+    ZKFeature.READONLY: ("-Dzookeeper.readonlymode.enabled=true",),
+    ZKFeature.RECONFIG: ("-Dzookeeper.reconfigEnabled=true",),
 }
 
 # auth -> JVM/system properties (injected into the server environment).
 # These are exported to the compose environment as ZK_AUTH_JVMFLAGS and
 # interpolated into SERVER_JVMFLAGS by the base compose file.
-AUTH_JVM_FLAGS: dict[str, str] = {
-    "plain": "",
-    "digest": (
+AUTH_JVM_FLAGS: dict[ZKAuthMode, str] = {
+    ZKAuthMode.PLAIN: "",
+    ZKAuthMode.DIGEST: (
         "-Dzookeeper.DigestAuthenticationProvider.superDigest="
         '"super:D/InIHSb7yEEbrWz8b9l71RjZJU="'
     ),
-    "sasl_digest": "",
-    "sasl_gssapi": "",
-    "tls": "",
+    ZKAuthMode.SASL_DIGEST: "",
+    ZKAuthMode.SASL_GSSAPI: "",
+    ZKAuthMode.TLS: "",
 }
 
 
@@ -84,14 +93,14 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=None,
         help=(
             "ZooKeeper server version (e.g. 3.7, 3.8, 3.9). "
-            "Defaults to $ZK_VERSION or '3.9.4'."
+            "Defaults to $ZK_VERSION or '3.9.5'."
         ),
     )
     parser.addoption(
         "--zk-auth",
         action="store",
         default=None,
-        choices=list(ZK_AUTH_MODES),
+        choices=[mode.value for mode in ZKAuthMode],
         help=(
             "ZooKeeper authentication flavor: plain, digest, sasl_digest, "
             "sasl_gssapi, tls. Defaults to $ZK_AUTH or 'plain'."
@@ -135,8 +144,8 @@ def pytest_configure(config):
 def _evaluate_axis_markers(
     item: pytest.Item,
     zk_version: str,
-    auth: str,
-    features: tuple[str, ...],
+    auth: ZKAuthMode,
+    features: tuple[ZKFeature, ...],
 ) -> str | None:
     """Evaluate the zk_version/zk_auth/zk_features markers on a test item.
 
@@ -153,23 +162,27 @@ def _evaluate_axis_markers(
 
     marker = item.get_closest_marker("zk_auth")
     if marker:
+        # Marker args are plain strings (e.g. @pytest.mark.zk_auth("digest"));
+        # StrEnum members compare equal to their value, so membership tests
+        # against those strings work unchanged.
         allowed = marker.args or ()
         skip = marker.kwargs.get("skip") or ()
-        if allowed and auth not in allowed:
+        if allowed and auth.value not in allowed:
             reasons.append(
-                f"Requires auth in {sorted(allowed)} (active: {auth})"
+                f"Requires auth in {sorted(allowed)} (active: {auth.value})"
             )
-        if auth in skip:
-            reasons.append(f"Incompatible with auth {auth}")
+        if auth.value in skip:
+            reasons.append(f"Incompatible with auth {auth.value}")
 
     marker = item.get_closest_marker("zk_features")
     if marker:
         require = marker.kwargs.get("require") or ()
         skip_features = marker.kwargs.get("skip") or ()
-        missing = [f for f in require if f not in features]
+        active = {f.value for f in features}
+        missing = [f for f in require if f not in active]
         if missing:
             reasons.append(f"Missing required feature(s): {missing}")
-        incompatible = [f for f in skip_features if f in features]
+        incompatible = [f for f in skip_features if f in active]
         if incompatible:
             reasons.append(
                 f"Incompatible with active feature(s): {incompatible}"
@@ -201,8 +214,8 @@ def pytest_collection_modifyitems(
 class KazooZkEnv:
     version: str
     workdir: pathlib.Path
-    auth: str = "plain"
-    features: tuple[str, ...] = ("standard",)
+    auth: ZKAuthMode = ZKAuthMode.PLAIN
+    features: tuple[ZKFeature, ...] = (ZKFeature.STANDARD,)
 
 
 @attrs.frozen(kw_only=True, auto_attribs=True)
@@ -215,8 +228,8 @@ class ZkEnsemble:
     version: str
     compose: DockerCompose
     workdir: pathlib.Path
-    auth: str = "plain"
-    features: tuple[str, ...] = ("standard",)
+    auth: ZKAuthMode = ZKAuthMode.PLAIN
+    features: tuple[ZKFeature, ...] = (ZKFeature.STANDARD,)
 
     def get_hosts(self) -> str:
         client_hosts = ",".join(
@@ -237,9 +250,9 @@ class ZkEnsemble:
         contracts/client-connection.md).
         """
         opts: dict[str, Any] = {}
-        if self.auth == "digest":
+        if self.auth is ZKAuthMode.DIGEST:
             opts["auth_data"] = [("digest", "super:super_secret")]
-        elif self.auth == "sasl_digest":
+        elif self.auth is ZKAuthMode.SASL_DIGEST:
             opts["sasl_options"] = {
                 "mechanism": "DIGEST-MD5",
                 # DigestServerCallback in the server JAAS config only accepts
@@ -247,7 +260,7 @@ class ZkEnsemble:
                 "username": "jaasuser",
                 "password": "jaas_password",
             }
-        elif self.auth in ("tls", "sasl_gssapi"):
+        elif self.auth in (ZKAuthMode.TLS, ZKAuthMode.SASL_GSSAPI):
             # TLS transport: client cert + CA produced by the certgen sidecar
             # (see dockerfiles/certgen; sasl_gssapi tunnels GSSAPI over TLS per
             # FR-012). The bundle carries the key followed by the certificate,
@@ -257,7 +270,7 @@ class ZkEnsemble:
             opts["certfile"] = str(certs / "client.pem")
             opts["keyfile"] = str(certs / "client.pem")
             opts["ca"] = str(certs / "cacert.pem")
-            if self.auth == "sasl_gssapi":
+            if self.auth is ZKAuthMode.SASL_GSSAPI:
                 opts["sasl_options"] = {"mechanism": "GSSAPI"}
         return opts
 
@@ -536,22 +549,28 @@ def _export_krb5_client_env(
 
 def _resolve_axis_options(
     pytestconfig: pytest.Config,
-) -> tuple[str, str, tuple[str, ...]]:
+) -> tuple[str, ZKAuthMode, tuple[ZKFeature, ...]]:
     """Resolve the three axes from CLI options, falling back to env vars."""
     version = pytestconfig.getoption("--zk-version") or os.environ.get(
         "ZK_VERSION", ZK_DEFAULT_VERSION
     )
-    auth = pytestconfig.getoption("--zk-auth") or os.environ.get(
-        "ZK_AUTH", "plain"
+    auth = ZKAuthMode(
+        pytestconfig.getoption("--zk-auth") or os.environ.get(
+            "ZK_AUTH", ZKAuthMode.PLAIN.value
+        )
     )
-    features_str = pytestconfig.getoption("--zk-features") or os.environ.get(
-        "ZK_FEATURES", "standard"
+    features = tuple(
+        ZKFeature(f.strip())
+        for f in (
+            pytestconfig.getoption("--zk-features")
+            or os.environ.get("ZK_FEATURES", ZKFeature.STANDARD.value)
+        ).split(",")
+        if f.strip()
     )
-    features = tuple(f.strip() for f in features_str.split(",") if f.strip())
     # Make the resolved values available to docker-compose interpolation.
     os.environ["ZK_VERSION"] = version
-    os.environ["ZK_AUTH"] = auth
-    os.environ["ZK_FEATURES"] = ",".join(features)
+    os.environ["ZK_AUTH"] = auth.value
+    os.environ["ZK_FEATURES"] = ",".join(f.value for f in features)
     os.environ["ZK_AUTH_JVMFLAGS"] = AUTH_JVM_FLAGS.get(auth, "")
     return version, auth, features
 
@@ -646,7 +665,11 @@ def zkensemble(
     # TLS-transport axes (tls, sasl_gssapi) expose the client port only on the
     # secureClientPort (2281, published as an ephemeral host port); plain,
     # digest and sasl_digest talk to the plain client port (2181).
-    client_port = 2281 if docker_env.auth in ("tls", "sasl_gssapi") else 2181
+    client_port = (
+        2281
+        if docker_env.auth in (ZKAuthMode.TLS, ZKAuthMode.SASL_GSSAPI)
+        else 2181
+    )
 
     # The ensemble exposes its client ports on ephemeral host ports; resolve
     # the actual host address/ports via the running compose stack.
@@ -654,7 +677,7 @@ def zkensemble(
     zk2_port = docker_compose.get_service_port("zoo2", client_port)
     zk3_port = docker_compose.get_service_port("zoo3", client_port)
 
-    if docker_env.auth == "sasl_gssapi":
+    if docker_env.auth is ZKAuthMode.SASL_GSSAPI:
         _export_krb5_client_env(docker_env, docker_compose)
 
     # ``get_service_host`` returns the publisher's bind address (``0.0.0.0`` /

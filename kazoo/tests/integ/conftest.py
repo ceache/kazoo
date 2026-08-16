@@ -7,6 +7,7 @@ import pytest
 
 from kazoo.testing.kazoo_ensemble import (
     FEATURE_JVM_PROPERTIES,
+    ZKAuthMode,
     KazooZkEnv,
     check_skip_version_marker,
     docker_compose,
@@ -56,17 +57,17 @@ def docker_compose_config(
     auth = docker_env.auth
 
     compose_files = ["docker-compose.base.yml"]
-    if auth != "plain":
+    if auth is not ZKAuthMode.PLAIN:
         # The overlay files use a hyphenated flavor name
         # (docker-compose.auth-sasl-digest.yml) while the auth axis value uses
         # an underscore (sasl_digest); map between the two.
-        overlay = auth.replace("_", "-")
+        overlay = auth.value.replace("_", "-")
         compose_files.append(f"docker-compose.auth-{overlay}.yml")
 
     # Expose resolved axis values to docker-compose interpolation.
     os.environ["ZK_VERSION"] = docker_env.version
-    os.environ["ZK_AUTH"] = auth
-    os.environ["ZK_FEATURES"] = ",".join(docker_env.features)
+    os.environ["ZK_AUTH"] = auth.value
+    os.environ["ZK_FEATURES"] = ",".join(f.value for f in docker_env.features)
     jvm_flags = []
     for feature in docker_env.features:
         for prop in FEATURE_JVM_PROPERTIES.get(feature, ()):
