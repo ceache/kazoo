@@ -138,17 +138,17 @@ description: "Task list for the docker-compose test harness implementation"
 
 ### Implementation for User Story 5
 
-- [ ] T028 [US5] Migrate `kazoo/tests/test_election.py` from `KazooTestCase` to the `zkclient`/`zkensemble` fixtures (swap `self.client` → `zkclient`, `self.cluster[i].stop()` → `zkensemble.stop("zooN")`, `self.expire_session` → `client.harness_expire_session`) with no coverage loss (R-08)
-- [ ] T029 [P] [US5] Migrate `kazoo/tests/test_lock.py` and `kazoo/tests/test_queue.py` to the new fixtures (R-08)
-- [ ] T030 [P] [US5] Migrate `kazoo/tests/test_party.py` and `kazoo/tests/test_partitioner.py` to the new fixtures (R-08)
-- [ ] T031 [P] [US5] Migrate `kazoo/tests/test_lease.py` and `kazoo/tests/test_interrupt.py` to the new fixtures (R-08)
-- [ ] T032 [P] [US5] Migrate `kazoo/tests/test_gevent_handler.py` to the new fixtures, using `zkensemble.get_client(handler=...)` (handler-specific; R-08)
-- [ ] T033 [P] [US5] Migrate `kazoo/tests/test_sasl.py` to the new fixtures, mapping its classes to the `sasl_digest` and `sasl_gssapi` flavors (R-08/US3); delete the `KRB5_TEST_ENV`/`init_krb5.sh` GSSAPI setup paths
-- [ ] T034 [US5] Delete `kazoo/testing/harness.py`, `kazoo/testing/common.py`, and strip the exports in `kazoo/testing/__init__.py` (legacy public API removal — breaking change, FR-010)
-- [ ] T035 [US5] Delete `ensure-zookeeper-env.sh`, `init_krb5.sh`, and the root `docker-compose.yml` / `docker-compose-test.yml` (superseded by `kazoo/tests/integ/`)
-- [ ] T036 [US5] Add a `BREAKING CHANGES` entry to `CHANGES.md`: legacy `kazoo.testing` public API removed, Python 3.8 support dropped, harness now requires testcontainers + Python >= 3.9 (FR-010, constitution IV)
-- [ ] T037 [US5] Rewrite `.github/workflows/testing.yml`: tiered matrix (all supported Python 3.9–3.14 + pypy × ZK `3.7.2`/`3.8.3`/`3.9.1`), auth (`digest`, `sasl_digest`, `tls`, `sasl_gssapi`) and feature (`ttl,reconfig`) axes on the latest Python target (FR-017/SC-007); remove the `zookeeper/` download cache, `ensure-zookeeper-env.sh`, apt `krb5-*`/`libevent-dev` installs, and the Python 3.8 runner entry; run `pytest kazoo/tests/ -q` via `pip install -e '.[test]'`
-- [ ] T038 [US5] Update `tox.ini`: remove `ensure-zookeeper-env.sh` / `init_krb5.sh` setup from test envs; ensure the integ test env declares `testcontainers` (R-10); keep the `pep8`/`black`/`mypy`/`gevent`/`eventlet`/`sasl`/`docs`/`pypy3` envlist
+- [x] T028 [US5] Migrate `kazoo/tests/test_election.py` from `KazooTestCase` to the `zkclient`/`zkensemble` fixtures (swap `self.client` → `zkclient`, `self.cluster[i].stop()` → `zkensemble.stop("zooN")`, `self.expire_session` → `client.harness_expire_session`) with no coverage loss (R-08)
+- [x] T029 [P] [US5] Migrate `kazoo/tests/test_lock.py` and `kazoo/tests/test_queue.py` to the new fixtures (R-08)
+- [x] T030 [P] [US5] Migrate `kazoo/tests/test_party.py` and `kazoo/tests/test_partitioner.py` to the new fixtures (R-08)
+- [x] T031 [P] [US5] Migrate `kazoo/tests/test_lease.py` and `kazoo/tests/test_interrupt.py` to the new fixtures (R-08)
+- [x] T032 [P] [US5] Migrate `kazoo/tests/test_gevent_handler.py` to the new fixtures, using `zkensemble.get_client(handler=...)` (handler-specific; R-08)
+- [x] T033 [P] [US5] Migrate `kazoo/tests/test_sasl.py` to the new fixtures, mapping its classes to the `sasl_digest` and `sasl_gssapi` flavors (R-08/US3); delete the `KRB5_TEST_ENV`/`init_krb5.sh` GSSAPI setup paths
+- [x] T034 [US5] Delete `kazoo/testing/harness.py`, `kazoo/testing/common.py`, and strip the exports in `kazoo/testing/__init__.py` (legacy public API removal — breaking change, FR-010)
+- [x] T035 [US5] Delete `ensure-zookeeper-env.sh`, `init_krb5.sh`, and the root `docker-compose.yml` / `docker-compose-test.yml` (superseded by `kazoo/tests/integ/`)
+- [x] T036 [US5] Add a `BREAKING CHANGES` entry to `CHANGES.md`: legacy `kazoo.testing` public API removed, Python 3.8 support dropped, harness now requires testcontainers + Python >= 3.9 (FR-010, constitution IV)
+- [x] T037 [US5] Rewrite `.github/workflows/testing.yml`: tiered matrix (all supported Python 3.9–3.14 + pypy × ZK `3.7.2`/`3.8.3`/`3.9.1`), auth (`digest`, `sasl_digest`, `tls`, `sasl_gssapi`) and feature (`ttl,reconfig`) axes on the latest Python target (FR-017/SC-007); remove the `zookeeper/` download cache, `ensure-zookeeper-env.sh`, apt `krb5-*`/`libevent-dev` installs, and the Python 3.8 runner entry; run `pytest kazoo/tests/ -q` via `pip install -e '.[test]'`
+- [x] T038 [US5] Update `tox.ini`: remove `ensure-zookeeper-env.sh` / `init_krb5.sh` setup from test envs; ensure the integ test env declares `testcontainers` (R-10); keep the `pep8`/`black`/`mypy`/`gevent`/`eventlet`/`sasl`/`docs`/`pypy3` envlist
 
 **Checkpoint**: Zero hand-rolled process management remains; the full suite passes on the compose path; CI runs the tiered matrix without ZK/Java/krb5 on runners.
 
