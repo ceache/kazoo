@@ -23,6 +23,7 @@
 #   * ZK_WORK_DIR           -> host directory mounted at /logs (per node)
 #   * ZK_FEATURES_JVMFLAGS  -> space-separated feature JVM flags ("" for plain)
 #   * ZK_AUTH_JVMFLAGS      -> space-separated auth JVM flags ("" for plain)
+#   * ZK_CAPTURE_JVMFLAGS   -> -javaagent keylog flag ("" unless capture+tls)
 #   * COMPOSE_PROJECT_NAME  -> unique per-session project name (isolation)
 #
 # Service names are stable: zoo1, zoo2, zoo3 (hostnames and DNS names match).
@@ -47,13 +48,17 @@ x-zoo-environment: &zoo_env
   ZOO_4LW_COMMANDS_WHITELIST: "*"
   # Zk 3.8+ Logback uses ZOO_LOG_DIR and JVMFLAGS for configuration
   ZOO_LOG_DIR: "/logs"
-  # Feature flags (ZK_FEATURES_JVMFLAGS) and auth flags (ZK_AUTH_JVMFLAGS) are
-  # interpolated here from the host environment; never override
-  # SERVER_JVMFLAGS from an overlay file.
+  # Feature flags (ZK_FEATURES_JVMFLAGS), auth flags (ZK_AUTH_JVMFLAGS) and the
+  # capture keylog flag (ZK_CAPTURE_JVMFLAGS) are interpolated here from the
+  # host environment; never override SERVER_JVMFLAGS from an overlay file.
+  # ZK_CAPTURE_JVMFLAGS is set to the -javaagent: keylog flag only when
+  # `capture` is active on the tls flavor (see
+  # specs/002-network-capture/research.md R-02).
   SERVER_JVMFLAGS: >-
     -Dzookeeper.root.logger=INFO,CONSOLE,ROLLINGFILE
     ${ZK_FEATURES_JVMFLAGS}
     ${ZK_AUTH_JVMFLAGS}
+    ${ZK_CAPTURE_JVMFLAGS}
   # Zk 3.7 LOG4J writes logs to /logs/zookeeper.log
   ZOO_LOG4J_PROP: "DEBUG,ROLLINGFILE"
 

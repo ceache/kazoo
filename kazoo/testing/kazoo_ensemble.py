@@ -57,6 +57,11 @@ class ZKFeature(StrEnum):
     TTL = "ttl"
     READONLY = "readonly"
     RECONFIG = "reconfig"
+    # Harness-level feature: adds the capture sidecar to the compose stack.
+    # Deliberately absent from FEATURE_JVM_PROPERTIES below — capture is a
+    # harness observation feature, not a ZooKeeper server feature, so it must
+    # contribute no server JVM flags (FR-007, R-04).
+    CAPTURE = "capture"
 
 
 ZK_DEFAULT_VERSION = "3.9.5"
@@ -111,7 +116,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=None,
         help=(
             "Comma-separated ZooKeeper feature set: standard, ttl, readonly, "
-            "reconfig. Defaults to $ZK_FEATURES or 'standard'."
+            "reconfig, capture. Defaults to $ZK_FEATURES or 'standard'."
         ),
     )
 
@@ -590,6 +595,18 @@ def _resolve_axis_options(
     os.environ["ZK_AUTH"] = auth.value
     os.environ["ZK_FEATURES"] = ",".join(f.value for f in features)
     os.environ["ZK_AUTH_JVMFLAGS"] = AUTH_JVM_FLAGS.get(auth, "")
+    # Capture keylog agent flag (R-02): injected into SERVER_JVMFLAGS only
+    # when capture is active on the tls flavor. The -javaagent path is
+    # identical for every node; each JVM's /logs mount is per-node, so a
+    # shared path yields per-node host keylog files (zk1|zk2|zk3). Always
+    # export the variable so the base-file interpolation resolves cleanly.
+    if ZKFeature.CAPTURE in features and auth is ZKAuthMode.TLS:
+        capture_jvmflags = (
+            "-javaagent:/agent/extract-tls-secrets.jar=/logs/tls-secrets.log"
+        )
+    else:
+        capture_jvmflags = ""
+    os.environ["ZK_CAPTURE_JVMFLAGS"] = capture_jvmflags
     return version, auth, features
 
 
@@ -656,6 +673,23 @@ def docker_compose(
         context=context,
         compose_file_name=docker_compose_config["compose_files"],
     )
+
+    # Capture preflight (R-07): when `capture` is active, build the in-repo
+    # images declared by the capture overlay (dockerfiles/capture and
+    # dockerfiles/tls-secrets-agent) *before* `up`, so a build failure aborts
+    # the session with an actionable message instead of failing opaquely
+    # mid-`up`. The fetch of the pinned keylog agent jar happens inside that
+    # build (R-10), so a network/registry outage is reported here.
+    if ZKFeature.CAPTURE in docker_compose_config["features"]:
+        try:
+            compose.build()
+        except Exception as exc:  # noqa: BLE001 - surface actionable message
+            raise RuntimeError(
+                "capture: in-repo image build failed before the stack started "
+                f"({exc}). Check Docker network/registry reachability for "
+                "dockerfiles/capture (apk tshark) and dockerfiles/"
+                "tls-secrets-agent (Maven Central extract-tls-secrets jar)."
+            ) from exc
 
     global _COMPOSE_HANDLE
     try:

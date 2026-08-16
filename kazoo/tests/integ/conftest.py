@@ -8,6 +8,7 @@ import pytest
 from kazoo.testing.kazoo_ensemble import (
     FEATURE_JVM_PROPERTIES,
     ZKAuthMode,
+    ZKFeature,
     KazooZkEnv,
     check_skip_version_marker,
     docker_compose,
@@ -77,6 +78,12 @@ def docker_compose_config(
         # an underscore (sasl_digest); map between the two.
         overlay = auth.value.replace("_", "-")
         compose_files.append(f"docker-compose.auth-{overlay}.yml")
+
+    # The capture overlay layers the tshark sidecar (and, on tls, the keylog
+    # agent provisioning) on top of whatever base/auth combination is active
+    # (R-04).
+    if ZKFeature.CAPTURE in docker_env.features:
+        compose_files.append("docker-compose.features-capture.yml")
 
     # Expose resolved axis values to docker-compose interpolation.
     os.environ["ZK_VERSION"] = docker_env.version
