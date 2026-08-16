@@ -100,7 +100,7 @@ services:
       - ${ZK_WORK_DIR}/krb5.conf:/conf/krb5.conf:ro
       - ${ZK_WORK_DIR}/keytabs/server.keytab:/conf/server.keytab:ro
     ports:
-      - "0:2281"
+      - ${ZOO1_SECURE_PORT}:2281
 
   zoo2:
     depends_on:
@@ -114,7 +114,7 @@ services:
       - ${ZK_WORK_DIR}/krb5.conf:/conf/krb5.conf:ro
       - ${ZK_WORK_DIR}/keytabs/server.keytab:/conf/server.keytab:ro
     ports:
-      - "0:2281"
+      - ${ZOO2_SECURE_PORT}:2281
 
   zoo3:
     depends_on:
@@ -128,4 +128,4 @@ services:
       - ${ZK_WORK_DIR}/krb5.conf:/conf/krb5.conf:ro
       - ${ZK_WORK_DIR}/keytabs/server.keytab:/conf/server.keytab:ro
     ports:
-      - "0:2281"
+      - ${ZOO3_SECURE_PORT}:2281

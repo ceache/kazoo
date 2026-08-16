@@ -511,9 +511,14 @@ def _export_krb5_client_env(
             "is docker-compose.auth-sasl-gssapi.yml being used?"
         )
     kdc_port = tcp[0].PublishedPort
-    kdc_host = tcp[0].normalize().URL or docker_compose.get_service_host(
-        "zoo1", 2181
-    )
+    # ``normalize().URL`` returns the publisher's bind address (``0.0.0.0`` /
+    # ``::`` on macOS/Linux), which host-side kinit cannot reach. Clients must
+    # target the loopback interface where Docker publishes the port, exactly
+    # like the ensemble host resolution below (see the ``zk_ip`` normalization
+    # in the ``zkensemble`` fixture).
+    kdc_host = tcp[0].normalize().URL
+    if not kdc_host or kdc_host in ("0.0.0.0", "::", "::1", "localhost"):
+        kdc_host = "127.0.0.1"
 
     host_krb5 = docker_env.workdir / "krb5.client.conf"
     host_krb5.write_text(
@@ -593,22 +598,34 @@ def docker_env(
     pytestconfig: pytest.Config,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[KazooZkEnv]:
-    with tmp_path_factory.getbasetemp() as tmp_path:
-        # Compose interpolates ${ZK_WORK_DIR} into bind-mount sources; on
-        # Windows the host path must be POSIX-style (C:/Users/...) for Docker
-        # Desktop, while host-side file ops below keep the native Path
-        # (FR-011).
-        os.environ["ZK_WORK_DIR"] = tmp_path.as_posix()
-        # Unique per-session compose project name keeps parallel test runs (and
-        # any stray stacks from other projects) isolated from each other.
-        os.environ["COMPOSE_PROJECT_NAME"] = f"kazoo-{uuid.uuid4().hex[:8]}"
-        version, auth, features = _resolve_axis_options(pytestconfig)
-        yield KazooZkEnv(
-            version=version,
-            workdir=tmp_path,
-            auth=auth,
-            features=features,
-        )
+    tmp_path: pathlib.Path = tmp_path_factory.getbasetemp()
+    # Compose interpolates ${ZK_WORK_DIR} into bind-mount sources; on
+    # Windows the host path must be POSIX-style (C:/Users/...) for Docker
+    # Desktop, while host-side file ops below keep the native Path
+    # (FR-011).
+    os.environ["ZK_WORK_DIR"] = tmp_path.as_posix()
+    # Unique per-session compose project name keeps parallel test runs (and
+    # any stray stacks from other projects) isolated from each other.
+    os.environ["COMPOSE_PROJECT_NAME"] = f"kazoo-{uuid.uuid4().hex[:8]}"
+    # Failure-injection tests (FR-009) stop and restart individual ensemble
+    # members via `docker compose stop`/`start`. Docker re-randomizes
+    # ephemeral host port mappings (`0:2181`) every time a container is
+    # restarted, which would silently break those tests: the client keeps
+    # reconnecting to the previously resolved host:port and gets
+    # Connection refused. Publish each node on a *fixed* per-session host
+    # port (allocated from a private range) so the mapping survives
+    # restarts, while the random base keeps simultaneous runs isolated.
+    _port_base = 22300 + (uuid.uuid4().int % 500) * 6
+    for i, name in enumerate(("zoo1", "zoo2", "zoo3")):
+        os.environ[f"{name.upper()}_CLIENT_PORT"] = str(_port_base + i * 3)
+        os.environ[f"{name.upper()}_SECURE_PORT"] = str(_port_base + i * 3 + 1)
+    version, auth, features = _resolve_axis_options(pytestconfig)
+    yield KazooZkEnv(
+        version=version,
+        workdir=tmp_path,
+        auth=auth,
+        features=features,
+    )
 
 
 @pytest.fixture(scope="session")

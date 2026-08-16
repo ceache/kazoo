@@ -75,7 +75,7 @@ services:
     restart: always
     hostname: zoo1
     ports:
-      - 0:2181
+      - ${ZOO1_CLIENT_PORT}:2181
     healthcheck: *zoo_healthcheck
     environment:
       <<: *zoo_env
@@ -92,7 +92,7 @@ services:
     restart: always
     hostname: zoo2
     ports:
-      - 0:2181
+      - ${ZOO2_CLIENT_PORT}:2181
     healthcheck: *zoo_healthcheck
     environment:
       <<: *zoo_env
@@ -109,7 +109,7 @@ services:
     restart: always
     hostname: zoo3
     ports:
-      - 0:2181
+      - ${ZOO3_CLIENT_PORT}:2181
     healthcheck: *zoo_healthcheck
     environment:
       <<: *zoo_env

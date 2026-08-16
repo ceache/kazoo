@@ -52,7 +52,7 @@ services:
       - ${ZK_WORK_DIR}/certs/server/keystore.p12:/conf/keystore.p12:ro
       - ${ZK_WORK_DIR}/certs/server/truststore.p12:/conf/truststore.p12:ro
     ports:
-      - "0:2281"
+      - ${ZOO1_SECURE_PORT}:2281
 
   zoo2:
     depends_on:
@@ -64,7 +64,7 @@ services:
       - ${ZK_WORK_DIR}/certs/server/keystore.p12:/conf/keystore.p12:ro
       - ${ZK_WORK_DIR}/certs/server/truststore.p12:/conf/truststore.p12:ro
     ports:
-      - "0:2281"
+      - ${ZOO2_SECURE_PORT}:2281
 
   zoo3:
     depends_on:
@@ -76,4 +76,4 @@ services:
       - ${ZK_WORK_DIR}/certs/server/keystore.p12:/conf/keystore.p12:ro
       - ${ZK_WORK_DIR}/certs/server/truststore.p12:/conf/truststore.p12:ro
     ports:
-      - "0:2281"
+      - ${ZOO3_SECURE_PORT}:2281
