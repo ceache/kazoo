@@ -1,0 +1,27 @@
+# Feature overlay: capture
+#
+# Layers the network-capture capability onto the ensemble stack whenever the
+# `capture` axis value is active (see specs/002-network-capture/).
+#
+#   * capture sidecar (build ./dockerfiles/capture) -> single tshark process
+#     on the compose bridge in promiscuous mode, capturing full-length
+#     frames (-s 0) of all client-port traffic (clear 2181, secure 2281) for
+#     the whole session into ${ZK_WORK_DIR}/captures/kazoo-client.pcapng;
+#     bind mount survives `docker compose down --volumes`.
+#   * tls-secrets-agent sidecar (build ./dockerfiles/tls-secrets-agent) ->
+#     provisions the pinned, checksum-verified `extract-tls-secrets` Java
+#     agent jar into ${ZK_WORK_DIR}/agent; zoo services mount the jar
+#     read-only and, on the tls flavor, launch each JVM with -javaagent so
+#     the SSLKEYLOGFILE sessions can be decrypted from emitted material only.
+#
+# NOTE: never set SERVER_JVMFLAGS here — compose merges environment maps
+# wholesale per key and would silently override the base interpolation. The
+# -javaagent flag is injected only through the base file's
+# ${ZK_CAPTURE_JVMFLAGS} slot (see specs/002-network-capture/research.md R-02).
+#
+# NOTE: volumes/ports are plain lists — docker-compose concatenates them with
+# the base file's lists across files, so no anchor merge is needed.
+
+# Service definitions are layered in by the capture (R-01) and
+# tls-secrets-agent (R-10) implementation tasks (US1/US2).
+services: {}
