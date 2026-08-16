@@ -1,4 +1,4 @@
-"""SASL authentication tests migrated from the legacy ``kazoo/tests/test_sasl.py``.
+"""SASL authentication tests migrated from the legacy test_sasl.py module.
 
 The legacy file exercised SASL against a ZK cluster started with
 ``ZOOKEEPER_JAAS_AUTH`` and the ``KRB5_TEST_ENV``/``init_krb5.sh`` GSSAPI
@@ -44,7 +44,7 @@ from kazoo.tests.integ.test_auth import (
 
 
 class TestLegacySASLDigestAuthentication:
-    """Legacy ``auth_data=[("sasl", "user:pass")]`` string form (deprecated)."""
+    """Legacy ``auth_data=[("sasl", "user:pass")]`` string form."""
 
     @pytest.mark.zk_auth("sasl_digest")
     def test_connect_sasl_auth(self, zkensemble, zkchroot):
@@ -86,8 +86,11 @@ class TestLegacySASLDigestAuthentication:
         )
         try:
             client.start(timeout=5)
-        except (AuthFailedError, SessionClosedRequireSaslError,
-                KazooTimeoutError):
+        except (
+            AuthFailedError,
+            SessionClosedRequireSaslError,
+            KazooTimeoutError,
+        ):
             # The rejection surfaced synchronously from start().
             client.stop()
             client.close()
@@ -147,7 +150,9 @@ class TestSASLDigestAuthentication:
             client.ensure_path(zkchroot)
             # Protect a node with an ACL for an identity other than the one
             # this session authenticated under (jaasuser).
-            alien_acl = make_acl("sasl", credential="some_other_user", all=True)
+            alien_acl = make_acl(
+                "sasl", credential="some_other_user", all=True
+            )
             path = f"{zkchroot}/sasl-protected"
             client.create(path, b"secret", acl=(alien_acl,))
             # The authenticated SASL identity (jaasuser) does not satisfy the
@@ -170,8 +175,11 @@ class TestSASLDigestAuthentication:
         )
         try:
             client.start(timeout=5)
-        except (AuthFailedError, SessionClosedRequireSaslError,
-                KazooTimeoutError):
+        except (
+            AuthFailedError,
+            SessionClosedRequireSaslError,
+            KazooTimeoutError,
+        ):
             client.stop()
             client.close()
             return
@@ -247,8 +255,12 @@ class TestSASLGSSAPIAuthentication:
         )
         try:
             client.start(timeout=5)
-        except (AuthFailedError, SessionClosedRequireSaslError,
-                KazooTimeoutError, ConnectionLoss):
+        except (
+            AuthFailedError,
+            SessionClosedRequireSaslError,
+            KazooTimeoutError,
+            ConnectionLoss,
+        ):
             client.stop()
             client.close()
             return

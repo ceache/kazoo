@@ -49,7 +49,9 @@ class TestKazooCounters:
         with pytest.raises(TypeError):
             counter.__add__(b"a")
         with pytest.raises(TypeError):
-            counter = self._makeOne(zkclient, default=0.0, support_curator=True)
+            counter = self._makeOne(
+                zkclient, default=0.0, support_curator=True
+            )
 
     def test_pre_post_values(self, zkclient):
         counter = self._makeOne(zkclient)

@@ -152,8 +152,11 @@ class TestSASLDigestAuthentication:
         )
         try:
             client.start(timeout=5)
-        except (AuthFailedError, SessionClosedRequireSaslError,
-                KazooTimeoutError):
+        except (
+            AuthFailedError,
+            SessionClosedRequireSaslError,
+            KazooTimeoutError,
+        ):
             # The rejection surfaced synchronously from start().
             client.stop()
             client.close()
@@ -249,8 +252,12 @@ class TestSASLGSSAPIAuthentication:
         )
         try:
             client.start(timeout=5)
-        except (AuthFailedError, SessionClosedRequireSaslError,
-                KazooTimeoutError, ConnectionLoss):
+        except (
+            AuthFailedError,
+            SessionClosedRequireSaslError,
+            KazooTimeoutError,
+            ConnectionLoss,
+        ):
             client.stop()
             client.close()
             return

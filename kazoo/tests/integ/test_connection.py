@@ -1,10 +1,9 @@
 import os
 import struct
-import sys
 import threading
 import time
 import uuid
-from collections import deque, namedtuple
+from collections import namedtuple
 from unittest.mock import patch
 
 import pytest

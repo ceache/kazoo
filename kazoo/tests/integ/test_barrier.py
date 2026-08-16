@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import threading
 
-import pytest
-
 
 class TestKazooBarrier:
     def test_barrier_not_exist(self, zkclient):

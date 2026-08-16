@@ -13,13 +13,26 @@ from kazoo.testing.kazoo_ensemble import (
     docker_compose,
     docker_env,
     pytest_addoption as kazoo_ensemble_pytest_addoption,
-    pytest_collection_modifyitems as kazoo_ensemble_pytest_collection_modifyitems,
+    pytest_collection_modifyitems as kazoo_ensemble_pytest_collection_modifyitems,  # noqa: E501
     pytest_configure as kazoo_ensemble_pytest_configure,
     zkchroot,
     zkclient,
     zkensemble,
     zksuperadmin_client,
 )
+
+# pytest discovers fixtures by name in conftest modules; re-export the
+# ensemble fixtures so the integ tests can request them directly. Declaring
+# them in ``__all__`` marks them as intentional re-exports (F401/F811).
+__all__ = [
+    "check_skip_version_marker",
+    "docker_compose",
+    "docker_env",
+    "zkchroot",
+    "zkclient",
+    "zkensemble",
+    "zksuperadmin_client",
+]
 
 if TYPE_CHECKING:
     from typing import Any
@@ -48,10 +61,11 @@ def docker_compose_config(
     The base file (``docker-compose.base.yml``) is always included. For any
     non-plain authentication flavor an overlay file
     (``docker-compose.auth-<auth>.yml``) is layered on top via docker-compose
-    multi-file support. Interpolation variables (ZK_VERSION, ZK_FEATURES_JVMFLAGS,
-    ZK_AUTH_JVMFLAGS, ZK_WORK_DIR, COMPOSE_PROJECT_NAME) are exported to the
-    process environment by :func:`~kazoo.testing.kazoo_ensemble.docker_env`
-    and :func:`~kazoo.testing.kazoo_ensemble._resolve_axis_options` before this
+    multi-file support. Interpolation variables (ZK_VERSION,
+    ZK_FEATURES_JVMFLAGS, ZK_AUTH_JVMFLAGS, ZK_WORK_DIR,
+    COMPOSE_PROJECT_NAME) are exported to the process environment by
+    :func:`~kazoo.testing.kazoo_ensemble.docker_env` and
+    :func:`~kazoo.testing.kazoo_ensemble._resolve_axis_options` before this
     fixture runs.
     """
     auth = docker_env.auth

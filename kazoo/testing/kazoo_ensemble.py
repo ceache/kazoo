@@ -34,7 +34,6 @@ if TYPE_CHECKING:
     from typing import (
         Any,
         Callable,
-        Literal,
     )
     from threading import Event
     from testcontainers.compose import DockerCompose
@@ -123,16 +122,18 @@ def pytest_configure(config):
     """
     config.addinivalue_line(
         "markers",
-        "skip_if_zk_version(condition): Skip test based on the 'zkensemble' fixture's version.",
+        "skip_if_zk_version(condition): Skip test based on the "
+        "'zkensemble' fixture's version.",
     )
     config.addinivalue_line(
         "markers",
-        "zk_version(spec): Run only when the active ZK version matches the PEP 440 SpecifierSet.",
+        "zk_version(spec): Run only when the active ZK version matches "
+        "the PEP 440 SpecifierSet.",
     )
     config.addinivalue_line(
         "markers",
-        "zk_auth(*allowed, skip=None): Run only under the listed auth schemes, "
-        "or skip the listed ones.",
+        "zk_auth(*allowed, skip=None): Run only under the listed auth "
+        "schemes, or skip the listed ones.",
     )
     config.addinivalue_line(
         "markers",
@@ -274,18 +275,22 @@ class ZkEnsemble:
                 opts["sasl_options"] = {"mechanism": "GSSAPI"}
         return opts
 
-    def get_client(self, /, superadmin: bool = False, **kwargs: Any) -> KazooClient:
+    def get_client(
+        self, /, superadmin: bool = False, **kwargs: Any
+    ) -> KazooClient:
         if "hosts" in kwargs:
             client_hosts = kwargs.pop("hosts")
         else:
             client_hosts = self.get_hosts()
 
         if superadmin:
-            # For superadmin, the Zookeeper server must be configured with digest authentication.
-            # This typically involves setting JVMFLAGS like:
+            # For superadmin, the Zookeeper server must be configured with
+            # digest authentication. This typically involves setting JVMFLAGS
+            # like:
             # -Dzookeeper.DigestAuthenticationProvider.superDigest="super:D/InIHSb7yEEbrWz8b9l71RjZJU="
             # in the server's startup script or docker-compose.yml.
-            # The client then authenticates with the cleartext password "super_secret".
+            # The client then authenticates with the cleartext password
+            # "super_secret".
             auth_data = kwargs.pop("auth_data", None)
             if auth_data is None:
                 kwargs["auth_data"] = [("digest", "super:super_secret")]
@@ -295,7 +300,8 @@ class ZkEnsemble:
                     kwargs["auth_data"] = auth_data
                 else:
                     raise ValueError(
-                        "Existing 'auth_data' in kwargs must be a list of (scheme, credentials) tuples if 'superadmin' is True."
+                        "Existing 'auth_data' in kwargs must be a list of "
+                        "(scheme, credentials) tuples if 'superadmin' is True."
                     )
 
         # Apply connection options implied by the active auth axis. Each option
@@ -313,7 +319,9 @@ class ZkEnsemble:
         return client
 
     def lose_connection(
-        self, client: KazooClient, event_factory: Callable[[], Event] | None = None
+        self,
+        client: KazooClient,
+        event_factory: Callable[[], Event] | None = None,
     ) -> None:
         """Force client to lose connection with server"""
         if event_factory is None:
@@ -323,7 +331,9 @@ class ZkEnsemble:
         )
 
     def expire_session(
-        self, client: KazooClient, event_factory: Callable[[], Event] | None = None
+        self,
+        client: KazooClient,
+        event_factory: Callable[[], Event] | None = None,
     ) -> None:
         """Force ZK to expire a client session"""
         if event_factory is None:
@@ -391,7 +401,7 @@ _COMPOSE_HANDLE: DockerCompose | None = None
 
 
 def _ensure_docker_available(context: str) -> None:
-    """Fail fast with an actionable message if docker compose is unavailable."""
+    """Fail fast if docker compose is unavailable."""
     try:
         subprocess.run(
             ["docker", "compose", "version"],
@@ -531,8 +541,12 @@ def _export_krb5_client_env(
     kinit_env.pop("KRB5CCNAME", None)
     kinit_rc = subprocess.run(
         [
-            "kinit", "-c", str(ccache), "-kt",
-            os.environ["KRB5_CLIENT_KTNAME"], "client@EXAMPLE.ORG",
+            "kinit",
+            "-c",
+            str(ccache),
+            "-kt",
+            os.environ["KRB5_CLIENT_KTNAME"],
+            "client@EXAMPLE.ORG",
         ],
         capture_output=True,
         text=True,
@@ -555,9 +569,8 @@ def _resolve_axis_options(
         "ZK_VERSION", ZK_DEFAULT_VERSION
     )
     auth = ZKAuthMode(
-        pytestconfig.getoption("--zk-auth") or os.environ.get(
-            "ZK_AUTH", ZKAuthMode.PLAIN.value
-        )
+        pytestconfig.getoption("--zk-auth")
+        or os.environ.get("ZK_AUTH", ZKAuthMode.PLAIN.value)
     )
     features = tuple(
         ZKFeature(f.strip())
@@ -583,7 +596,8 @@ def docker_env(
     with tmp_path_factory.getbasetemp() as tmp_path:
         # Compose interpolates ${ZK_WORK_DIR} into bind-mount sources; on
         # Windows the host path must be POSIX-style (C:/Users/...) for Docker
-        # Desktop, while host-side file ops below keep the native Path (FR-011).
+        # Desktop, while host-side file ops below keep the native Path
+        # (FR-011).
         os.environ["ZK_WORK_DIR"] = tmp_path.as_posix()
         # Unique per-session compose project name keeps parallel test runs (and
         # any stray stacks from other projects) isolated from each other.
@@ -734,8 +748,11 @@ def zksuperadmin_client(
     request: pytest.FixtureRequest,
     zkensemble: ZkEnsemble,
 ) -> Iterator[KazooClient]:
-    """Create a KazooClient instance connected as superadmin to the ensemble."""
-    chroot = f"/{os.path.basename(request.node.nodeid)}-{uuid.uuid4().hex[:8]}-superadmin"
+    """Create a KazooClient connected as superadmin to the ensemble."""
+    chroot = (
+        f"/{os.path.basename(request.node.nodeid)}-"
+        f"{uuid.uuid4().hex[:8]}-superadmin"
+    )
     client = zkensemble.get_client(superadmin=True)
     client.start()
     client.ensure_path(chroot)
@@ -770,5 +787,6 @@ def check_skip_version_marker(
 
     if zkversion in specifier:
         pytest.skip(
-            f"Skipped: Zookeeper ensemble version {zkversion} matches '{specifier}'"
+            f"Skipped: Zookeeper ensemble version {zkversion} matches "
+            f"'{specifier}'"
         )

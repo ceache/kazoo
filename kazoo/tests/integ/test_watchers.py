@@ -8,6 +8,7 @@ from kazoo.client import KazooClient
 from kazoo.exceptions import KazooException
 from kazoo.protocol.states import EventType
 
+
 class KazooDataWatcherTests:
     def test_data_watcher(self, zkensemble):
         client: KazooClient = zkensemble.get_client()

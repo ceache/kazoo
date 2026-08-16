@@ -1,10 +1,8 @@
 import functools
 import sys
-import unittest
 
 import pytest
 
-from kazoo.client import KazooClient
 from kazoo.exceptions import NoNodeError
 from kazoo.protocol.states import Callback
 from kazoo.tests.integ import test_client

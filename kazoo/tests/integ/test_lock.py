@@ -48,8 +48,9 @@ class TestKazooLock:
         self.released = self.make_event()
         self.active_thread = None
         self.cancelled_threads = []
-        # The primary client is chrooted (see the zkclient fixture); secondary
-        # clients share the same chroot so contenders line up on the same locks.
+        # The primary client is chrooted (see the zkclient fixture);
+        # secondary clients share the same chroot so contenders line up on
+        # the same locks.
         self.client = zkclient
         self.chroot = zkclient.chroot
         yield

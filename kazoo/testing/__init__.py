@@ -10,6 +10,4 @@ Docker-Compose ZooKeeper ensemble.
 from kazoo.testing import kazoo_ensemble  # noqa: F401
 
 
-__all__ = (
-    "kazoo_ensemble",
-)
+__all__ = ("kazoo_ensemble",)

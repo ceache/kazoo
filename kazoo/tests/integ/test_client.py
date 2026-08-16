@@ -4,9 +4,6 @@ import socket
 import threading
 import time
 import uuid
-from unittest.mock import Mock, MagicMock, patch
-
-import pytest
 
 from typing import TYPE_CHECKING
 from unittest import mock
@@ -30,10 +27,6 @@ from kazoo.exceptions import (
 )
 from kazoo.protocol.connection import _CONNECTION_DROP
 from kazoo.protocol.states import KeeperState, KazooState
-from kazoo.tests.util import CI_ZK_VERSION
-from kazoo.protocol.states import KazooState, KeeperState
-
-# from kazoo.tests.util import CI_ZK_VERSION
 
 if TYPE_CHECKING:
     from kazoo.client import KazooClient
@@ -605,7 +598,9 @@ class TestClient:
 
     def test_create_ephemeral_sequence(self, zkclient):
         basepath = "/" + uuid.uuid4().hex
-        realpath = zkclient.create(basepath, b"sandwich", sequence=True, ephemeral=True)
+        realpath = zkclient.create(
+            basepath, b"sandwich", sequence=True, ephemeral=True
+        )
         assert basepath != realpath and realpath.startswith(basepath)
         data, stat = zkclient.get(realpath)
         assert data == b"sandwich"
@@ -623,7 +618,6 @@ class TestClient:
             zkclient.create("/1/2/3/4/5", b"val2", makepath=True)
 
     def test_create_makepath_incompatible_acls(self, zkclient, zkensemble):
-        from kazoo.client import KazooClient
         from kazoo.security import make_digest_acl_credential, CREATOR_ALL_ACL
 
         credential = make_digest_acl_credential("username", "password")
@@ -992,13 +986,16 @@ class TestClient:
             zkensemble.start("zoo1")
 
     # utility for test_request_queuing*
-    def _make_request_queuing_client(self, zkclient, zkensemble) -> tuple[KazooClient, str]:
-        server = "zoo1" # XXX: Hardcoded, first server in the ensemble
+    def _make_request_queuing_client(
+        self, zkclient, zkensemble
+    ) -> tuple[KazooClient, str]:
+        server = "zoo1"  # XXX: Hardcoded, first server in the ensemble
         handler = self._makeOne()
         # create a client with only one server in its list, and
         # infinite retries
         client = zkensemble.get_client(
-            hosts=f"{zkensemble.zk_ip}:{zkensemble.zk1_port}", # connect to the first server in the ensemble
+            # connect to the first server in the ensemble
+            hosts=f"{zkensemble.zk_ip}:{zkensemble.zk1_port}",
             handler=handler,
             connection_retry={
                 "max_tries": -1,
@@ -1013,7 +1010,14 @@ class TestClient:
         return client, server
 
     # utility for test_request_queuing*
-    def _request_queuing_common(self, zkensemble, client: KazooClient, server: str, path: str, expire_session: bool):
+    def _request_queuing_common(
+        self,
+        zkensemble,
+        client: KazooClient,
+        server: str,
+        path: str,
+        expire_session: bool,
+    ):
         ev_suspended = client.handler.event_object()
         ev_connected = client.handler.event_object()
 
@@ -1061,12 +1065,19 @@ class TestClient:
 
     def test_request_queuing_session_recovered(self, zkclient, zkensemble):
         path = "/" + uuid.uuid4().hex
-        client, server = self._make_request_queuing_client(zkclient=zkclient, zkensemble=zkensemble)
-        # FIXME: server is supposed to be a handle to the server process in compose.
+        client, server = self._make_request_queuing_client(
+            zkclient=zkclient, zkensemble=zkensemble
+        )
+        # FIXME: server is supposed to be a handle to the server process
+        # in compose.
 
         try:
-            result = self._request_queuing_common(zkensemble=zkensemble,
-                client=client, server=server, path=path, expire_session=False
+            result = self._request_queuing_common(
+                zkensemble=zkensemble,
+                client=client,
+                server=server,
+                path=path,
+                expire_session=False,
             )
 
             assert result.get() == path
@@ -1076,11 +1087,17 @@ class TestClient:
 
     def test_request_queuing_session_expired(self, zkclient, zkensemble):
         path = "/" + uuid.uuid4().hex
-        client, server = self._make_request_queuing_client(zkclient=zkclient, zkensemble=zkensemble)
+        client, server = self._make_request_queuing_client(
+            zkclient=zkclient, zkensemble=zkensemble
+        )
 
         try:
-            result = self._request_queuing_common(zkensemble=zkensemble,
-                client=client, server=server, path=path, expire_session=True
+            result = self._request_queuing_common(
+                zkensemble=zkensemble,
+                client=client,
+                server=server,
+                path=path,
+                expire_session=True,
             )
 
             assert len(client._queue) == 0
@@ -1088,7 +1105,6 @@ class TestClient:
                 result.get()
         finally:
             client.stop()
-
 
 
 @pytest.mark.skip("Missing SSL helpers")
@@ -1099,13 +1115,20 @@ class TestSSLClient:
     #     cert_path = os.path.join(ssl_path, "cert.pem")
     #     cacert_path = os.path.join(ssl_path, "cacert.pem")
     #     with open(key_path, "wb") as key_file:
-    #         key_file.write(self.cluster.get_ssl_client_configuration()["client_key"])
+    #         key_file.write(
+    #             self.cluster.get_ssl_client_configuration()["client_key"]
+    #         )
     #     with open(cert_path, "wb") as cert_file:
-    #         cert_file.write(self.cluster.get_ssl_client_configuration()["client_cert"])
+    #         cert_file.write(
+    #             self.cluster.get_ssl_client_configuration()["client_cert"]
+    #         )
     #     with open(cacert_path, "wb") as cacert_file:
-    #         cacert_file.write(self.cluster.get_ssl_client_configuration()["ca_cert"])
+    #         cacert_file.write(
+    #             self.cluster.get_ssl_client_configuration()["ca_cert"]
+    #         )
     #     self.setup_zookeeper(
-    #         use_ssl=True, keyfile=key_path, certfile=cert_path, ca=cacert_path
+    #         use_ssl=True, keyfile=key_path, certfile=cert_path,
+    #         ca=cacert_path
     #     )
 
     def test_create(self, zkclient):
@@ -1302,8 +1325,9 @@ class TestReconfig:
         client.start()
 
         # # get ports for election, zab and client endpoints. we need to use
-        # # ports for which we'd immediately get a RST upon connect(); otherwise
-        # # the cluster could crash if it gets a SocketTimeoutException:
+        # # ports for which we'd immediately get a RST upon connect();
+        # # otherwise the cluster could crash if it gets a
+        # # SocketTimeoutException:
         # # https://issues.apache.org/jira/browse/ZOOKEEPER-2202
         # s1, port1 = free_sock_port()
         # s2, port2 = free_sock_port()

@@ -5,7 +5,6 @@ import unittest
 
 import pytest
 
-from kazoo.client import KazooClient
 from kazoo.handlers import utils
 from kazoo.protocol import states as kazoo_states
 from kazoo.tests import util as test_util

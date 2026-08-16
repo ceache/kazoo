@@ -71,7 +71,9 @@ class TestKazooElection:
         for _ in range(3):
             contender = "c" + uuid.uuid4().hex
             elections[contender] = zkclient.Election(path, contender)
-            threads[contender] = spawn_contender(contender, elections[contender])
+            threads[contender] = spawn_contender(
+                contender, elections[contender]
+            )
 
         # wait for a leader to be elected
         times = 0

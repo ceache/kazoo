@@ -5,7 +5,6 @@ import uuid
 from unittest.mock import Mock, call, patch
 from typing import TYPE_CHECKING
 
-from packaging.specifiers import T
 import pytest
 from objgraph import count as count_refs_by_type
 
@@ -16,8 +15,10 @@ from kazoo.recipe.cache import TreeCache, TreeEvent, TreeNode
 if TYPE_CHECKING:
     from queue import Queue
 
+
 class FakeException(Exception):
     pass
+
 
 class TestKazooTreeCache:
     cache: None | TreeCache
@@ -46,7 +47,9 @@ class TestKazooTreeCache:
             self.cache.close()
             self.cache = None
 
-    def _wait_cache(self, expect=None, since=None, timeout=10) -> TreeEvent | None:
+    def _wait_cache(
+        self, expect=None, since=None, timeout=10
+    ) -> TreeEvent | None:
         started = since is None
         while True:
             event = self._event_queue.get(timeout=timeout)
@@ -92,7 +95,7 @@ class TestKazooTreeCache:
         stat = zkclient.exists(self._path)
         assert stat.version == 0
 
-        assert self.cache != None
+        assert self.cache is not None
         assert self.cache._state == TreeCache.STATE_STARTED
         assert self.cache._root._state == TreeNode.STATE_LIVE
 
@@ -151,7 +154,8 @@ class TestKazooTreeCache:
 
         # outside watchers should not be deleted
         assert (
-            list(zkclient._data_watchers[root_path + "/foo"])[0] == stub_data_watcher
+            list(zkclient._data_watchers[root_path + "/foo"])[0]
+            == stub_data_watcher
         )
         assert (
             list(zkclient._child_watchers[root_path + "/foo"])[0]
@@ -255,7 +259,9 @@ class TestKazooTreeCache:
             assert cache.get_data(self._path + "/foo/bar").stat.version == 0
 
             assert cache.get_data(self._path + "/foo/bar/baz").data == b"@"
-            assert cache.get_data(self._path + "/foo/bar/baz").stat.version == 0
+            assert (
+                cache.get_data(self._path + "/foo/bar/baz").stat.version == 0
+            )
 
     def test_get_children(self, zkclient):
         self._wait_cache(since=TreeEvent.INITIALIZED)
@@ -266,9 +272,15 @@ class TestKazooTreeCache:
 
         cache = self.cache
         with patch.object(cache, "_client"):  # disable any remote operation
-            assert cache.get_children(self._path + "/foo/bar/baz") == frozenset()
-            assert cache.get_children(self._path + "/foo/bar") == frozenset(["baz"])
-            assert cache.get_children(self._path + "/foo") == frozenset(["bar"])
+            assert (
+                cache.get_children(self._path + "/foo/bar/baz") == frozenset()
+            )
+            assert cache.get_children(self._path + "/foo/bar") == frozenset(
+                ["baz"]
+            )
+            assert cache.get_children(self._path + "/foo") == frozenset(
+                ["bar"]
+            )
             assert cache.get_children(self._path) == frozenset(["foo"])
 
     def test_get_data_out_of_tree(self):
@@ -291,7 +303,9 @@ class TestKazooTreeCache:
     def test_get_children_no_node(self):
         self._wait_cache(since=TreeEvent.INITIALIZED)
 
-        with patch.object(self.cache, "_client"):  # disable any remote operation
+        with patch.object(
+            self.cache, "_client"
+        ):  # disable any remote operation
             assert self.cache.get_children(self._path + "/non_exists") is None
 
     def test_session_reconnected(self, zkclient, zkensemble):
@@ -302,8 +316,10 @@ class TestKazooTreeCache:
         assert event is not None
         assert event.event_data.path == self._path + "/foo"
 
-        with (self._spy_client(zkclient, "get_async") as get_data,
-              self._spy_client(zkclient, "get_children_async") as get_children):
+        with (
+            self._spy_client(zkclient, "get_async") as get_data,
+            self._spy_client(zkclient, "get_children_async") as get_children,
+        ):
             # session suspended
             zkensemble.lose_connection(zkclient)
             self._wait_cache(TreeEvent.CONNECTION_SUSPENDED)
