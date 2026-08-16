@@ -27,7 +27,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt', 'pyproject.toml', 'setup.cfg', 'tox.ini') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
@@ -52,30 +52,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "pypy-3.11-v7.3.21"]
-        # Friendly note: If you change the minimum zk-version here, update it in
-        # ensure-zookeeper-env.sh. Additionally, if you need to change the way that
-        # zookeeper is installed, do it THERE. Not in the 'test with tox' step here.
-        # That way, people trying to test changes have a reasonable chance of getting
-        # things to work properly before submitting a PR.
-        zk-version: ["3.6.4", "3.7.2", "3.8.3", "3.9.1"]
-        include:
-          - python-version: "3.8"
-            tox-env: py38
-          - python-version: "3.9"
-            tox-env: py39
-          - python-version: "3.10"
-            tox-env: py310
-          - python-version: "3.11"
-            tox-env: py311
-          - python-version: "3.12"
-            tox-env: py312
-          - python-version: "3.13"
-            tox-env: py313
-          - python-version: "3.14"
-            tox-env: py314
-          - python-version: "pypy-3.11-v7.3.21"
-            tox-env: pypy3
+        # Tiered matrix (FR-017): every supported Python interpreter runs the
+        # full suite (unit + integ) against each supported ZooKeeper version on
+        # the plain auth/feature axis. The auth and feature axes run separately
+        # (test_axes) on the latest Python target to keep the combinatorial
+        # cost bounded (SC-007).
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "pypy-3.11-v7.3.21"]
+        zk-version: ["3.7.2", "3.8.3", "3.9.1"]
     steps:
       - uses: actions/checkout@v4
 
@@ -88,33 +71,122 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt', 'pyproject.toml', 'setup.cfg', 'tox.ini') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Handle ZK installation cache
-        uses: actions/cache@v4
-        with:
-          path: zookeeper
-          key: ${{ runner.os }}-zookeeper
-          restore-keys: |
-            ${{ runner.os }}-zookeeper
+      # Docker and the Compose v2 plugin are pre-installed on ubuntu-latest;
+      # the harness needs no ZK/Java/krb5 installation on the host (FR-001/011).
+      - name: Verify docker compose
+        run: docker compose version
 
       - name: Install required dependencies
         run: |
           sudo apt-get update
           sudo apt-get -y install libevent-dev krb5-kdc krb5-admin-server libkrb5-dev
           python3 -m pip install --upgrade pip
-          pip install tox
+          pip install -e '.[test]'
 
-      - name: Test with tox
-        run: tox -e ${TOX_VENV}
+      - name: Test with pytest (plain axis)
+        run: pytest kazoo/tests/ -q --cov-report=xml --cov=kazoo
         env:
-          TOX_VENV: ${{ format('{0}-{1}', matrix.tox-env, 'gevent-eventlet-sasl') }}
+          # ZK_VERSION drives the docker-compose harness; ZOOKEEPER_VERSION is
+          # the legacy env for the CI_ZK_VERSION test gates.
+          ZK_VERSION: ${{ matrix.zk-version }}
           ZOOKEEPER_VERSION: ${{ matrix.zk-version }}
+          ZK_AUTH: plain
+          ZK_FEATURES: standard
 
       - name: Publish Codecov report
         uses: codecov/codecov-action@v4
+
+  test_axes:
+    needs: [validate]
+
+    # Auth (digest, sasl_digest, tls, sasl_gssapi) and feature (ttl, reconfig)
+    # axes on the latest Python target (FR-017/SC-007). The SASL axes enforce
+    # auth on the ensemble; the sasl_gssapi leg additionally needs a host
+    # Kerberos client: kinit (krb5-user) plus libkrb5-dev to build the
+    # pykerberos module (no Linux wheels exist for it; T037 decision).
+    name: >
+      Linux - Axis ${{ matrix.axis }}
+      (Python ${{ matrix.python-version }}, ZK ${{ matrix.zk-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - axis: digest
+            python-version: "3.14"
+            zk-version: "3.9.1"
+            zk-auth: digest
+            zk-features: standard
+          - axis: sasl_digest
+            python-version: "3.14"
+            zk-version: "3.9.1"
+            zk-auth: sasl_digest
+            zk-features: standard
+          - axis: tls
+            python-version: "3.14"
+            zk-version: "3.9.1"
+            zk-auth: tls
+            zk-features: standard
+          - axis: sasl_gssapi
+            python-version: "3.14"
+            zk-version: "3.9.1"
+            zk-auth: sasl_gssapi
+            zk-features: standard
+          - axis: ttl
+            python-version: "3.14"
+            zk-version: "3.9.1"
+            zk-auth: plain
+            zk-features: ttl
+          - axis: reconfig
+            python-version: "3.14"
+            zk-version: "3.9.1"
+            zk-auth: plain
+            zk-features: reconfig
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Handle pip cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt', 'pyproject.toml', 'setup.cfg', 'tox.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Verify docker compose
+        run: docker compose version
+
+      # Host Kerberos client for the sasl_gssapi axis: kinit must be on PATH
+      # (kazoo_ensemble.py invokes it for the KDC sidecar) and libkrb5-dev is
+      # required to compile the `kerberos` python module from sdist.
+      - name: Install Kerberos client tools
+        if: matrix.axis == 'sasl_gssapi'
+        run: |
+          sudo apt-get -y install krb5-user libkrb5-dev
+
+      - name: Install required dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install -e '.[test]'
+          if [ "${{ matrix.axis }}" = "sasl_gssapi" ]; then pip install kerberos; fi
+
+      - name: Test with pytest (${{ matrix.axis }} axis)
+        run: pytest kazoo/tests/ -q
+        env:
+          ZK_VERSION: ${{ matrix.zk-version }}
+          ZOOKEEPER_VERSION: ${{ matrix.zk-version }}
+          ZK_AUTH: ${{ matrix.zk-auth }}
+          ZK_FEATURES: ${{ matrix.zk-features }}
 
   test_windows:
     needs: [validate]
@@ -132,7 +204,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~\AppData\Local\pip\Cache
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt', 'pyproject.toml', 'setup.cfg', 'tox.ini') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import threading
 
-# from kazoo.testing import KazooTestCase
 import pytest
 
 
