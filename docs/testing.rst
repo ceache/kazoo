@@ -4,68 +4,125 @@
 Testing
 =======
 
-Kazoo has several test harnesses used internally for its own tests that are
-exposed as public API's for use in your own tests for common Zookeeper cluster
-management and session testing. They can be mixed in with your own `unittest`
-or `pytest` tests along with a `mock` object that allows you to force specific
-`KazooClient` commands to fail in various ways.
+Kazoo's own integration test suite uses a Docker-Compose based test harness
+that is also exposed as public API for use in your own tests. The harness
+starts a real ZooKeeper ensemble in containers (`zookeeper` image, ≥ 3.7),
+waits for it to become healthy, and provides pytest fixtures that give you a
+connected :class:`~kazoo.client.KazooClient`.
 
-The test harness needs to be able to find the Zookeeper Java libraries. You
-need to specify an environment variable called `ZOOKEEPER_PATH` and point it
-to their location, for example `/usr/share/java`. The directory should contain
-a `zookeeper-*.jar` and a `lib` directory containing at least a `log4j-*.jar`.
+Requirements
+============
 
-If your Java setup is complex, you may also override our classpath mechanism
-completely by specifying an environment variable called `ZOOKEEPER_CLASSPATH`.
-If provided, it will be used unmodified as the Java classpath for Zookeeper.
+* A `docker compose` compatible CLI (v2.12+) with a running Docker daemon.
+* Python 3.9+ (Python 3.8 support was dropped).
+* No ZooKeeper binary, Java, keytool, or local ZK classpath is required —
+  everything runs in containers.
 
-You can specify an optional `ZOOKEEPER_PORT_OFFSET` environment variable to
-influence the ports the cluster is using. By default the offset is 20000 and
-a cluster with three members will use ports 20000, 20010 and 20020.
+Install the project with the test extras:
 
+.. code-block:: bash
 
-Kazoo Test Harness
-==================
+    pip install -e '.[test]'
 
-The :class:`~kazoo.testing.harness.KazooTestHarness` can be used directly or
-mixed in with your test code.
+The harness is implemented in :mod:`kazoo.testing.kazoo_ensemble`. The
+`legacy <https://docs.python.org/3/library/unittest.html>`_ ``KazooTestHarness`` /
+``KazooTestCase`` API was removed; use the pytest fixtures below instead
+(see `CHANGES.md <https://github.com/python-zk/kazoo/blob/main/CHANGES.md>`_
+under BREAKING CHANGES).
+
+Entry point
+===========
+
+The :class:`~kazoo.testing.kazoo_ensemble.ZkEnsemble` class and the fixtures
+it provides are registered as a pytest plugin. To use the harness in your own
+``pytest`` suite, import the fixtures from the ensemble module in your
+``conftest.py`` (fixtures are plain functions that receive the ensemble):
+
+.. code-block:: python
+
+    from kazoo.testing import kazoo_ensemble
+
+Fixtures
+========
+
+``zkensemble``
+    Session-scoped. Starts a three-node ZooKeeper ensemble via
+    ``docker compose up --wait`` and tears it down (``down --volumes``) at
+    session end. Yields a :class:`~kazoo.testing.kazoo_ensemble.ZkEnsemble`
+    that can create and manage clients, stop/start individual ensemble
+    members (for failure-injection tests), and expose the resolved axis
+    configuration.
+
+``zkclient``
+    Function-scoped. A started :class:`~kazoo.client.KazooClient` connected
+    to the ensemble. The connection options implied by the active
+    configuration (auth, features) are applied automatically.
+
+``zkchroot``
+    Function-scoped. The chroot path (``/``) under which the test may create
+    nodes; it is created and removed around each test to keep runs isolated.
+
+``zksuperadmin_client``
+    Function-scoped. A client authenticated with the superDigest digest
+    credentials, for tests that need to bypass ACLs.
 
 Example:
 
 .. code-block:: python
 
-    from kazoo.testing import KazooTestHarness
+    def test_create_and_read(zkclient):
+        zkclient.ensure_path("/my/test/path")
+        assert zkclient.exists("/my/test/path") is not None
 
-    class MyTest(KazooTestHarness):
-        def setUp(self):
-            self.setup_zookeeper()
+Testing axes
+============
 
-        def tearDown(self):
-            self.teardown_zookeeper()
+The harness exposes three axes as pytest command-line options (each also
+honors an environment variable):
 
-        def testmycode(self):
-            self.client.ensure_path('/test/path')
-            result = self.client.get('/test/path')
-            ...
+``--zk-version`` (or ``ZK_VERSION``)
+    ZooKeeper server tag, e.g. ``3.7.2``, ``3.8.3``, ``3.9.5`` (default).
 
+``--zk-auth`` (or ``ZK_AUTH``)
+    Authentication flavor: ``plain`` (default), ``digest``, ``sasl_digest``,
+    ``sasl_gssapi``, ``tls``. The auth flavor selects the matching
+    docker-compose overlay file and the client-side connection options (TLS
+    certs, SASL options).
 
-Kazoo Test Case
-===============
+``--zk-features`` (or ``ZK_FEATURES``)
+    Comma-separated ZooKeeper feature set: ``standard`` (default), ``ttl``,
+    ``readonly``, ``reconfig`` (injected as server JVM flags).
 
-The :class:`~kazoo.testing.harness.KazooTestCase` is complete test case that
-is equivalent to the mixin setup of
-:class:`~kazoo.testing.harness.KazooTestHarness`. An equivalent test to the
-one above:
+Compose layout
+==============
 
-.. code-block:: python
+The compose files live in ``kazoo/tests/integ/``:
 
-    from kazoo.testing import KazooTestCase
+* ``docker-compose.base.yml`` — the base three-node ensemble (ephemeral
+  ports, tmpfs data dirs, healthcheck).
+* ``docker-compose.auth-<auth>.yml`` — per-auth overlay files layered on top
+  of the base file (digest, sasl-digest, tls, sasl-gssapi).
+* ``dockerfiles/`` — support images for TLS cert generation and the Kerberos
+  KDC used by the GSSAPI axis.
 
-    class MyTest(KazooTestCase):
-        def testmycode(self):
-            self.client.ensure_path('/test/path')
-            result = self.client.get('/test/path')
-            ...
+The active overlay set is resolved by ``docker_compose_config()`` in
+``kazoo/tests/integ/conftest.py`` and the ensemble is driven through
+`testcontainers <https://testcontainers-python.readthedocs.io>`_
+(:class:`testcontainers.compose.DockerCompose`).
+
+Marker shortcuts
+================
+
+The harness registers pytest markers that let you gate tests on the active
+axes (they skip with an actionable reason when the active configuration does
+not match):
+
+* ``@pytest.mark.zk_version("<3.8")`` — PEP 440 specifier vs. the active ZK
+  version.
+* ``@pytest.mark.zk_auth("digest", "tls")`` — run only under the listed auth
+  schemes.
+* ``@pytest.mark.zk_features(require=[...], skip=[...])`` — run only when the
+  listed features are (or are not) active.
 
 Zake
 ====

@@ -1,12 +1,12 @@
-.. _testing_harness_module:
+.. _testing_module:
 
-:mod:`kazoo.testing.harness`
-----------------------------
+:mod:`kazoo.testing`
+--------------------
 
-.. automodule:: kazoo.testing.harness
+.. automodule:: kazoo.testing
 
-Public API
-++++++++++
+The test harness module
++++++++++++++++++++++++
 
-    .. autoclass:: KazooTestHarness
-    .. autoclass:: KazooTestCase
+.. automodule:: kazoo.testing.kazoo_ensemble
+    :members:
