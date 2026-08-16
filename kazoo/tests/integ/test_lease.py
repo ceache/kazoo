@@ -1,10 +1,10 @@
 import datetime
 import uuid
 
+import pytest
+
 from kazoo.recipe.lease import NonBlockingLease
 from kazoo.recipe.lease import MultiNonBlockingLease
-
-from kazoo.testing import KazooTestCase
 
 
 class MockClock(object):
@@ -18,26 +18,33 @@ class MockClock(object):
         return datetime.datetime.utcfromtimestamp(self.epoch)
 
 
-class KazooLeaseTests(KazooTestCase):
-    def setUp(self):
-        super(KazooLeaseTests, self).setUp()
+class TestKazooLease:
+    @pytest.fixture(autouse=True)
+    def _setup(self, zkclient, zkensemble):
+        self.zkensemble = zkensemble
+        self.client = zkclient
+        self.chroot = zkclient.chroot
         self.client2 = self._get_client(timeout=0.8)
         self.client2.start()
         self.client3 = self._get_client(timeout=0.8)
         self.client3.start()
         self.path = "/" + uuid.uuid4().hex
         self.clock = MockClock(10)
-
-    def tearDown(self):
+        yield
         for cl in [self.client2, self.client3]:
             if cl.connected:
                 cl.stop()
                 cl.close()
-        del self.client2
-        del self.client3
+
+    def _get_client(self, **opts):
+        # Mirrors the legacy _get_client(): additional clients connected to
+        # the same chrooted namespace as ``self.client``.
+        c = self.zkensemble.get_client(**opts)
+        c.chroot = self.chroot
+        return c
 
 
-class NonBlockingLeaseTests(KazooLeaseTests):
+class TestNonBlockingLease(TestKazooLease):
     def test_renew(self):
         # Use client convenience method here to test it at least once.  Use
         # class directly in
@@ -198,7 +205,7 @@ class NonBlockingLeaseTests(KazooLeaseTests):
         assert not foreigner_lease
 
 
-class MultiNonBlockingLeaseTest(KazooLeaseTests):
+class TestMultiNonBlockingLease(TestKazooLease):
     def test_1_renew(self):
         ls = self.client.MultiNonBlockingLease(
             1, self.path, datetime.timedelta(seconds=4), utcnow=self.clock

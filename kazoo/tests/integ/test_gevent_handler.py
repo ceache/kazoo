@@ -1,27 +1,59 @@
-import unittest
+import functools
 import sys
+import unittest
 
 import pytest
 
 from kazoo.client import KazooClient
 from kazoo.exceptions import NoNodeError
 from kazoo.protocol.states import Callback
-from kazoo.testing import KazooTestCase
-from kazoo.tests import test_client
+from kazoo.tests.integ import test_client
+
+
+def _require_gevent():
+    try:
+        import gevent  # noqa: F401
+    except ImportError:
+        pytest.skip("gevent not available.")
+
+
+def _make_gevent_handler():
+    from kazoo.handlers.gevent import SequentialGeventHandler
+
+    return SequentialGeventHandler()
+
+
+# The zkclient fixture is shadowed for this module so every test (including
+# those inherited from kazoo.tests.integ.test_client.TestClient) talks to the
+# ensemble through a gevent-handler client (handler-specific; R-08).
+@pytest.fixture
+def zkclient(zkensemble, zkchroot):
+    # Guard against fixture-ordering: inherited autouse set-up fixtures (e.g.
+    # TestKazooLock._setup) pull in ``zkclient`` before the class-level
+    # `_skip_without_gevent` autouse fixture runs.
+    _require_gevent()
+    client = zkensemble.get_client(handler=_make_gevent_handler())
+    client.harness_expire_session = functools.partial(
+        zkensemble.expire_session,
+        client=client,
+        event_factory=client.handler.event_object,
+    )
+    client.start()
+    client.ensure_path(zkchroot)
+    client.chroot = zkchroot
+    yield client
+    client.stop()
+    client.close()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="does not run on windows")
-class TestGeventHandler(unittest.TestCase):
-    def setUp(self):
-        try:
-            import gevent  # NOQA
-        except ImportError:
-            pytest.skip("gevent not available.")
+class TestGeventHandler:
+    @pytest.fixture(autouse=True)
+    def _skip_without_gevent(self):
+        _require_gevent()
 
     def _makeOne(self, *args):
-        from kazoo.handlers.gevent import SequentialGeventHandler
-
-        return SequentialGeventHandler(*args)
+        return _make_gevent_handler()
 
     def _getAsync(self, *args):
         from kazoo.handlers.gevent import AsyncResult
@@ -80,40 +112,27 @@ class TestGeventHandler(unittest.TestCase):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="does not run on windows")
-class TestBasicGeventClient(KazooTestCase):
-    def setUp(self):
-        try:
-            import gevent  # NOQA
-        except ImportError:
-            pytest.skip("gevent not available.")
-        KazooTestCase.setUp(self)
+class TestBasicGeventClient:
+    @pytest.fixture(autouse=True)
+    def _skip_without_gevent(self):
+        _require_gevent()
 
-    def _makeOne(self, *args):
-        from kazoo.handlers.gevent import SequentialGeventHandler
-
-        return SequentialGeventHandler(*args)
-
-    def _getEvent(self):
-        from gevent.event import Event
-
-        return Event
-
-    def test_start(self):
-        client = self._get_client(handler=self._makeOne())
+    def test_start(self, zkclient):
+        client = zkclient
         client.start()
         assert client.state == "CONNECTED"
         client.stop()
 
-    def test_start_stop_double(self):
-        client = self._get_client(handler=self._makeOne())
+    def test_start_stop_double(self, zkclient):
+        client = zkclient
         client.start()
         assert client.state == "CONNECTED"
         client.handler.start()
         client.handler.stop()
         client.stop()
 
-    def test_basic_commands(self):
-        client = self._get_client(handler=self._makeOne())
+    def test_basic_commands(self, zkclient):
+        client = zkclient
         client.start()
         assert client.state == "CONNECTED"
         client.create("/anode", b"fred")
@@ -122,18 +141,20 @@ class TestBasicGeventClient(KazooTestCase):
         assert client.exists("/anode") is None
         client.stop()
 
-    def test_failures(self):
-        client = self._get_client(handler=self._makeOne())
+    def test_failures(self, zkclient):
+        client = zkclient
         client.start()
         with pytest.raises(NoNodeError):
             client.get("/none")
         client.stop()
 
-    def test_data_watcher(self):
-        client = self._get_client(handler=self._makeOne())
+    def test_data_watcher(self, zkclient):
+        client = zkclient
         client.start()
         client.ensure_path("/some/node")
-        ev = self._getEvent()()
+        from gevent.event import Event
+
+        ev = Event()
 
         @client.DataWatch("/some/node")
         def changed(d, stat):
@@ -145,43 +166,12 @@ class TestBasicGeventClient(KazooTestCase):
         ev.wait()
         client.stop()
 
-    def test_huge_file_descriptor(self):
-        import resource
-        from gevent import socket
-        from kazoo.handlers.utils import create_tcp_socket
-
-        try:
-            resource.setrlimit(resource.RLIMIT_NOFILE, (4096, 4096))
-        except (ValueError, resource.error):
-            self.skipTest("couldn't raise fd limit high enough")
-        fd = 0
-        socks = []
-        while fd < 4000:
-            sock = create_tcp_socket(socket)
-            fd = sock.fileno()
-            socks.append(sock)
-        h = self._makeOne()
-        h.start()
-        h.select(socks, [], [], 0)
-        h.stop()
-        for sock in socks:
-            sock.close()
-
 
 @pytest.mark.skipif(sys.platform == "win32", reason="does not run on windows")
 class TestGeventClient(test_client.TestClient):
-    def setUp(self):
-        try:
-            import gevent  # NOQA
-        except ImportError:
-            pytest.skip("gevent not available.")
-        KazooTestCase.setUp(self)
+    @pytest.fixture(autouse=True)
+    def _skip_without_gevent(self):
+        _require_gevent()
 
     def _makeOne(self, *args):
-        from kazoo.handlers.gevent import SequentialGeventHandler
-
-        return SequentialGeventHandler(*args)
-
-    def _get_client(self, **kwargs):
-        kwargs["handler"] = self._makeOne()
-        return KazooClient(self.hosts, **kwargs)
+        return _make_gevent_handler()

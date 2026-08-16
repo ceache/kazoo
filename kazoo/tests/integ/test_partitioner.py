@@ -3,8 +3,9 @@ import threading
 import time
 from unittest.mock import patch
 
+import pytest
+
 from kazoo.exceptions import LockTimeout
-from kazoo.testing import KazooTestCase
 from kazoo.recipe.partitioner import PartitionState
 
 
@@ -41,13 +42,15 @@ class SlowLockMock:
         self._lock.release()
 
 
-class KazooPartitionerTests(KazooTestCase):
+class TestKazooPartitioner:
     @staticmethod
     def make_event():
         return threading.Event()
 
-    def setUp(self):
-        super(KazooPartitionerTests, self).setUp()
+    @pytest.fixture(autouse=True)
+    def _setup(self, zkclient, zkensemble):
+        self.client = zkclient
+        self.zkensemble = zkensemble
         self.path = "/" + uuid.uuid4().hex
         self.__partitioners = []
 
@@ -125,7 +128,7 @@ class KazooPartitionerTests(KazooTestCase):
         self.__assert_partitions([0, 2], [1])
 
         # Emulate connection loss
-        self.lose_connection(self.make_event)
+        self.zkensemble.lose_connection(self.client, self.make_event)
         self.__assert_state(PartitionState.RELEASE)
         self.__release()
 

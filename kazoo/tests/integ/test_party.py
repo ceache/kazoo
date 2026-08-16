@@ -1,11 +1,12 @@
 import uuid
 
-from kazoo.testing import KazooTestCase
+import pytest
 
 
-class KazooPartyTests(KazooTestCase):
-    def setUp(self):
-        super(KazooPartyTests, self).setUp()
+class TestKazooParty:
+    @pytest.fixture(autouse=True)
+    def _setup(self, zkclient):
+        self.client = zkclient
         self.path = "/" + uuid.uuid4().hex
 
     def test_party(self):
@@ -51,9 +52,10 @@ class KazooPartyTests(KazooTestCase):
         assert len(party) == 0
 
 
-class KazooShallowPartyTests(KazooTestCase):
-    def setUp(self):
-        super(KazooShallowPartyTests, self).setUp()
+class TestKazooShallowParty:
+    @pytest.fixture(autouse=True)
+    def _setup(self, zkclient):
+        self.client = zkclient
         self.path = "/" + uuid.uuid4().hex
 
     def test_party(self):

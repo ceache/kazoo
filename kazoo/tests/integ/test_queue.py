@@ -2,17 +2,16 @@ import uuid
 
 import pytest
 
-from kazoo.testing import KazooTestCase
 from kazoo.tests.util import CI_ZK_VERSION
 
 
-class KazooQueueTests(KazooTestCase):
-    def _makeOne(self):
+class TestKazooQueue:
+    def _makeOne(self, zkclient):
         path = "/" + uuid.uuid4().hex
-        return self.client.Queue(path)
+        return zkclient.Queue(path)
 
-    def test_queue_validation(self):
-        queue = self._makeOne()
+    def test_queue_validation(self, zkclient):
+        queue = self._makeOne(zkclient)
         with pytest.raises(TypeError):
             queue.put({})
         with pytest.raises(TypeError):
@@ -24,14 +23,14 @@ class KazooQueueTests(KazooTestCase):
         with pytest.raises(ValueError):
             queue.put(b"one", 100000)
 
-    def test_empty_queue(self):
-        queue = self._makeOne()
+    def test_empty_queue(self, zkclient):
+        queue = self._makeOne(zkclient)
         assert len(queue) == 0
         assert queue.get() is None
         assert len(queue) == 0
 
-    def test_queue(self):
-        queue = self._makeOne()
+    def test_queue(self, zkclient):
+        queue = self._makeOne(zkclient)
         queue.put(b"one")
         queue.put(b"two")
         queue.put(b"three")
@@ -42,8 +41,8 @@ class KazooQueueTests(KazooTestCase):
         assert queue.get() == b"three"
         assert len(queue) == 0
 
-    def test_priority(self):
-        queue = self._makeOne()
+    def test_priority(self, zkclient):
+        queue = self._makeOne(zkclient)
         queue.put(b"four", priority=101)
         queue.put(b"one", priority=0)
         queue.put(b"two", priority=0)
@@ -55,27 +54,27 @@ class KazooQueueTests(KazooTestCase):
         assert queue.get() == b"four"
 
 
-class KazooLockingQueueTests(KazooTestCase):
-    def setUp(self):
-        KazooTestCase.setUp(self)
+class TestKazooLockingQueue:
+    @pytest.fixture(autouse=True)
+    def _skip_unless_zk34(self, zkclient):
         skip = False
         if CI_ZK_VERSION and CI_ZK_VERSION < (3, 4):
             skip = True
         elif CI_ZK_VERSION and CI_ZK_VERSION >= (3, 4):
             skip = False
         else:
-            ver = self.client.server_version()
+            ver = zkclient.server_version()
             if ver[1] < 4:
                 skip = True
         if skip:
             pytest.skip("Must use Zookeeper 3.4 or above")
 
-    def _makeOne(self):
+    def _makeOne(self, zkclient):
         path = "/" + uuid.uuid4().hex
-        return self.client.LockingQueue(path)
+        return zkclient.LockingQueue(path)
 
-    def test_queue_validation(self):
-        queue = self._makeOne()
+    def test_queue_validation(self, zkclient):
+        queue = self._makeOne(zkclient)
         with pytest.raises(TypeError):
             queue.put({})
         with pytest.raises(TypeError):
@@ -99,14 +98,14 @@ class KazooLockingQueueTests(KazooTestCase):
         with pytest.raises(ValueError):
             queue.put_all([b"one"], 100000)
 
-    def test_empty_queue(self):
-        queue = self._makeOne()
+    def test_empty_queue(self, zkclient):
+        queue = self._makeOne(zkclient)
         assert len(queue) == 0
         assert queue.get(0) is None
         assert len(queue) == 0
 
-    def test_queue(self):
-        queue = self._makeOne()
+    def test_queue(self, zkclient):
+        queue = self._makeOne(zkclient)
         queue.put(b"one")
         queue.put_all([b"two", b"three"])
         assert len(queue) == 3
@@ -130,8 +129,8 @@ class KazooLockingQueueTests(KazooTestCase):
         assert not queue.consume()
         assert len(queue) == 0
 
-    def test_consume(self):
-        queue = self._makeOne()
+    def test_consume(self, zkclient):
+        queue = self._makeOne(zkclient)
 
         queue.put(b"one")
         assert not queue.consume()
@@ -139,8 +138,8 @@ class KazooLockingQueueTests(KazooTestCase):
         assert queue.consume()
         assert not queue.consume()
 
-    def test_release(self):
-        queue = self._makeOne()
+    def test_release(self, zkclient):
+        queue = self._makeOne(zkclient)
 
         queue.put(b"one")
         assert queue.get(1) == b"one"
@@ -152,8 +151,8 @@ class KazooLockingQueueTests(KazooTestCase):
         assert not queue.release()
         assert len(queue) == 0
 
-    def test_holds_lock(self):
-        queue = self._makeOne()
+    def test_holds_lock(self, zkclient):
+        queue = self._makeOne(zkclient)
 
         assert not queue.holds_lock()
         queue.put(b"one")
@@ -162,8 +161,8 @@ class KazooLockingQueueTests(KazooTestCase):
         queue.consume()
         assert not queue.holds_lock()
 
-    def test_priority(self):
-        queue = self._makeOne()
+    def test_priority(self, zkclient):
+        queue = self._makeOne(zkclient)
         queue.put(b"four", priority=101)
         queue.put(b"one", priority=0)
         queue.put(b"two", priority=0)
@@ -178,23 +177,23 @@ class KazooLockingQueueTests(KazooTestCase):
         assert queue.get(1) == b"four"
         assert queue.consume()
 
-    def test_concurrent_execution(self):
-        queue = self._makeOne()
+    def test_concurrent_execution(self, zkclient):
+        queue = self._makeOne(zkclient)
         value1 = []
         value2 = []
         value3 = []
-        event1 = self.client.handler.event_object()
-        event2 = self.client.handler.event_object()
-        event3 = self.client.handler.event_object()
+        event1 = zkclient.handler.event_object()
+        event2 = zkclient.handler.event_object()
+        event3 = zkclient.handler.event_object()
 
         def get_concurrently(value, event):
-            q = self.client.LockingQueue(queue.path)
+            q = zkclient.LockingQueue(queue.path)
             value.append(q.get(0.1))
             event.set()
 
-        self.client.handler.spawn(get_concurrently, value1, event1)
-        self.client.handler.spawn(get_concurrently, value2, event2)
-        self.client.handler.spawn(get_concurrently, value3, event3)
+        zkclient.handler.spawn(get_concurrently, value1, event1)
+        zkclient.handler.spawn(get_concurrently, value2, event2)
+        zkclient.handler.spawn(get_concurrently, value3, event3)
         queue.put(b"one")
         event1.wait(0.2)
         event2.wait(0.2)
