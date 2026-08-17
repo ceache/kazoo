@@ -100,7 +100,7 @@ Relationships:
   standard Wireshark/tshark keylog preference, covering forward-secret and
   TLS 1.3 sessions because secrets are captured on the server JVMs (R-02).
 
-### Keylog agent (provisioned jar) *(US2 — NOT YET IMPLEMENTED)*
+### Keylog agent (provisioned jar) *(US2 — IMPLEMENTED)*
 
 A versioned, checksum-pinned build artifact that makes keylog capture possible.
 

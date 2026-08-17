@@ -217,6 +217,53 @@ def pytest_collection_modifyitems(
             item.add_marker(pytest.mark.skip(reason=reason))
 
 
+def pytest_sessionfinish(
+    session: pytest.Session, exitstatus: int | pytest.ExitCode
+) -> None:
+    """Document the interrupted-session artifact guarantee (quickstart V9).
+
+    When a capture-enabled run is interrupted mid-suite (keyboard interrupt),
+    Docker's ``down`` teardown still runs the session fixture (R-05/R-07), so
+    the capture sidecars receive SIGTERM and flush their pcapng files before
+    exiting. The bind-mounted artifacts therefore survive the interruption as
+    readable *partial* files (FR-003 edge). This hook verifies that reality
+    post-hoc: on interruption it best-effort probes the newest per-member
+    pcapng for a readable Section Header Block and reports it. Best-effort
+    only — the run is already interrupted and must never turn into a failure.
+    """
+    if exitstatus != getattr(pytest.ExitCode, "INTERRUPTED", 130):
+        return
+    workdir = os.environ.get("ZK_WORK_DIR")
+    captures = (
+        pathlib.Path(workdir) / "captures"
+        if workdir
+        else pathlib.Path(session.config.rootpath) / "captures"
+    )
+    if not captures.is_dir():
+        return
+    magics = (b"\x0a\x0d\x0d\x0a", b"\x4d\x3c\xb2\xa1")
+    readable = []
+    for pattern in (
+        "kazoo-client-zoo1-*.pcapng",
+        "kazoo-client-zoo2-*.pcapng",
+        "kazoo-client-zoo3-*.pcapng",
+    ):
+        files = sorted(captures.glob(pattern))
+        if not files:
+            continue
+        try:
+            with files[-1].open("rb") as handle:
+                if handle.read(4) in magics:
+                    readable.append(files[-1].name)
+        except OSError:
+            pass
+    if readable:
+        print(
+            "[kazoo] interrupted capture left readable partial artifacts: "
+            + ", ".join(readable)
+        )
+
+
 @attrs.frozen(kw_only=True, auto_attribs=True)
 class KazooZkEnv:
     version: str
@@ -816,6 +863,12 @@ def docker_compose(
         if emitted:
             paths = ", ".join(map(str, emitted))
             print(f"[kazoo] capture keylog artifacts: {paths}")
+        # Teardown never deletes capture artifacts (FR-009, R-05): `down
+        # --volumes` removes only *named compose volumes* (the tmpfs zooN data
+        # volumes), never the bound directories under ${ZK_WORK_DIR}
+        # (captures/, logs/, certs/, agent/), so the pcapngs + decryption
+        # material survive unchanged and remain on disk after the session for
+        # analysis (quickstart V1/V2). See contracts/artifacts.md.
         _COMPOSE_HANDLE = None
         compose.stop()
 

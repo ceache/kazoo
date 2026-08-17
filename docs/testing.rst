@@ -93,6 +93,18 @@ honors an environment variable):
     Comma-separated ZooKeeper feature set: ``standard`` (default), ``ttl``,
     ``readonly``, ``reconfig`` (injected as server JVM flags).
 
+``--zk-features=capture``
+    Adds the **capture** harness feature: per-member ``tshark`` sidecars (in an
+    in-repo Alpine image, FR-009) record all client-port traffic (clear 2181,
+    secure 2281) for the whole session into per-member pcapng artifacts
+    (``kazoo-client-zooN-*.pcapng``) under ``${ZK_WORK_DIR}/captures``, which
+    survive cluster teardown for later analysis. It composes with any auth
+    flavor; on ``tls`` it also emits ``captures/tls/zk-secrets.log`` (an
+    SSLKEYLOGFILE) plus the server/CA certificates so the capture decrypts with
+    only emitted material. Capture is observational and never changes test
+    outcomes. See ``specs/002-network-capture/`` for the full contract and
+    quickstart guide.
+
 Compose layout
 ==============
 

@@ -41,7 +41,7 @@ pytest kazoo/tests/integ/test_client.py --zk-auth=tls --zk-features=ttl,capture 
 |---|---|
 | `ZK_FEATURES` | accepted value `capture` among the comma-joined set |
 | `ZK_WORK_DIR` | already exported by the harness; `${ZK_WORK_DIR}/captures` is the bind-mount target |
-| `ZK_CAPTURE_JVMFLAGS` | host-computed; set to `-javaagent:/agent/extract-tls-secrets.jar=/logs/tls-secrets.log` only when `capture` is active on the `tls` flavor, else `""`; interpolated into the base `SERVER_JVMFLAGS`. **US2 caveat**: the agent jar the flag points at is NOT yet provisioned (the `tls-secrets-agent` service/Dockerfile plus keylog assembly are pending tasks T014–T017), so a `tls`+`capture` run currently launches JVMs with a missing agent jar |
+| `ZK_CAPTURE_JVMFLAGS` | host-computed; set to `-javaagent:/agent/extract-tls-secrets.jar=/logs/tls-secrets.log` only when `capture` is active on the `tls` flavor, else `""`; interpolated into the base `SERVER_JVMFLAGS`. The `tls-secrets-agent` service provisions the pinned/checksummed jar into `${ZK_WORK_DIR}/agent` and the zoo services `depends_on` its `.ready` healthcheck, so the flag's jar always exists on a `tls`+`capture` run (R-10, US2 implemented) |
 
 No new user-facing environment variables are introduced by this feature.
 

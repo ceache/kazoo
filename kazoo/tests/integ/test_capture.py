@@ -16,6 +16,12 @@ cell.
 * ``test_tls_keylog_emitted`` -- the decryption-material contract (R-02/R-09):
   on the tls flavor the ensemble emits a non-empty SSLKEYLOGFILE-format keylog
   plus the context certs into ``captures/tls/``.
+* ``test_capture_outcomes_identical`` -- the parity contract (FR-007/SC-005):
+  the ``capture`` axis never changes any test's run/skip/fail classification
+  (verified via the marker machinery).
+* ``test_capture_with_feature_combo_ttl`` /
+  ``test_capture_with_feature_combo_reconfig`` -- capture composes with the
+  ttl/reconfig server features (FR-012, quickstart V8).
 * ``test_non_tls_emits_no_keylog`` -- the FR-006 edge: no decryption material
   is emitted unless the tls flavor is active.
 
@@ -60,7 +66,11 @@ from pathlib import Path
 
 import pytest
 
-from kazoo.testing.kazoo_ensemble import _assemble_tls_keylog
+from kazoo.testing.kazoo_ensemble import (
+    ZKFeature,
+    _assemble_tls_keylog,
+    _evaluate_axis_markers,
+)
 
 # pcapng magic bytes: 0A 0D 0D 0A (native endian) identifies the Section
 # Header Block (SHB); the byte-swapped variant is produced by non-native
@@ -129,6 +139,13 @@ def test_tls_keylog_emitted(docker_env, zkclient):
     zkclient.create("/tls-keylog-selfcheck", b"x")
     assert zkclient.get("/tls-keylog-selfcheck")[0] == b"x"
 
+    # The agent flushes keylog lines as handshakes occur, but the host-side
+    # view of an actively-written bind mount can lag briefly (and on Docker
+    # Desktop virtiofs syncs lazily), so poll the per-node keylogs until at
+    # least one carries content before assembling (same rationale as the
+    # pcapng magic poll above).
+    _wait_for_host_keylog(docker_env.workdir)
+
     emitted = _assemble_tls_keylog(
         docker_env.workdir, docker_env.auth, docker_env.features
     )
@@ -160,6 +177,68 @@ def test_non_tls_emits_no_keylog(docker_env):
         f"decryption material {tls_dir} emitted on non-tls axis "
         f"(auth={docker_env.auth.value})"
     )
+
+
+@pytest.mark.zk_features(require=["capture"])
+def test_capture_outcomes_identical(request, docker_env):
+    """Adding the ``capture`` feature must not alter any test's outcome.
+
+    FR-007/SC-005: capture is observational (a tshark sidecar plus, on tls, a
+    passive keylog agent), so it must not change which tests run, skip, or
+    fail (quickstart V4–V5). We prove this through the marker machinery
+    itself: re-evaluate every collected item's axis markers with the active
+    feature set and with ``capture`` removed, and require identical
+    run/skip/fail classifications. Only the capture-gated self-check tests
+    themselves are exempt (they are supposed to skip without the axis value).
+    """
+    items = list(request.session.items)
+    assert items, "no collected items to parity-check"
+    active_features = docker_env.features
+    assert ZKFeature.CAPTURE in active_features  # we are on a capture run
+    baseline_features = tuple(
+        f for f in active_features if f is not ZKFeature.CAPTURE
+    )
+
+    for item in items:
+        # Skip the capture-gated tests: they are defined to run only under
+        # the capture axis, so their without-capture classification (skip) is
+        # an expected, intentional difference.
+        marker = item.get_closest_marker("zk_features")
+        require = (marker.kwargs or {}).get("require") or () if marker else ()
+        if "capture" in require:
+            continue
+        with_capture = _evaluate_axis_markers(
+            item, docker_env.version, docker_env.auth, active_features
+        )
+        without_capture = _evaluate_axis_markers(
+            item, docker_env.version, docker_env.auth, baseline_features
+        )
+        assert without_capture == with_capture, (
+            f"capture changed the outcome of {item.nodeid}: "
+            f"without={without_capture!r} with={with_capture!r}"
+        )
+
+
+@pytest.mark.zk_features(require=["capture", "ttl"])
+def test_capture_with_feature_combo_ttl(docker_compose, zkclient):
+    """Capture composes with the ttl server feature (FR-012, quickstart V8).
+
+    The per-member capture sidecars must work identically when the ttl server
+    feature is also active; the pcapng of at least one member must carry
+    client-port frames (the artifact contract is per-member, see module
+    docstring).
+    """
+    zkclient.create("/capture-ttl-combo", b"x")
+    assert zkclient.get("/capture-ttl-combo")[0] == b"x"
+    _assert_container_frames_present(docker_compose)
+
+
+@pytest.mark.zk_features(require=["capture", "reconfig"])
+def test_capture_with_feature_combo_reconfig(docker_compose, zkclient):
+    """Capture composes with the reconfig server feature (FR-012, V8)."""
+    zkclient.create("/capture-reconfig-combo", b"y")
+    assert zkclient.get("/capture-reconfig-combo")[0] == b"y"
+    _assert_container_frames_present(docker_compose)
 
 
 def _container_exec(
@@ -279,6 +358,26 @@ def _assert_container_frames_present(docker_compose) -> None:
         f"no client-port frames captured across {_MEMBERS} (ports="
         f"{sorted(ports)})"
     )
+
+
+def _wait_for_host_keylog(workdir: Path) -> None:
+    """Poll the per-node host-side keylogs until at least one is non-empty.
+
+    The ``extract-tls-secrets`` agent writes SSLKEYLOGFILE lines as TLS
+    handshakes occur, but the host-side view of an actively-written bind mount
+    can lag briefly (Docker Desktop's virtiofs syncs lazily). Poll up to ~10s
+    so ``_assemble_tls_keylog`` reads a file that already carries content,
+    matching the pcapng magic poll used above.
+    """
+    for _ in range(50):
+        for node in _MEMBERS:
+            keylog = workdir / "logs" / node / "tls-secrets.log"
+            try:
+                if keylog.stat().st_size > 0:
+                    return
+            except OSError:
+                continue
+        time.sleep(0.2)
 
 
 def _probe_host_artifacts(

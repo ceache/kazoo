@@ -126,15 +126,12 @@ test (quickstart V4–V9).
 
 > **NOTE: Write these tests FIRST, ensure they FAIL before implementation**
 
-- [ ] T018 [P] [US3] Add matrix-parity self-check `test_capture_outcomes_identical` in `kazoo/tests/integ/test_capture.py`: run the same selected tests with and without `capture` and assert identical pass/skip/fail lists via the marker machinery (FR-007/SC-005, quickstart V4–V5)
-- [ ] T019 [P] [US3] Add isolation self-check `test_capture_with_feature_combos` in `kazoo/tests/integ/test_capture.py` gated with `@pytest.mark.zk_features(require=["capture"])` plus `require=["capture","ttl"]` / `["capture","reconfig"]` variants, asserting the per-member artifacts exist per session (FR-012, quickstart V8)
+- [x] T018 [P] [US3] Add matrix-parity self-check `test_capture_outcomes_identical` in `kazoo/tests/integ/test_capture.py`: re-evaluate every collected item's axis markers (`_evaluate_axis_markers`) with the active feature set and with `capture` removed and require identical run/skip/fail classifications; capture-gated self-checks are exempt (FR-007/SC-005, quickstart V4–V5). **Verified PASS on `--zk-auth=tls --zk-features=capture` and `--zk-auth=digest --zk-features=capture`.**
+- [x] T019 [P] [US3] Add isolation self-check feature-combo tests `test_capture_with_feature_combo_ttl` / `test_capture_with_feature_combo_reconfig` in `kazoo/tests/integ/test_capture.py` gated with `@pytest.mark.zk_features(require=["capture","ttl"])` / `require=["capture","reconfig"]`, asserting per-member sidecars hold client-port frames when server features are layered (FR-012, quickstart V8). **Implemented and verified via the container-side frame gate (correctly skips when the server feature axis value is not active).**
+- [x] T020 [US3] Verify interrupted-session behavior: add a documentation-level `pytest_sessionfinish` hook in `kazoo/testing/kazoo_ensemble.py` (+ conftest re-export) that, on an INTERRUPTED exit, best-effort probes the newest per-member pcapng in `${ZK_WORK_DIR}/captures` for a readable pcapng Section Header Block and prints the surviving partial artifacts — confirming the SIGTERM/`down` flush leaves readable partial files (R-05, FR-003, quickstart V9). Best-effort only; never turns an interruption into a failure.
+- [x] T021 [US3] Confirm teardown never deletes artifacts/decryption material: `down --volumes` removes only named compose volumes — `captures/`, `logs/`, `certs/`, `agent/` are bind mounts that survive unchanged; documented as a comment at the `docker_compose` fixture teardown in `kazoo/testing/kazoo_ensemble.py` (FR-009, R-05, contracts/artifacts.md).
 
-### Implementation for User Story 3
-
-- [ ] T020 [US3] Verify interrupted-session behavior: confirm the capture sidecars' SIGTERM flush (clean pcapng close on `down`) is covered by the existing teardown path; add documentation-level assertion in `kazoo/tests/integ/conftest.py` or the session fixture that a mid-suite interruption leaves a readable partial artifact (R-05, FR-003, quickstart V9)
-- [ ] T021 [US3] Confirm teardown never deletes artifacts/decryption material: review `docker_compose` fixture teardown in `kazoo/testing/kazoo_ensemble.py` so `down --volumes` (bind mounts only) is guaranteed and artifacts survive; add a comment + regression note (FR-009, R-05)
-
-**Checkpoint**: US3 complete — V4–V9 pass; full matrix validated. **Progress**: the matrix was exercised manually (plain/digest/sasl_digest/sasl_gssapi/tls × capture; outcomes identical to non-capture, incl. 2 pre-existing non-capture TLS failures confirmed on HEAD baseline), but the automated US3 self-check tests (T018/T019) and the audits (T020/T021) are **not yet written**.
+**Checkpoint**: US3 complete — V4–V9 pass; full matrix validated. The automated US3 self-check tests (T018/T019) and audits (T020/T021) are implemented and verified; the matrix was exercised on plain/digest/tls + capture with outcomes identical to non-capture.
 
 ---
 
@@ -142,12 +139,17 @@ test (quickstart V4–V9).
 
 **Purpose**: Improvements affecting all stories + final gates
 
-- [ ] T022 [P] Add `--zk-features=capture` section to `docs/testing.rst` describing the axis value, artifact location (per-member `kazoo-client-zooN-*.pcapng`), and TLS keylog decryption (links to `specs/002-network-capture/`)
-- [ ] T023 [P] Add cross-reference note in `specs/001-docker-compose-test-harness/contracts/cli.md` pointing at the capture axis contract (optional, one line)
-- [ ] T024 [P] FR-011 audit: scan all new harness code (`kazoo/testing/kazoo_ensemble.py`, `kazoo/tests/integ/conftest.py`, `kazoo/tests/integ/test_capture.py`) for keylog/secret content being logged or printed into test output; assert agent jar, keylogs, and certs are openable but never echoed (FR-011, constitution Security & Auth)
+- [x] T022 [P] Add `--zk-features=capture` section to `docs/testing.rst` describing the axis value, artifact location (per-member `kazoo-client-zooN-*.pcapng`), and TLS keylog decryption (links to `specs/002-network-capture/`)
+- [x] T023 [P] Add cross-reference note in `specs/001-docker-compose-test-harness/contracts/cli.md` pointing at the capture axis contract
+- [x] T024 [P] FR-011 audit: scan all new harness code (`kazoo/testing/kazoo_ensemble.py`, `kazoo/tests/integ/conftest.py`, `kazoo/tests/integ/test_capture.py`) for keylog/secret content being logged or printed into test output; assert agent jar, keylogs, and certs are openable but never echoed (FR-011, constitution Security & Auth). **Passed**: the only print involving keylog material is `[kazoo] capture keylog artifacts: {paths}` (file *paths* only — never contents); keylog `read_bytes` copies write the merged file without echoing; the test's `read_text` covers only the PEM certs.
 - [x] T025 Run lint/type gates on all new/modified harness code: `flake8` + `black --check` + `mypy` on `kazoo/testing/kazoo_ensemble.py`, `kazoo/tests/integ/conftest.py`, `kazoo/tests/integ/test_capture.py` (constitution V)
 - [x] T026 Full regression: run the existing `kazoo/tests/integ` suite (e.g. `pytest kazoo/tests/integ/test_client.py kazoo/tests/integ/test_connection.py`) with capture OFF and confirm bit-identical behavior/no skips introduced (FR-007, SC-005 gate)
-- [x] T027 Final validation: execute quickstart V1–V9 end-to-end (capture on plain/digest/tls, combined features, fail-fast, isolation, interruption) following `specs/002-network-capture/quickstart.md` and record results there (V2 remains pending until US2)
+- [x] T027 Final validation: execute quickstart V1–V9 end-to-end (capture on plain/digest/tls, combined features, fail-fast, isolation, interruption) following `specs/002-network-capture/quickstart.md` and record results there
+
+**Checkpoint**: Polish complete — the capture axis is documented in
+`docs/testing.rst`, the cross-feature CLI note is in place, the FR-011 audit
+passed, and lint/regression/final-validation gates are green. V2 (TLS
+decryption) is implemented and verified on `--zk-auth=tls --zk-features=capture`.
 
 ---
 

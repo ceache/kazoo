@@ -14,6 +14,12 @@ plain-auth, standard-feature run on the latest pinned ZooKeeper version.
 | `--zk-auth` | `plain`, `digest`, `sasl_digest`, `sasl_gssapi`, `tls` | `plain` | `ZK_AUTH` | Auth scheme; selects the compose flavor (FR-004) |
 | `--zk-features` | comma-separated subset of `standard`, `ttl`, `readonly`, `reconfig` | `standard` | `ZK_FEATURES` | Server feature toggles (FR-005) |
 
+> **Note**: the standalone [network-capture
+> feature](../../002-network-capture/contracts/cli.md) adds the `capture`
+> value to the same `--zk-features` axis (`specs/002-network-capture/`). It is
+> a harness capability (no server JVM flag) that layers per-member tshark
+> sidecars and, on tls, emits keylog decryption material.
+
 ## Environment variables set by the harness
 
 These are exported before the compose process runs and are consumed by compose

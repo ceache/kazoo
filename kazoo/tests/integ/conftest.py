@@ -16,6 +16,7 @@ from kazoo.testing.kazoo_ensemble import (
     pytest_addoption as kazoo_ensemble_pytest_addoption,
     pytest_collection_modifyitems as kazoo_ensemble_pytest_collection_modifyitems,  # noqa: E501
     pytest_configure as kazoo_ensemble_pytest_configure,
+    pytest_sessionfinish as kazoo_ensemble_pytest_sessionfinish,
     zkchroot,
     zkclient,
     zkensemble,
@@ -51,6 +52,10 @@ def pytest_configure(config):
 
 def pytest_collection_modifyitems(session, config, items):
     kazoo_ensemble_pytest_collection_modifyitems(session, config, items)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    kazoo_ensemble_pytest_sessionfinish(session, exitstatus)
 
 
 @pytest.fixture(scope="session")

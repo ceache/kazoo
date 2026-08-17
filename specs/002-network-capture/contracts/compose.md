@@ -61,7 +61,7 @@ services:
 - **Readiness**: long-running service without a healthcheck; compose
   `up --wait` treats it ready once up (R-06).
 
-### What the overlay adds to the zoo services *(US2 — pending)*
+### What the overlay adds to the zoo services *(tls flavor, US2)*
 
 For each of `zoo1-service`/`zoo2-service`/`zoo3-service` (the ZK JVM services),
 on the `tls` auth flavor only (R-02/R-09):
@@ -90,12 +90,11 @@ When `capture` is active, the session fixture builds the capture image
 (`docker compose build` in the capture overlay's context,
 `_build_capture_images` in `kazoo_ensemble.py`) before `up`. Build/start
 failure aborts the run with an actionable message before any test executes
-(R-07). *(On US2 this same preflight will also build `tls-secrets-agent`.)*
+(R-07). *(On tls+capture runs this same preflight also builds `tls-secrets-agent`.)*
 
-## `tls-secrets-agent` service *(US2 — pending)*
+## `tls-secrets-agent` service
 
-The keylog agent provisioner is a planned US2 addition to the overlay (R-10),
-not yet implemented:
+The keylog agent provisioner is a shipped US2 addition to the overlay (R-10):
 
 ```yaml
 services:
@@ -127,7 +126,7 @@ colliding (R-08).
 `capture` composes with:
 - **auth flavors**: plain, digest, sasl_digest, sasl_gssapi, tls. On `tls` the
   keylog agent + decryption material are emitted (see
-  [decryption.md](./decryption.md)) — **US2, pending**; on non-tls flavors the
+  [decryption.md](./decryption.md)); on non-tls flavors the
   agent jar is still provisioned but no `-javaagent:` flag is set and no TLS
   secrets exist.
 - **server features**: standard, ttl, readonly, reconfig — orthogonal (FR-007).

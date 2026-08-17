@@ -2,15 +2,14 @@
 
 **Feature**: [Network Capture](../spec.md) · **Research**: [research.md](../research.md)
 
-> **Status: US2 — NOT YET IMPLEMENTED.** This contract describes the planned
-> decryption mechanism (tasks T012–T017). The `${ZK_CAPTURE_JVMFLAGS}`
-> `-javaagent:` flag computation already exists in `_resolve_axis_options`
-> (capture on the tls flavor), but the `tls-secrets-agent` jar provisioning,
-> the overlay `depends_on`/mount wiring, and the teardown keylog assembly do
-> not — a `tls`+`capture` run today would try to load the not-yet-provisioned
-> agent jar. Treat the rest of this document as the design contract for US2,
-> not shipped behavior. (The per-member capture artifacts, R-01/R-05/R-08, are
-> implemented; the TLS *decryption* material is not.)
+> **Status: US2 — IMPLEMENTED** (tasks T012–T017). The `${ZK_CAPTURE_JVMFLAGS}`
+> `-javaagent:` flag computation in `_resolve_axis_options` (capture on the tls
+> flavor), the `tls-secrets-agent` jar provisioning, the overlay
+> `depends_on`/mount wiring, and the teardown keylog assembly are all shipped
+> and verified on `--zk-auth=tls --zk-features=capture`. Treat the rest of this
+> document as the shipped contract. (The per-member capture artifacts,
+> R-01/R-05/R-08, are implemented; the TLS *decryption* material is shipped with
+> US2.)
 
 How the TLS portions of the capture are decrypted using nothing but what the
 harness emits.

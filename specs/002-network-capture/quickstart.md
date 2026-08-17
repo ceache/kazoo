@@ -69,7 +69,10 @@ implementation details live in `tasks.md` and the implementation phase.
 > **Note**: the keylog agent (US2, tasks T012–T017) is implemented — the
 > emitted `captures/tls/zk-secrets.log` is a TLS 1.3 SSLKEYLOGFILE
 > (`CLIENT_HANDSHAKE_TRAFFIC_SECRET`/`SERVER_TRAFFIC_SECRET_0` lines). The
-> automated self-check `test_tls_keylog_emitted` verifies emission; the
+> automated self-check `test_tls_keylog_emitted` verifies emission (drives real
+> TLS traffic, then polls the per-node host keylogs up to ~10s until the agent's
+> write lands on the bind mount — the pcapng-style flush poll — before invoking
+> the same `_assemble_tls_keylog` routine the harness teardown runs); the
 > `tshark` decryption gate here is manual (no host tshark, FR-009) or CI.
 
 ### V3 — Non-TLS runs emit no decryption material (FR-006 edge)
@@ -123,4 +126,6 @@ second run does not overwrite the first; no harness debris between runs.
 
 Start a capture run and interrupt it (Ctrl-C) mid-suite. **Expected**: the
 pcapng up to the interruption is present, readable, and flushes cleanly
-(FR-003).
+(FR-003). An automated post-hoc check (`pytest_sessionfinish`) probes the
+newest per-member pcapng for a readable pcapng header on INTERRUPTED exits and
+prints the surviving partial artifacts (T020).

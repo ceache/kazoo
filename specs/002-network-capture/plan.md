@@ -32,11 +32,11 @@ alongside the artifacts, so the captured TLS traffic is **decryptable using
 only the emitted material** — with **default ciphers untouched** (ECDHE/TLS 1.3
 kept; no downgrade, FR-007). This works because kazoo's client does not honor
 `SSLKEYLOGFILE`, but the *server* is Java and keylog entries are symmetric
-(R-02, R-09, R-10). **Status: US2 — planned, not yet implemented**: the
-`-javaagent:` flag computation in `${ZK_CAPTURE_JVMFLAGS}` already exists, but
-the `tls-secrets-agent` jar provisioning (T014/T015) and the teardown keylog
-assembly (T017) are pending — a `tls`+`capture` run today would try to load a
-jar that does not exist yet.
+(R-02, R-09, R-10). **Status: US2 — IMPLEMENTED**: the `-javaagent:` flag
+computation in `${ZK_CAPTURE_JVMFLAGS}` is live; the `tls-secrets-agent`
+sidecar provisions the pinned/checksummed jar (T014/T015), and the teardown
+keylog assembly `_assemble_tls_keylog` (T017) merges the per-node keylogs into
+`captures/tls/zk-secrets.log`. Verified on `--zk-auth=tls --zk-features=capture`.
 
 `capture` contributes **no server feature JVM flags** (it is a harness feature,
 not a ZK feature); the only JVM-level addition is the passive, observational
@@ -53,7 +53,7 @@ container.
 - New: none in the Python env. The capture tool is `tshark` from Alpine's
   `community` repo (`apk add tshark`), baked into an in-repo Dockerfile
   (`kazoo/tests/integ/dockerfiles/capture/`), consistent with the harness's
-  KDC pattern (R-03). For TLS decryption (US2, pending), the
+  KDC pattern (R-03). For TLS decryption (US2, implemented), the
   `extract-tls-secrets` Java agent (Apache-2.0, `5.0.0`, pinned + SHA-256
   verified) is downloaded at build time into an in-repo image
   (`dockerfiles/tls-secrets-agent/`) — same supply-chain discipline as `apk`
@@ -89,10 +89,10 @@ session.
   options/TLV payloads that must not be truncated (FR-005).
 - TLS decryption from emitted material only, including the handshake; via the
   JSSE keylog agent under capture on the tls axis, with the **TLS channel left
-  at default ciphers** (no downgrade; FR-006/FR-007, R-02). *(US2 — pending)*
-- In-repo, versioned capture image; the planned `tls-secrets-agent` image (no
-  third-party image trust) will pin-verify the agent jar at build time
-  (FR-009/FR-010, R-10). *(US2 — pending)*
+  at default ciphers** (no downgrade; FR-006/FR-007, R-02).
+- In-repo, versioned capture image; the `tls-secrets-agent` image (no
+  third-party image trust) pin-verifies the agent jar at build time
+  (FR-009/FR-010, R-10).
 - Throwaway material only; decryption uses ephemeral session secrets +
   throwaway certs — no private key exported, not logged, not committed
   (FR-011).
@@ -152,7 +152,7 @@ kazoo/
 │       #  ZkEnsemble.stop/start translate member names via _process_service
 │       #    so failure injection targets zooN-service, never the holder (R-01)
 │       #  health-wait + dump_ensemble_logs target zooN-service
-│       #  TLS path (US2, pending): export ZK_CAPTURE_JVMFLAGS (the -javaagent
+│       #  TLS path: export ZK_CAPTURE_JVMFLAGS (the -javaagent
 │       #    flag) when capture is active on the tls axis; merge per-node
 │       #    keylogs into zk-secrets.log at teardown (R-02, R-09, R-10)
 └── tests/
@@ -165,13 +165,13 @@ kazoo/
         │                            #   netns); + ${ZK_CAPTURE_JVMFLAGS} in
         │                            #   SERVER_JVMFLAGS slot (R-01/R-02/R-04)
         ├── docker-compose.features-capture.yml   # three per-member
-        │                            #   zooN-capture sidecars (R-01); US2
-        │                            #   will add tls-secrets-agent (R-10)
+        │                            #   zooN-capture sidecars (R-01) +
+        │                            #   tls-secrets-agent keylog provisioner (R-10)
         └── dockerfiles/
             ├── capture/             # in-repo Alpine tshark image (R-03)
             │   ├── Dockerfile
             │   └── capture-entrypoint.sh   # $1 = member name; unique pcapng
-            └── tls-secrets-agent/   # US2 (pending): pinned, sha256-verified
+            └── tls-secrets-agent/   # pinned, sha256-verified
                                      #   keylog agent jar (R-10)
 
 docs/testing.rst               # + one section documenting `--zk-features=capture`

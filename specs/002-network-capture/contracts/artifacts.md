@@ -14,11 +14,11 @@ ${ZK_WORK_DIR}/
 │   ├── kazoo-client-zoo1-<ts>.pcapng   # one per member, per run (FR-002)
 │   ├── kazoo-client-zoo2-<ts>.pcapng
 │   ├── kazoo-client-zoo3-<ts>.pcapng
-│   └── tls/                            # present ONLY on the tls auth flavor (US2)
+│   └── tls/                            # present ONLY on the tls auth flavor
 │       ├── zk-secrets.log       # SSLKEYLOGFILE — merged session keys (R-02)
 │       ├── server-cert.pem      # server certificate
 │       └── ca.pem               # signing CA certificate
-└── agent/                              # (US2)
+└── agent/                              # (tls flavor, US2)
     └── extract-tls-secrets.jar  # pinned keylog agent jar (provisioned, R-10)
 ```
 
@@ -31,7 +31,7 @@ ${ZK_WORK_DIR}/
   `mergecap`.
 - `zk-secrets.log` is assembled at teardown from the per-node keylogs the
   agent wrote into the `/logs` bind mounts (`logs/zk1|zk2|zk3/tls-secrets.log`)
-  — see [decryption.md](./decryption.md). *(US2)*
+  — see [decryption.md](./decryption.md).
 - The path is printed to the test output at teardown so developers know where
   to look.
 
@@ -54,7 +54,6 @@ is at the TCP/traffic level unless a third-party Lua dissector is loaded.)
 
 **tls axis**: decrypt first using the emitted keylog material (see
 [decryption.md](./decryption.md)), then analyze the plaintext on port 2281.
-*(US2 — pending)*
 
 ## Integrity
 
@@ -65,4 +64,4 @@ is at the TCP/traffic level unless a third-party Lua dissector is loaded.)
   never a corrupt or zero-byte file.
 - On the tls axis, `zk-secrets.log` must be non-empty after any TLS handshake;
   a missing/empty keylog on a capture-enabled tls run is a failure to report
-  (it means the agent never recorded a session). *(US2)*
+  (it means the agent never recorded a session).
