@@ -47,8 +47,54 @@
 # wrapper, which consumes that member name for the output filename and appends
 # `-w`; compose appends `command` to the entrypoint, so a `tshark` prefix here
 # would double-execute the binary (R-03, T010). Do NOT specify `-w` in command.
+#
+# On the tls flavor this overlay additionally provisions the JSSE keylog
+# agent (R-02/R-10): the `tls-secrets-agent` sidecar downloads the pinned,
+# checksum-verified `extract-tls-secrets` jar into ${ZK_WORK_DIR}/agent and
+# signals readiness with a `.ready` healthcheck. The zoo services depend on
+# that healthcheck and mount the jar read-only at /agent/extract-tls-secrets.jar,
+# which the base file's ${ZK_CAPTURE_JVMFLAGS} -javaagent: flag points at.
+# The agent jar is present and healthy before any JVM starts, so a
+# `tls`+`capture` run never launches a JVM with a missing `-javaagent:` jar.
 
 services:
+  # JSSE keylog agent provisioner (R-02/R-10): downloads the pinned jar at
+  # build time (dockerfiles/tls-secrets-agent) and installs it into the shared
+  # ${ZK_WORK_DIR}/agent mount. The zoo services depend on this service's
+  # healthcheck, so the jar always exists before any JVM starts. Harmless on
+  # non-tls runs: ${ZK_CAPTURE_JVMFLAGS} is empty there, so the jar is simply
+  # mounted but never attached.
+  tls-secrets-agent:
+    build: ./dockerfiles/tls-secrets-agent
+    volumes:
+      - ${ZK_WORK_DIR}/agent:/agent
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /agent/.ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+
+  zoo1-service:
+    depends_on:
+      tls-secrets-agent:
+        condition: service_healthy
+    volumes:
+      - ${ZK_WORK_DIR}/agent/extract-tls-secrets.jar:/agent/extract-tls-secrets.jar:ro
+
+  zoo2-service:
+    depends_on:
+      tls-secrets-agent:
+        condition: service_healthy
+    volumes:
+      - ${ZK_WORK_DIR}/agent/extract-tls-secrets.jar:/agent/extract-tls-secrets.jar:ro
+
+  zoo3-service:
+    depends_on:
+      tls-secrets-agent:
+        condition: service_healthy
+    volumes:
+      - ${ZK_WORK_DIR}/agent/extract-tls-secrets.jar:/agent/extract-tls-secrets.jar:ro
+
   zoo1-capture:
     build: ./dockerfiles/capture
     # Join member 1's network namespace: taps the interface the ZK JVM listens

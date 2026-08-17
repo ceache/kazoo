@@ -13,6 +13,11 @@ cell.
   every member's tshark sidecar holds open a ``kazoo-client-zooN-*.pcapng``
   that already carries real client-port frames and a structurally valid pcapng
   header.
+* ``test_tls_keylog_emitted`` -- the decryption-material contract (R-02/R-09):
+  on the tls flavor the ensemble emits a non-empty SSLKEYLOGFILE-format keylog
+  plus the context certs into ``captures/tls/``.
+* ``test_non_tls_emits_no_keylog`` -- the FR-006 edge: no decryption material
+  is emitted unless the tls flavor is active.
 
 Per the network-holder split (docker-compose.base.yml), capture is now **per
 member**: one ``zooN-capture`` sidecar joins each member's network namespace
@@ -54,6 +59,8 @@ import time
 from pathlib import Path
 
 import pytest
+
+from kazoo.testing.kazoo_ensemble import _assemble_tls_keylog
 
 # pcapng magic bytes: 0A 0D 0D 0A (native endian) identifies the Section
 # Header Block (SHB); the byte-swapped variant is produced by non-native
@@ -104,6 +111,55 @@ def test_artifact_exists_and_valid(docker_compose, zkclient):
         Path(os.environ["ZK_WORK_DIR"]).glob("captures/kazoo-client-*.pcapng")
     )
     _probe_host_artifacts(artifacts, magics)
+
+
+@pytest.mark.zk_auth("tls")
+@pytest.mark.zk_features(require=["capture"])
+def test_tls_keylog_emitted(docker_env, zkclient):
+    """The tls+capture run emits the TLS decryption material (R-02/R-09).
+
+    On the tls flavor the ensemble JVMs run the ``extract-tls-secrets`` agent,
+    which writes an SSLKEYLOGFILE-format keylog per node. This test drives real
+    TLS client traffic, then exercises the same assembly routine the harness
+    teardown runs (``_assemble_tls_keylog``) to assert ``captures/tls/``
+    contains a non-empty keylog plus the context certificates. No private key
+    is ever emitted (FR-006).
+    """
+    # Drive real TLS traffic (the handshake the agent's keylog captures).
+    zkclient.create("/tls-keylog-selfcheck", b"x")
+    assert zkclient.get("/tls-keylog-selfcheck")[0] == b"x"
+
+    emitted = _assemble_tls_keylog(
+        docker_env.workdir, docker_env.auth, docker_env.features
+    )
+    assert emitted is not None, "no keylog material assembled on tls+capture"
+    paths = {p.name for p in emitted}
+    assert "zk-secrets.log" in paths
+    assert "server-cert.pem" in paths
+    assert "ca.pem" in paths
+
+    keylog = docker_env.workdir / "captures" / "tls" / "zk-secrets.log"
+    assert keylog.stat().st_size > 0, "keylog is empty after a TLS handshake"
+    for name in ("server-cert.pem", "ca.pem"):
+        material = (docker_env.workdir / "captures" / "tls" / name).read_text()
+        assert material.startswith(
+            "-----BEGIN CERTIFICATE-----"
+        ), f"{name} is not a PEM certificate"
+
+
+@pytest.mark.zk_auth(skip=("tls",))
+@pytest.mark.zk_features(require=["capture"])
+def test_non_tls_emits_no_keylog(docker_env):
+    """Non-tls capture runs must not emit TLS decryption material (R-09 edge).
+
+    The keylog agent is only attached on the tls flavor, so ``captures/tls/``
+    must not exist anywhere else (plain, digest, sasl_digest, sasl_gssapi).
+    """
+    tls_dir = docker_env.workdir / "captures" / "tls"
+    assert not tls_dir.exists(), (
+        f"decryption material {tls_dir} emitted on non-tls axis "
+        f"(auth={docker_env.auth.value})"
+    )
 
 
 def _container_exec(

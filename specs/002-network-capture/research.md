@@ -81,17 +81,16 @@ zoo1-capture:                     # same for zoo2-capture, zoo3-capture
 
 ---
 
-## R-02 — TLS decryption: session-key export via a JSSE keylog agent *(US2 — NOT YET IMPLEMENTED)*
+## R-02 — TLS decryption: session-key export via a JSSE keylog agent *(US2 — IMPLEMENTED)*
 
-> **Status**: this decision describes the planned US2 mechanism (tasks
-> T012–T017). Part is already wired: `_resolve_axis_options` computes the
-> `-javaagent:` flag into `${ZK_CAPTURE_JVMFLAGS}` when `capture` is active on
-> the `tls` flavor (this predates the current work). What is **not** yet
-> implemented is the `tls-secrets-agent` jar provisioning, the overlay
-> `depends_on`/mount wiring on `zooN-service`, and the teardown keylog
-> assembly — so a `tls`+`capture` run today would launch the JVMs with a
-> `-javaagent:` pointing at a jar that does not exist yet. Treat everything
-> below as the design contract for US2, not shipped behavior.
+> **Status**: implemented across tasks T012–T017. `_resolve_axis_options`
+> computes the `-javaagent:` flag into `${ZK_CAPTURE_JVMFLAGS}` when `capture`
+> is active on the `tls` flavor; the `tls-secrets-agent` sidecar provisions the
+> pinned/checksummed jar into the shared `${ZK_WORK_DIR}/agent` mount (zoo
+> services `depends_on` its `.ready` healthcheck and mount the jar read-only);
+> `_assemble_tls_keylog` merges the three per-node keylogs + context certs into
+> `captures/tls/` at teardown (and is exercised mid-session by the T012
+> self-check). The text below remains the design contract.
 
 **Unknown**: Modern TLS uses forward secrecy (ECDHE); the server's RSA private
 key alone cannot decrypt a session. The user requires "ssl certs keys made
@@ -315,7 +314,7 @@ leftover harness debris (SC-007).
 
 ---
 
-## R-09 — Decryption material: ephemeral session keys + context certs *(US2 — NOT YET IMPLEMENTED)*
+## R-09 — Decryption material: ephemeral session keys + context certs *(US2 — IMPLEMENTED)*
 
 **Decision**: decryption material is emitted only under the tls flavor with
 `capture` active, in `${ZK_WORK_DIR}/captures/tls/`:
@@ -333,7 +332,7 @@ logged or printed (FR-011).
 
 ---
 
-## R-10 — Provisioning the keylog agent jar: in-repo, pinned, no third-party image trust *(US2 — NOT YET IMPLEMENTED)*
+## R-10 — Provisioning the keylog agent jar: in-repo, pinned, no third-party image trust *(US2 — IMPLEMENTED)*
 
 **Unknown**: the `-javaagent:` jar must exist inside every zoo container
 *before* the JVM starts, yet the harness provisions nothing from third-party

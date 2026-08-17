@@ -47,7 +47,7 @@ implementation details live in `tasks.md` and the implementation phase.
    > validation (the self-check tests) inspects the files **inside the capture
    > containers** via `docker compose exec`, which is always current.
 
-### V2 — TLS traffic decrypts with only the emitted material (SC-004, FR-006) *(US2 — pending)*
+### V2 — TLS traffic decrypts with only the emitted material (SC-004, FR-006)
 
 1. Run the TLS axis with capture:
    ```bash
@@ -66,9 +66,11 @@ implementation details live in `tasks.md` and the implementation phase.
    **Expected**: the connect-request magic appears in decrypted payloads; no
    external secrets used (single keylog file, no private key exported).
 
-> **Note**: V2 depends on the JSSE keylog agent (US2, tasks T012–T017), which
-> is not yet implemented. Until then the TLS-axis capture produces ciphertext
-> artifacts without emitted decryption material.
+> **Note**: the keylog agent (US2, tasks T012–T017) is implemented — the
+> emitted `captures/tls/zk-secrets.log` is a TLS 1.3 SSLKEYLOGFILE
+> (`CLIENT_HANDSHAKE_TRAFFIC_SECRET`/`SERVER_TRAFFIC_SECRET_0` lines). The
+> automated self-check `test_tls_keylog_emitted` verifies emission; the
+> `tshark` decryption gate here is manual (no host tshark, FR-009) or CI.
 
 ### V3 — Non-TLS runs emit no decryption material (FR-006 edge)
 

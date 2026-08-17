@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import uuid
@@ -521,6 +522,56 @@ def dump_ensemble_logs() -> None:
         _print_logs(service)
 
 
+def _assemble_tls_keylog(
+    workdir: pathlib.Path,
+    auth: ZKAuthMode,
+    features: tuple[ZKFeature, ...],
+) -> list[pathlib.Path] | None:
+    """Concatenate per-node TLS keylogs + context certs into ``captures/tls/``.
+
+    On ``tls``+``capture`` runs the ensemble JVMs are launched with the
+    ``extract-tls-secrets`` agent (R-02), which writes an SSLKEYLOGFILE-format
+    secrets file into each node's ``/logs`` bind mount. This assembles those
+    per-node keylogs (``logs/zk1|zk2|zk3/tls-secrets.log``) into
+    ``captures/tls/zk-secrets.log`` and copies the server + CA certificates
+    for context, so the pcapng artifacts can be decrypted (R-09, FR-006). No
+    private key is exported, and the keylog contents are never printed.
+
+    Returns the emitted artifact paths, or ``None`` when this run has no keylog
+    (capture inactive or auth is not ``tls``).
+    """
+    if ZKFeature.CAPTURE not in features or auth is not ZKAuthMode.TLS:
+        return None
+
+    tls_dir = workdir / "captures" / "tls"
+    tls_dir.mkdir(parents=True, exist_ok=True)
+
+    keylog = tls_dir / "zk-secrets.log"
+    with keylog.open("wb") as out:
+        for log_dir in ("zk1", "zk2", "zk3"):
+            node_log = workdir / "logs" / log_dir / "tls-secrets.log"
+            if node_log.is_file() and node_log.stat().st_size:
+                out.write(node_log.read_bytes())
+                out.write(b"\n")
+
+    emitted: list[pathlib.Path] = []
+    copies = {
+        workdir / "certs" / "server" / "server.pem": "server-cert.pem",
+        workdir / "certs" / "cacert.pem": "ca.pem",
+    }
+    for source, name in copies.items():
+        if source.is_file():
+            destination = tls_dir / name
+            shutil.copyfile(source, destination)
+            emitted.append(destination)
+
+    if keylog.stat().st_size:
+        emitted.insert(0, keylog)
+    if emitted:
+        return emitted
+    return None
+
+
 def _export_krb5_client_env(
     docker_env: KazooZkEnv,
     docker_compose: DockerCompose,
@@ -700,6 +751,7 @@ def docker_env(
 def docker_compose(
     request: pytest.FixtureRequest,
     docker_compose_config: dict[str, Any],
+    docker_env: KazooZkEnv,
 ) -> Iterator[DockerCompose]:
     """Start the ZooKeeper ensemble stack via docker-compose (testcontainers).
 
@@ -755,6 +807,15 @@ def docker_compose(
         # became healthy), so `down --volumes` always cleans up the stack.
         if request.session.testsfailed:
             dump_ensemble_logs()
+        # Assemble the TLS keylog + context certs (R-02/R-09) before the stack
+        # goes down, so the decryption material for the pcapng artifacts is
+        # available after teardown. No-op on non-tls/non-capture runs.
+        emitted = _assemble_tls_keylog(
+            docker_env.workdir, docker_env.auth, docker_env.features
+        )
+        if emitted:
+            paths = ", ".join(map(str, emitted))
+            print(f"[kazoo] capture keylog artifacts: {paths}")
         _COMPOSE_HANDLE = None
         compose.stop()
 
