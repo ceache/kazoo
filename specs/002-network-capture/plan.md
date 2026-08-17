@@ -103,10 +103,9 @@ session.
 
 **Scale/Scope**: one new `ZKFeature.CAPTURE` enum value; one compose overlay
 (`docker-compose.features-capture.yml`) plus the netns-holder split in
-`docker-compose.base.yml`; one in-repo Dockerfile (capture); a planned second
-Dockerfile (tls-secrets-agent, US2); three per-member capture sidecars in the
-session compose stack; decryption-material export for the tls axis (US2);
-quickstart V1–V9.
+`docker-compose.base.yml`; two in-repo Dockerfiles (capture + tls-secrets-agent,
+R-03/R-10); three per-member capture sidecars in the session compose stack;
+decryption-material export for the tls axis (US2); quickstart V1–V9.
 
 ## Constitution Check
 
@@ -179,8 +178,8 @@ specs/001-docker-compose-test-harness/contracts/cli.md  # (optional) cross-ref n
 ```
 
 **Structure Decision**: Single-project layout, mirroring the parent harness.
-The capture overlay, the base-file holder/service split, and the capture
-Dockerfile (plus the planned tls-secrets-agent Dockerfile) live with the
+The capture overlay, the base-file holder/service split, and the capture and
+`tls-secrets-agent` Dockerfiles live with the
 integration tests (`kazoo/tests/integ/`), exactly where the KDC/certgen infra
 already sits; the axis wiring stays in `kazoo/testing/kazoo_ensemble.py`; no
 new top-level packages, no `setup.cfg` changes.
