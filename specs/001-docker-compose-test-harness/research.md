@@ -6,7 +6,9 @@
 
 This document resolves every "NEEDS CLARIFICATION" and open decision in the
 feature spec against the current branch state (in-progress `kazoo/testing/kazoo_ensemble.py`
-and `kazoo/tests/integ/`) plus the strategy docs `PYTEST_INTEG.md` and `COMPOSE-STRATEGY.md`.
+and `kazoo/tests/integ/`). See `docs/testing.rst` for the architecture/technical
+implementation of the composite harness, which supersedes the earlier
+`PYTEST_INTEG.md` and `COMPOSE-STRATEGY.md` strategy docs.
 
 ---
 
@@ -126,9 +128,9 @@ Each auth flavor is materialized as a compose overlay on the base definition
 
 ## R-04: Kerberos KDC — in-repo Alpine build
 
-- **Decision**: Port the existing `tmp/kdc/` Dockerfile + entrypoint to **Alpine
-  Linux** and commit it in-repo (FR-018). No third-party KDC image.
-- **Rationale**: `tmp/kdc/Dockerfile` (Debian `buster-slim`) installs
+- **Decision**: Build the KDC in-repo as an **Alpine** image committed at
+  `kazoo/tests/integ/dockerfiles/kdc/` (FR-018). No third-party KDC image.
+- **Rationale**: the KDC Dockerfile (Alpine-based) installs
   `krb5-admin-server krb5-kdc`, runs as user `daemon`, and its `entrypoint.sh`:
   1. writes `krb5.conf` (realm `EXAMPLE.ORG`, KDC listening on `127.0.0.1:1088`),
   2. creates the principal database (`kdb5_util create -s`),
@@ -298,7 +300,7 @@ Nine top-level test files still use the legacy API and MUST be migrated
   ├── docker-compose.auth-sasl-digest.yml        # JAAS DigestLoginModule + SASL provider
   ├── docker-compose.auth-sasl-gssapi.yml        # + kdc service (depends_on service_healthy) + JAAS Krb5 + TLS transport
   ├── docker-compose.auth-tls.yml                # + certgen service + Netty + secureClientPort + ssl.*
-  └── dockerfiles/kdc/                           # Alpine KDC (ported from tmp/kdc)
+  └── dockerfiles/kdc/                           # Alpine KDC (in-repo, R-04)
       ├── Dockerfile
       └── root/entrypoint.sh
   ```
@@ -388,7 +390,7 @@ Nine top-level test files still use the legacy API and MUST be migrated
 | Healthcheck tooling | `nc` + 4LW, verified present in image | R-02 |
 | Ensemble size | fixed 3-node (clarification Q1 / FR-016) | R-09 |
 | GSSAPI + TLS combined mode | sasl_gssapi flavor = TLS tunnel + GSSAPI auth | R-03/R-05/R-06 |
-| KDC image | in-repo Alpine build from `tmp/kdc/` pattern | R-04 |
+| KDC image | in-repo Alpine build at `kazoo/tests/integ/dockerfiles/kdc/` | R-04 |
 | TLS cert generation | ephemeral certgen sidecar → shared bind mount | R-05 |
 | Legacy migration | 9 files, coverage-preserving, then delete legacy modules | R-08 |
 | Dependency declarations | add testcontainers>=4,<5; drop pytest-docker, pyjks, pyOpenSSL | R-10 |

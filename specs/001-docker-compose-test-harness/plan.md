@@ -18,8 +18,8 @@ session-scoped, fixed 3-node ensemble, per-test chroot isolation, and
 marker-driven skipping across the three axes (ZK version, auth scheme, feature
 set). Auth flavors — plain, digest, SASL digest, SASL GSSAPI, TLS, and the
 combined **TLS tunnel + GSSAPI** mode — are materialized as compose overlays
-(base definition + auth overlay) backed by an in-repo Alpine KDC (ported from
-`tmp/kdc/`). CI migrates to a tiered matrix (FR-017). Nine legacy-API test files
+(base definition + auth overlay) backed by an in-repo Alpine KDC in
+`kazoo/tests/integ/dockerfiles/kdc/`). CI migrates to a tiered matrix (FR-017). Nine legacy-API test files
 migrate to the new fixtures; the legacy public API is removed as a documented
 breaking change.
 
@@ -86,7 +86,7 @@ ZK version series; 6 already-migrated integ files + 9 legacy files to migrate
 | **IV. Backward compatibility** | PASS (with documented breaking change) | Legacy public API (`KazooTestCase`, `KazooTestHarness`) removed outright per clarification Q1; MUST be recorded in `CHANGES.md` under `BREAKING CHANGES` (FR-010). Python 3.8 is dropped from the support matrix (testcontainers 4.x requires Python >= 3.9 — plan-refinement clarification); all other supported Python/handler backends preserved. |
 | **V. Rigorous quality gates** | PASS | flake8/black/mypy strict on all new harness code; the 9 migrated test files keep passing under all handlers (threading/gevent/eventlet). |
 | **Security & Auth** | PASS | Throwaway credentials/keytabs/certs (FR-013); KDC built in-repo on Alpine (FR-018) — no third-party trust root; GSSAPI-in-TLS supported (FR-012). |
-| **License** | PASS | Apache-2.0; no new vendored code — the KDC Dockerfile/entrypoint is ported from the repo's own `tmp/kdc/` (already Apache-2.0 project code). |
+| **License** | PASS | Apache-2.0; no new vendored code — the KDC Dockerfile/entrypoint lives in-repo under `kazoo/tests/integ/dockerfiles/kdc/` (already Apache-2.0 project code). |
 
 ## Project Structure
 
@@ -127,7 +127,7 @@ kazoo/
     │   ├── docker-compose.auth-sasl-digest.yml        # JAAS DigestLoginModule + SASL provider
     │   ├── docker-compose.auth-sasl-gssapi.yml        # KDC + JAAS Krb5 + TLS tunnel + GSSAPI
     │   ├── docker-compose.auth-tls.yml                # certgen + Netty + secureClientPort
-    │   ├── dockerfiles/kdc/                           # Alpine KDC (ported from tmp/kdc)
+    │   ├── dockerfiles/kdc/                           # Alpine KDC (in-repo, R-04)
     │   │   ├── Dockerfile
     │   │   └── root/entrypoint.sh
     │   └── test_*.py             # 6 already migrated + new auth/feature tests

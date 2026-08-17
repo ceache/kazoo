@@ -37,7 +37,7 @@ kazoo/tests/integ/
 ├── docker-compose.auth-sasl-digest.yml        # JAAS DigestLoginModule + SASL provider
 ├── docker-compose.auth-sasl-gssapi.yml        # KDC sidecar + JAAS Krb5 + TLS transport
 ├── docker-compose.auth-tls.yml                # certgen sidecar + Netty + secureClientPort
-└── dockerfiles/kdc/                           # Alpine KDC (in-repo, from tmp/kdc)
+└── dockerfiles/kdc/                           # Alpine KDC (in-repo, R-04)
 ```
 
 The active file list is `[base]` + (`[auth-<mode>]` when auth != plain),

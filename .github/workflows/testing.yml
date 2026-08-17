@@ -58,7 +58,7 @@ jobs:
         # (test_axes) on the latest Python target to keep the combinatorial
         # cost bounded (SC-007).
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "pypy-3.11-v7.3.21"]
-        zk-version: ["3.7.2", "3.8.3", "3.9.1"]
+        zk-version: ["3.7.2", "3.8.6", "3.9.5"]
     steps:
       - uses: actions/checkout@v4
 
@@ -119,32 +119,32 @@ jobs:
         include:
           - axis: digest
             python-version: "3.14"
-            zk-version: "3.9.1"
+            zk-version: "3.9.5"
             zk-auth: digest
             zk-features: standard
           - axis: sasl_digest
             python-version: "3.14"
-            zk-version: "3.9.1"
+            zk-version: "3.9.5"
             zk-auth: sasl_digest
             zk-features: standard
           - axis: tls
             python-version: "3.14"
-            zk-version: "3.9.1"
+            zk-version: "3.9.5"
             zk-auth: tls
             zk-features: standard
           - axis: sasl_gssapi
             python-version: "3.14"
-            zk-version: "3.9.1"
+            zk-version: "3.9.5"
             zk-auth: sasl_gssapi
             zk-features: standard
           - axis: ttl
             python-version: "3.14"
-            zk-version: "3.9.1"
+            zk-version: "3.9.5"
             zk-auth: plain
             zk-features: ttl
           - axis: reconfig
             python-version: "3.14"
-            zk-version: "3.9.1"
+            zk-version: "3.9.5"
             zk-auth: plain
             zk-features: reconfig
     steps:

@@ -81,7 +81,7 @@ The harness exposes three axes as pytest command-line options (each also
 honors an environment variable):
 
 ``--zk-version`` (or ``ZK_VERSION``)
-    ZooKeeper server tag, e.g. ``3.7.2``, ``3.8.3``, ``3.9.5`` (default).
+    ZooKeeper server tag, e.g. ``3.7.2``, ``3.8.6``, ``3.9.5`` (default).
 
 ``--zk-auth`` (or ``ZK_AUTH``)
     Authentication flavor: ``plain`` (default), ``digest``, ``sasl_digest``,
@@ -109,13 +109,75 @@ The compose files live in ``kazoo/tests/integ/``:
   ports, tmpfs data dirs, healthcheck).
 * ``docker-compose.auth-<auth>.yml`` — per-auth overlay files layered on top
   of the base file (digest, sasl-digest, tls, sasl-gssapi).
-* ``dockerfiles/`` — support images for TLS cert generation and the Kerberos
-  KDC used by the GSSAPI axis.
+* ``docker-compose.features-capture.yml`` — the capture overlay (``tshark``
+  sidecars, keylog agent); other features (ttl/readonly/reconfig) are pure
+  JVM-flag interpolation in the base file.
+* ``dockerfiles/`` — in-repo support images: TLS cert generation, the Kerberos
+  KDC for the GSSAPI axis, the capture ``tshark`` sidecars, and the
+  ``tls-secrets-agent`` keylog provisioner.
 
 The active overlay set is resolved by ``docker_compose_config()`` in
 ``kazoo/tests/integ/conftest.py`` and the ensemble is driven through
 `testcontainers <https://testcontainers-python.readthedocs.io>`_
 (:class:`testcontainers.compose.DockerCompose`).
+
+Architecture
+============
+
+The harness drives Docker Compose programmatically inside pytest. Three
+orthogonal dimensions define every test run — the **ZK version** (the official
+``zookeeper`` image tag), the **auth scheme** (``plain``, ``digest``,
+``sasl_digest``, ``sasl_gssapi``, ``tls``, and a TLS tunnel + GSSAPI combo),
+and the **feature set** (``standard``, ``ttl``, ``readonly``, ``reconfig``,
+plus harness capabilities like ``capture``). They are selected per run via the
+``--zk-*`` CLI options (documented above) and materialized into a single
+compose project assembled from a base file plus optional overlays:
+
+1. **Base compose file** — ``docker-compose.base.yml`` defines the three-node
+   ensemble from the official image: parameterized ``ZK_VERSION`` tag, clear
+   client ports, tmpfs data dirs, and the 4-letter-word healthcheck
+   (``ruok``/``imok``). Each member is split into a *network holder*
+   (``zoo1``/``zoo2``/``zoo3``, ``sleep infinity``) and a *ZooKeeper process*
+   service joined into the holder's netns via ``network_mode: service:zooN``,
+   so restarting the ZooKeeper JVM (failure-injection tests) never tears down
+   published client ports or the capture sidecar's tap.
+2. **JVM flags are interpolated host-side** — feature flags (``-Dzookeeper.ttl.enabled``,
+   read-only ``true``, ``-Dzookeeper.dynamicConfigFile=...``) and auth flags
+   (the digest ``superDigest``, TLS/GSSAPI quorum config) are computed in
+   ``kazoo/testing/kazoo_ensemble.py`` and injected into
+   ``SERVER_JVMFLAGS`` **here in the base file** via ``${ZK_FEATURES_JVMFLAGS}``
+   and ``${ZK_AUTH_JVMFLAGS}``. Deliberately not composed across overlay files:
+   docker-compose merges an ``environment`` map wholesale by key, so a cross-file
+   ``SERVER_JVMFLAGS`` override would silently replace the base value instead of
+   appending to it.
+3. **Auth overlays** — ``docker-compose.auth-<auth>.yml`` resolve per-flavor
+   *services* only (they never set ``SERVER_JVMFLAGS``, since compose merges
+   an ``environment`` map wholesale per key and would silently override the
+   base interpolation): ``sasl-digest`` binds ``jaas/sasl-digest.conf`` and set
+   ``JVMFLAGS`` for the login module, ``tls`` spins up a certgen container that
+   materializes the throwaway PKI, and ``sasl-gssapi`` adds the in-repo Alpine
+   KDC (_kazoo/tests/integ/dockerfiles/kdc_) plus a gssapi init sidecar that
+   provisions the realm, keytabs and the server JAAS. ``digest`` declares no
+   services at all — it is configured purely by the host-side ``superDigest``
+   interpolation.
+4. **Capture overlay** — ``docker-compose.features-capture.yml`` adds the
+   ``tshark`` sidecar per member that taps the shared netns and writes pcap
+   captures to a ``capture://`` URL (useful for deterministically exercising
+   client-side cert/keylog handling).
+
+The pytest integration mirrors that layering:
+
+* **Session-scoped lifecycle** — ``zkensemble`` boots one compose project
+  (per-session ``COMPOSE_PROJECT_NAME``) matching the active axes, waits for
+  it via ``docker compose up --wait``, and tears it down in a ``finally``
+  (``down --volumes``) so a partial/failed session is still cleaned up.
+* **Collection-time skipping** — every collected item's markers are evaluated
+  against the active axes during collection; mismatches become skips with an
+  actionable reason, so a run never collects tests that cannot pass on its
+  configuration.
+* **Per-test isolation** — ``zkclient`` yields one connected client per test,
+  scoped to an ephemeral chroot that is created and removed around each test,
+  so tests share the live ensemble but not each other's data.
 
 Marker shortcuts
 ================
