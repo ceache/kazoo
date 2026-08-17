@@ -123,6 +123,7 @@ module = [
     'kazoo.tests.integ.test_auth',
     'kazoo.tests.integ.test_barrier',
     'kazoo.tests.integ.test_cache',
+    'kazoo.tests.integ.test_capture',
     'kazoo.tests.integ.test_client',
     'kazoo.tests.integ.test_connection',
     'kazoo.tests.integ.test_counter',

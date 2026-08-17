@@ -13,6 +13,12 @@
 # Clients connect with use_ssl=True + certfile/keyfile/ca from
 # ${ZK_WORK_DIR}/certs (see contracts/client-connection.md).
 #
+# Under the network-holder split (docker-compose.base.yml header), the secure
+# port 2281 is published on the *holder* services (zoo1/zoo2/zoo3 — the netns
+# owners carry `ports:`), while the TLS configuration itself (ZOO_CFG_EXTRA,
+# keystore/truststore mounts, certgen dependency) lives on the *process*
+# services (zoo1-service/zoo2-service/zoo3-service).
+#
 # NOTE: never set SERVER_JVMFLAGS here — compose merges environment maps
 # wholesale per key and would silently override the base interpolation.
 # The plain 2181 port stays enabled (base file) and is used by the base
@@ -43,18 +49,11 @@ services:
       retries: 60
 
   zoo1:
-    depends_on:
-      certgen:
-        condition: service_healthy
-    environment:
-      <<: *tls_environment
-    volumes:
-      - ${ZK_WORK_DIR}/certs/server/keystore.p12:/conf/keystore.p12:ro
-      - ${ZK_WORK_DIR}/certs/server/truststore.p12:/conf/truststore.p12:ro
+    # Holder: publishes the secure client port (netns owner carries ports).
     ports:
       - ${ZOO1_SECURE_PORT}:2281
 
-  zoo2:
+  zoo1-service:
     depends_on:
       certgen:
         condition: service_healthy
@@ -63,10 +62,12 @@ services:
     volumes:
       - ${ZK_WORK_DIR}/certs/server/keystore.p12:/conf/keystore.p12:ro
       - ${ZK_WORK_DIR}/certs/server/truststore.p12:/conf/truststore.p12:ro
+
+  zoo2:
     ports:
       - ${ZOO2_SECURE_PORT}:2281
 
-  zoo3:
+  zoo2-service:
     depends_on:
       certgen:
         condition: service_healthy
@@ -75,5 +76,17 @@ services:
     volumes:
       - ${ZK_WORK_DIR}/certs/server/keystore.p12:/conf/keystore.p12:ro
       - ${ZK_WORK_DIR}/certs/server/truststore.p12:/conf/truststore.p12:ro
+
+  zoo3:
     ports:
       - ${ZOO3_SECURE_PORT}:2281
+
+  zoo3-service:
+    depends_on:
+      certgen:
+        condition: service_healthy
+    environment:
+      <<: *tls_environment
+    volumes:
+      - ${ZK_WORK_DIR}/certs/server/keystore.p12:/conf/keystore.p12:ro
+      - ${ZK_WORK_DIR}/certs/server/truststore.p12:/conf/truststore.p12:ro

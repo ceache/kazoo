@@ -3,16 +3,36 @@
 # Layers the network-capture capability onto the ensemble stack whenever the
 # `capture` axis value is active (see specs/002-network-capture/).
 #
-#   * capture sidecar (build ./dockerfiles/capture) -> single tshark process
-#     on the compose bridge in promiscuous mode, capturing full-length
-#     frames (-s 0) of all client-port traffic (clear 2181, secure 2281) for
-#     the whole session into ${ZK_WORK_DIR}/captures/kazoo-client.pcapng;
-#     bind mount survives `docker compose down --volumes`.
-#   * tls-secrets-agent sidecar (build ./dockerfiles/tls-secrets-agent) ->
-#     provisions the pinned, checksum-verified `extract-tls-secrets` Java
-#     agent jar into ${ZK_WORK_DIR}/agent; zoo services mount the jar
-#     read-only and, on the tls flavor, launch each JVM with -javaagent so
-#     the SSLKEYLOGFILE sessions can be decrypted from emitted material only.
+#   * capture sidecars (build ./dockerfiles/capture) -> one tshark process PER
+#     ensemble member (`zoo1-capture`/`zoo2-capture`/`zoo3-capture`), each
+#     joined into its member's network namespace via
+#     `network_mode: service:zooN`. Each captures full-length frames (-s 0) of
+#     all client-port traffic (clear 2181, secure 2281) into a uniquely-named
+#     per-run file under ${ZK_WORK_DIR}/captures/; the bind mount survives
+#     `docker compose down --volumes`.
+#
+# ARCHITECTURE NOTE: why the sidecar lives in the member's netns (vs. the
+# earlier host-netns design):
+#
+#   * The plan originally ran ONE sidecar on the compose bridge in promiscuous
+#     mode (`-i eth0`). On Docker Desktop (macOS/Windows) that bridge is a
+#     userspace stack (gvisor-tap) that never mirrors other containers' unicast
+#     frames onto a peer's veth, so tshark captured nothing but its own
+#     traffic. A single host-netns sidecar (`-i any`, R-01) fixed the bridge
+#     problem but observed traffic for ALL three members at once and tied the
+#     whole capture to the host namespace.
+#   * The network-holder split (docker-compose.base.yml header) makes the
+#     deterministic per-member tap possible: each `zooN-capture` joins the
+#     member's netns and taps the member's own `eth0` NON-promiscuously (-p).
+#     The traffic passing through that interface is precisely the traffic
+#     reaching the ZooKeeper JVM in the same namespace — on BOTH Docker Desktop
+#     and native Linux — with no bridge-mirroring dependency. Because the
+#     holder owns the netns, a member restart (`docker compose stop
+#     zooN-service`) never kills the sidecar's tap: the capture continues
+#     across the member's downtime (FR-009 / quickstart invariants).
+#   * `-p` (no promiscuous mode) keeps the sidecar's privileges minimal; the
+#     capture filter (client ports only, no quorum ports) keeps the artifact
+#     scoped to client traffic.
 #
 # NOTE: never set SERVER_JVMFLAGS here — compose merges environment maps
 # wholesale per key and would silently override the base interpolation. The
@@ -21,7 +41,63 @@
 #
 # NOTE: volumes/ports are plain lists — docker-compose concatenates them with
 # the base file's lists across files, so no anchor merge is needed.
+#
+# Each capture service's `command:` is a flags-only line whose FIRST token is
+# the member name. The Dockerfile's ENTRYPOINT is the capture-entrypoint.sh
+# wrapper, which consumes that member name for the output filename and appends
+# `-w`; compose appends `command` to the entrypoint, so a `tshark` prefix here
+# would double-execute the binary (R-03, T010). Do NOT specify `-w` in command.
 
-# Service definitions are layered in by the capture (R-01) and
-# tls-secrets-agent (R-10) implementation tasks (US1/US2).
-services: {}
+services:
+  zoo1-capture:
+    build: ./dockerfiles/capture
+    # Join member 1's network namespace: taps the interface the ZK JVM listens
+    # on (see ARCHITECTURE NOTE above).
+    network_mode: service:zoo1
+    depends_on:
+      zoo1:
+        condition: service_started
+    # tshark/dumpcap need raw + interface privileges even in the member netns
+    # (R-06).
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    # Full-length frames (-s 0) of all client-port traffic — clear 2181 and
+    # secure 2281 (FR-002/FR-005). Quorum ports (2888/3888) are not captured.
+    # First token `zoo1` is the member name for the output filename.
+    command: >
+      zoo1 -i eth0 -p -s 0
+      -f "tcp port 2181 or tcp port 2281"
+    volumes:
+      # Bind mount: survives `docker compose down --volumes` (R-05).
+      - ${ZK_WORK_DIR}/captures:/captures
+
+  zoo2-capture:
+    build: ./dockerfiles/capture
+    network_mode: service:zoo2
+    depends_on:
+      zoo2:
+        condition: service_started
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    command: >
+      zoo2 -i eth0 -p -s 0
+      -f "tcp port 2181 or tcp port 2281"
+    volumes:
+      - ${ZK_WORK_DIR}/captures:/captures
+
+  zoo3-capture:
+    build: ./dockerfiles/capture
+    network_mode: service:zoo3
+    depends_on:
+      zoo3:
+        condition: service_started
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    command: >
+      zoo3 -i eth0 -p -s 0
+      -f "tcp port 2181 or tcp port 2281"
+    volumes:
+      - ${ZK_WORK_DIR}/captures:/captures

@@ -13,6 +13,12 @@
 # sasl_options={"mechanism": "DIGEST-MD5", "username": "jaasuser",
 # "password": "jaas_password"} (see contracts/client-connection.md).
 #
+# These overrides target the *process* services (zoo1-service/zoo2-service/
+# zoo3-service): the JVM environment and /conf mounts belong to the container
+# running ZooKeeper, not the network-namespace holder (see
+# docker-compose.base.yml header). No ports are published here — they live on
+# the holders in the base file.
+#
 # NOTE: never set SERVER_JVMFLAGS here — compose merges environment maps
 # wholesale per key and would silently override the base interpolation.
 
@@ -24,17 +30,17 @@ x-sasl-digest-environment: &sasl_digest_environment
     enforce.auth.schemes=sasl
 
 services:
-  zoo1:
+  zoo1-service:
     environment:
       <<: *sasl_digest_environment
     volumes:
       - ./jaas/sasl-digest.conf:/conf/jaas.conf:ro
-  zoo2:
+  zoo2-service:
     environment:
       <<: *sasl_digest_environment
     volumes:
       - ./jaas/sasl-digest.conf:/conf/jaas.conf:ro
-  zoo3:
+  zoo3-service:
     environment:
       <<: *sasl_digest_environment
     volumes:

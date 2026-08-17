@@ -26,7 +26,35 @@
 #   * ZK_CAPTURE_JVMFLAGS   -> -javaagent keylog flag ("" unless capture+tls)
 #   * COMPOSE_PROJECT_NAME  -> unique per-session project name (isolation)
 #
-# Service names are stable: zoo1, zoo2, zoo3 (hostnames and DNS names match).
+# NETWORK-Namespace HOLDER PATTERN (the Kubernetes "pause container" model):
+#
+# Each ensemble member is split into a *network holder* service (zoo1/zoo2/zoo3)
+# plus a *zookeeper process* service (zoo1-service/zoo2-service/zoo3-service)
+# that joins the holder's network namespace via `network_mode: service:zooN`:
+#
+#   * zooN (holder)          -> a container that OWNS the network namespace and
+#     publishes the client ports (2181, and 2281 via the tls/gssapi overlays).
+#     It reuses the `zookeeper:${ZK_VERSION}` image — which the -service
+#     containers pull anyway — with its ENTRYPOINT command overridden to
+#     `sleep infinity`, so it runs no JVM and adds no new image to the stack.
+#     The compose-network DNS name `zooN` resolves to this container, so
+#     `ZOO_SERVERS` and client connections are unchanged.
+#   * zooN-service (process) -> the actual ZooKeeper JVM, joined into the
+#     holder's netns. It binds 0.0.0.0:{2181,2888,3888,2281} inside that shared
+#     namespace, exactly where the holder's published ports and the DNS name
+#     point.
+#
+# The split exists so that stopping/restarting the ZooKeeper *process*
+# (failure-injection tests, FR-009) never tears down the network namespace: the
+# holder keeps running, and the capture sidecar (`zooN-capture`, layered by
+# docker-compose.features-capture.yml) keeps its tap on the member's interface
+# across a member restart. Without the holder, `docker compose stop zoo1` would
+# also destroy the namespace the sidecar lives in (see
+# docker-compose.features-capture.yml ARCHITECTURE NOTE).
+#
+# Service names are stable: zoo1, zoo2, zoo3 are the network holders
+# (hostnames/DNS names); zoo1-service/zoo2-service/zoo3-service are the
+# ZooKeeper JVM processes.
 
 volumes:
   zoo1_data_vol:
@@ -75,12 +103,30 @@ x-zoo-healthcheck: &zoo_healthcheck
   retries: 20
 
 services:
+  # --- Member 1: network holder + ZooKeeper process ---
+
   zoo1:
+    # Network-namespace holder: keeps the member's netns (and therefore the
+    # published client ports) alive across `zoo1-service` stop/start cycles.
+    # Reuses the zookeeper image (already pulled for the -service containers),
+    # overriding ENTRYPOINT's command so the container just sleeps instead of
+    # starting a JVM — no extra image is pulled for the holder.
     image: zookeeper:${ZK_VERSION}
     restart: always
     hostname: zoo1
+    command: ["sleep", "infinity"]
     ports:
       - ${ZOO1_CLIENT_PORT}:2181
+
+  zoo1-service:
+    image: zookeeper:${ZK_VERSION}
+    restart: always
+    # Join the holder's network namespace (see header comment). DNS name
+    # `zoo1` resolves to the holder, whose published ports terminate here.
+    network_mode: service:zoo1
+    depends_on:
+      zoo1:
+        condition: service_started
     healthcheck: *zoo_healthcheck
     environment:
       <<: *zoo_env
@@ -92,12 +138,23 @@ services:
     tmpfs:
       - "/datalog"
 
+  # --- Member 2: network holder + ZooKeeper process ---
+
   zoo2:
     image: zookeeper:${ZK_VERSION}
     restart: always
     hostname: zoo2
+    command: ["sleep", "infinity"]
     ports:
       - ${ZOO2_CLIENT_PORT}:2181
+
+  zoo2-service:
+    image: zookeeper:${ZK_VERSION}
+    restart: always
+    network_mode: service:zoo2
+    depends_on:
+      zoo2:
+        condition: service_started
     healthcheck: *zoo_healthcheck
     environment:
       <<: *zoo_env
@@ -109,12 +166,23 @@ services:
     tmpfs:
       - "/datalog"
 
+  # --- Member 3: network holder + ZooKeeper process ---
+
   zoo3:
     image: zookeeper:${ZK_VERSION}
     restart: always
     hostname: zoo3
+    command: ["sleep", "infinity"]
     ports:
       - ${ZOO3_CLIENT_PORT}:2181
+
+  zoo3-service:
+    image: zookeeper:${ZK_VERSION}
+    restart: always
+    network_mode: service:zoo3
+    depends_on:
+      zoo3:
+        condition: service_started
     healthcheck: *zoo_healthcheck
     environment:
       <<: *zoo_env

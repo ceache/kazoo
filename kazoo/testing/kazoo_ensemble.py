@@ -390,13 +390,29 @@ class ZkEnsemble:
             check=True,
         )
 
+    @staticmethod
+    def _process_service(name: str) -> str:
+        """Map a member name to the compose service running its ZK JVM.
+
+        Under the network-holder split (docker-compose.base.yml), the compose
+        service ``zooN`` is only a netns-holding container while the actual
+        ZooKeeper process lives in ``zooN-service``. Failure-injection tests
+        stop/start a member's ZooKeeper *process*, so any member name must be
+        translated to its ``-service`` twin here; the holder itself is never
+        stopped (it keeps the member's network namespace — and the capture
+        sidecar's tap — alive across member restarts).
+        """
+        if name in {"zoo1", "zoo2", "zoo3"}:
+            return f"{name}-service"
+        return name
+
     def stop(self, name: str) -> None:
-        """Stop the specified ZK node."""
-        self._run_compose("stop", name)
+        """Stop the specified ZK node's ZooKeeper process."""
+        self._run_compose("stop", self._process_service(name))
 
     def start(self, name: str) -> None:
-        """Start the specified ZK node."""
-        self._run_compose("start", name)
+        """Start the specified ZK node's ZooKeeper process."""
+        self._run_compose("start", self._process_service(name))
 
 
 #: Module-global handle on the running compose stack, set by the
@@ -441,6 +457,39 @@ def _ensure_docker_available(context: str) -> None:
         ) from None
 
 
+def _build_capture_images(compose: DockerCompose, context: str) -> None:
+    """Build the in-repo capture image before the stack starts (R-07).
+
+    ``docker compose up --wait`` would normally build the image declared by
+    the overlay, but a failure there surfaces as an opaque error partway into
+    ``start()``. Building explicitly first converts any build-time problem
+    (Docker network / registry outage for ``apk`` tshark) into a single,
+    actionable ``RuntimeError`` raised before the ensemble is even started.
+    The session fixture's ``finally`` teardown still runs, so nothing is left
+    behind.
+    """
+    # Reuse the same compose project/context/overlay list the stack will start
+    # with; `build` is a bool flag on the driver that only modifies `up`, so
+    # the build subcommand is invoked here directly.
+    cmd = [*compose.docker_compose_command(), "build"]
+    try:
+        subprocess.run(
+            cmd,
+            cwd=context,
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        details = exc.stderr.decode("utf-8", "replace").strip() or (
+            exc.stdout.decode("utf-8", "replace").strip()
+        )
+        raise RuntimeError(
+            "capture: in-repo image build failed before the stack started "
+            f"({details or exc}). Check Docker network/registry reachability "
+            "for dockerfiles/capture (apk tshark)."
+        ) from exc
+
+
 def dump_ensemble_logs() -> None:
     """Dump stdout/stderr of every ensemble member to aid failure diagnosis.
 
@@ -466,7 +515,9 @@ def dump_ensemble_logs() -> None:
             print(f"\n===== {service} {label} =====")
             print(text)
 
-    for service in ("zoo1", "zoo2", "zoo3"):
+    # Logs from the ZK JVM processes; the network-ns holders (zoo1..zoo3)
+    # run no JVM, so their stdout/stderr carry nothing of interest.
+    for service in ("zoo1-service", "zoo2-service", "zoo3-service"):
         _print_logs(service)
 
 
@@ -675,29 +726,22 @@ def docker_compose(
     )
 
     # Capture preflight (R-07): when `capture` is active, build the in-repo
-    # images declared by the capture overlay (dockerfiles/capture and
-    # dockerfiles/tls-secrets-agent) *before* `up`, so a build failure aborts
-    # the session with an actionable message instead of failing opaquely
-    # mid-`up`. The fetch of the pinned keylog agent jar happens inside that
-    # build (R-10), so a network/registry outage is reported here.
+    # image declared by the capture overlay (dockerfiles/capture) *before*
+    # `up`, so a build failure aborts the session with an actionable message
+    # instead of failing opaquely mid-`up` (a network/registry outage for
+    # `apk` tshark is reported here).
     if ZKFeature.CAPTURE in docker_compose_config["features"]:
-        try:
-            compose.build()
-        except Exception as exc:  # noqa: BLE001 - surface actionable message
-            raise RuntimeError(
-                "capture: in-repo image build failed before the stack started "
-                f"({exc}). Check Docker network/registry reachability for "
-                "dockerfiles/capture (apk tshark) and dockerfiles/"
-                "tls-secrets-agent (Maven Central extract-tls-secrets jar)."
-            ) from exc
+        _build_capture_images(compose, context)
 
     global _COMPOSE_HANDLE
     try:
         compose.start()
         _COMPOSE_HANDLE = compose
         # Belt-and-suspenders beyond `up --wait`: fail fast with a precise
-        # message if any ensemble member is not actually healthy.
-        for node in ("zoo1", "zoo2", "zoo3"):
+        # message if any ensemble member's ZK JVM is not actually healthy.
+        # The healthcheck lives on the -service services (the netns holders
+        # zoo1/zoo2/zoo3 run no JVM and carry no healthcheck).
+        for node in ("zoo1-service", "zoo2-service", "zoo3-service"):
             container = compose.get_container(node)
             if container.Health != "healthy":
                 raise RuntimeError(

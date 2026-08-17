@@ -13,13 +13,19 @@
 #     enforce.auth.enabled + enforce.auth.schemes=sasl
 #     + TLS transport (secureClientPort 2281, Netty factory, ssl.*, clientAuth)
 #   * certgen sidecar (from the tls flavor) produces the PKI the TLS tunnel
-#     and the client certs are built on; zoo services depend on BOTH sidecars
-#     becoming healthy before starting.
+#     and the client certs are built on; zoo *process* services depend on BOTH
+#     sidecars becoming healthy before starting.
 #
 # Clients connect with use_ssl=True (cert from ${ZK_WORK_DIR}/certs) and
 # sasl_options={"mechanism": "GSSAPI"}; the fixture exports KRB5_CONFIG
 # (host-view krb5.conf) and KRB5_CLIENT_KTNAME (client.keytab) for the client
 # process (see contracts/client-connection.md).
+#
+# Under the network-holder split (docker-compose.base.yml header), the secure
+# port 2281 is published on the *holder* services (zoo1/zoo2/zoo3 — the netns
+# owners carry `ports:`), while the JAAS/krb5/TLS configuration and the
+# kdc/certgen dependencies live on the *process* services
+# (zoo1-service/zoo2-service/zoo3-service).
 #
 # NOTE: never set SERVER_JVMFLAGS here — compose merges environment maps
 # wholesale per key and would silently override the base interpolation.
@@ -89,20 +95,11 @@ services:
       retries: 60
 
   zoo1:
-    depends_on:
-      <<: *sasl_gssapi_depends_on
-    environment:
-      <<: *sasl_gssapi_environment
-    volumes:
-      - ${ZK_WORK_DIR}/certs/server/keystore.p12:/conf/keystore.p12:ro
-      - ${ZK_WORK_DIR}/certs/server/truststore.p12:/conf/truststore.p12:ro
-      - ./jaas/sasl-gssapi.conf:/conf/jaas.conf:ro
-      - ${ZK_WORK_DIR}/krb5.conf:/conf/krb5.conf:ro
-      - ${ZK_WORK_DIR}/keytabs/server.keytab:/conf/server.keytab:ro
+    # Holder: publishes the secure client port (netns owner carries ports).
     ports:
       - ${ZOO1_SECURE_PORT}:2281
 
-  zoo2:
+  zoo1-service:
     depends_on:
       <<: *sasl_gssapi_depends_on
     environment:
@@ -113,10 +110,12 @@ services:
       - ./jaas/sasl-gssapi.conf:/conf/jaas.conf:ro
       - ${ZK_WORK_DIR}/krb5.conf:/conf/krb5.conf:ro
       - ${ZK_WORK_DIR}/keytabs/server.keytab:/conf/server.keytab:ro
+
+  zoo2:
     ports:
       - ${ZOO2_SECURE_PORT}:2281
 
-  zoo3:
+  zoo2-service:
     depends_on:
       <<: *sasl_gssapi_depends_on
     environment:
@@ -127,5 +126,19 @@ services:
       - ./jaas/sasl-gssapi.conf:/conf/jaas.conf:ro
       - ${ZK_WORK_DIR}/krb5.conf:/conf/krb5.conf:ro
       - ${ZK_WORK_DIR}/keytabs/server.keytab:/conf/server.keytab:ro
+
+  zoo3:
     ports:
       - ${ZOO3_SECURE_PORT}:2281
+
+  zoo3-service:
+    depends_on:
+      <<: *sasl_gssapi_depends_on
+    environment:
+      <<: *sasl_gssapi_environment
+    volumes:
+      - ${ZK_WORK_DIR}/certs/server/keystore.p12:/conf/keystore.p12:ro
+      - ${ZK_WORK_DIR}/certs/server/truststore.p12:/conf/truststore.p12:ro
+      - ./jaas/sasl-gssapi.conf:/conf/jaas.conf:ro
+      - ${ZK_WORK_DIR}/krb5.conf:/conf/krb5.conf:ro
+      - ${ZK_WORK_DIR}/keytabs/server.keytab:/conf/server.keytab:ro
