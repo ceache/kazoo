@@ -94,16 +94,11 @@ honors an environment variable):
     ``readonly``, ``reconfig`` (injected as server JVM flags).
 
 ``--zk-features=capture``
-    Adds the **capture** harness feature: per-member ``tshark`` sidecars (in an
-    in-repo Alpine image, FR-009) record all client-port traffic (clear 2181,
-    secure 2281) for the whole session into per-member pcapng artifacts
-    (``kazoo-client-zooN-*.pcapng``) under ``${ZK_WORK_DIR}/captures``, which
-    survive cluster teardown for later analysis. It composes with any auth
-    flavor; on ``tls`` it also emits ``captures/tls/zk-secrets.log`` (an
-    SSLKEYLOGFILE) plus the server/CA certificates so the capture decrypts with
-    only emitted material. Capture is observational and never changes test
-    outcomes. See ``specs/002-network-capture/`` for the full contract and
-    quickstart guide.
+    Adds the **capture** harness feature: per-member ``tshark`` sidecars record
+    all client-port traffic for the session into per-member pcapng artifacts
+    that survive teardown, plus — on the ``tls`` flavor — the keylog material
+    to decrypt them. Capture is observational and never changes test outcomes.
+    See :ref:`capture` for the full workflow (merge + TLS decryption).
 
 Compose layout
 ==============
@@ -135,6 +130,99 @@ not match):
   schemes.
 * ``@pytest.mark.zk_features(require=[...], skip=[...])`` — run only when the
   listed features are (or are not) active.
+
+.. _capture:
+
+Network capture
+===============
+
+The ``capture`` feature value layers per-member ``tshark`` sidecars onto the
+ensemble. Each sidecar joins its member's network namespace and records all
+traffic on that member's *client ports* (clear ``2181``, and secure ``2281``
+when TLS is enabled) for the whole session — full frames, no truncation —
+into a bind-mounted directory that **survives cluster teardown**, so you can
+analyze a failed or interesting run afterwards.
+
+* Artifacts are written **per member**: ``kazoo-client-zooN-*.pcapng`` (one
+  per ensemble member, uniquely named per run). See the data-model contract
+  under ``specs/002-network-capture/`` for the full layout.
+* On the ``tls`` auth flavor the harness also emits the **decryption
+  material** (an SSLKEYLOGFILE plus the server/CA certificates), so the
+  captured TLS traffic can be decrypted into plaintext using only what the
+  run produced.
+* Capture is observational: it never changes test outcomes, skip decisions,
+  or connection behavior (FR-007), and it composes with every auth flavor and
+  server feature.
+
+Run a capture session
+---------------------
+
+.. code-block:: bash
+
+    # plain-auth capture
+    pytest kazoo/tests/integ/test_client.py --zk-features=capture -v
+
+    # TLS-auth capture (emits the decryption keylog too)
+    pytest kazoo/tests/integ/test_client.py --zk-auth=tls --zk-features=capture -v
+
+At teardown the harness prints the artifact location (the pytest session
+basetemp, exported as ``ZK_WORK_DIR``). The artifacts are left in place after
+the suite exits:
+
+.. code-block:: bash
+
+    ls "$ZK_WORK_DIR/captures/"                # kazoo-client-zoo{1,2,3}-*.pcapng
+    ls "$ZK_WORK_DIR/captures/tls/"            # tls run only: zk-secrets.log, server-cert.pem, ca.pem
+
+Re-assemble (merge) the per-member files
+----------------------------------------
+
+The Kazoo client connects to whichever ensemble member it happens to pick, so
+a single session's traffic can be split across the three files. Merge them
+into one capture for a combined view (``mergecap`` ships with Wireshark/tshark;
+no capture tooling is required on the host to *run* the tests — this analysis
+step is optional):
+
+.. code-block:: bash
+
+    mergecap -w session-all.pcapng \
+      "$ZK_WORK_DIR"/captures/kazoo-client-zoo1-*.pcapng \
+      "$ZK_WORK_DIR"/captures/kazoo-client-zoo2-*.pcapng \
+      "$ZK_WORK_DIR"/captures/kazoo-client-zoo3-*.pcapng
+
+On the plain/digest/sasl flavors the client protocol is unencrypted on port
+2181, so the merged capture is immediately readable:
+
+.. code-block:: bash
+
+    tshark -r session-all.pcapng -Y "tcp.port == 2181" -c 10
+
+Decrypt the TLS traffic
+-----------------------
+
+Modern TLS uses forward secrecy, so a private key alone cannot decrypt a
+session. The ``tls`` capture run attaches a passive *keylog agent* to the
+three server JVMs, which records each handshake's master secret; the harness
+merges those into ``captures/tls/zk-secrets.log`` and copies the server/CA
+certificates alongside. Provide that keylog file to tshark via
+``tls.keylog_file``:
+
+.. code-block:: bash
+
+    # decrypt the merged capture and show plaintext ZK protocol magic
+    tshark -o tls.keylog_file:"$ZK_WORK_DIR/captures/tls/zk-secrets.log" \
+      -r session-all.pcapng \
+      -Y "tls" -T fields -e tcp.payload | grep -c "ffffffff"
+
+    # alternative: decrypt the per-member files directly, no merge needed
+    tshark -o tls.keylog_file:"$ZK_WORK_DIR/captures/tls/zk-secrets.log" \
+      -r "$ZK_WORK_DIR"/captures/kazoo-client-zoo1-*.pcapng -Y "tls"
+
+``server-cert.pem`` and ``ca.pem`` identify the throwaway test PKI the
+ensemble used; they are context for the trace. No real credentials are ever
+involved, and no private key is exported — the keylog *is* the key material.
+In Wireshark, set **Edit → Preferences → Protocols → TLS → (Pre)-Master-Secret
+log filename** to ``zk-secrets.log`` and reload.
 
 Zake
 ====
