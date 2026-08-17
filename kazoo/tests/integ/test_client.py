@@ -618,17 +618,28 @@ class TestClient:
             zkclient.create("/1/2/3/4/5", b"val2", makepath=True)
 
     def test_create_makepath_incompatible_acls(self, zkclient, zkensemble):
-        from kazoo.security import make_digest_acl_credential, CREATOR_ALL_ACL
+        from kazoo.security import make_digest_acl
 
-        credential = make_digest_acl_credential("username", "password")
+        # Authenticate with the plaintext credential: the server hashes
+        # whatever it receives, so a pre-hashed ``make_digest_acl_credential``
+        # would be double-hashed and match neither CREATOR_ALL_ACL nor an
+        # explicit digest ACL.
         alt_client = zkensemble.get_client(
             max_retries=5,
-            auth_data=[("digest", credential)],
+            auth_data=[("digest", "username:password")],
             handler=self._makeOne(),
         )
         alt_client.chroot = zkclient.chroot
         alt_client.start()
-        alt_client.create("/1/2", b"val2", makepath=True, acl=CREATOR_ALL_ACL)
+        # Use an explicit digest ACL rather than CREATOR_ALL_ACL: the "auth"
+        # scheme resolves to every identity of the creating session, and on
+        # the shared-identity axes (tls/sasl_digest/sasl_gssapi) every client
+        # shares one identity (the single client cert, the single JAAS user,
+        # the single GSSAPI principal), so the isolation assertion would not
+        # hold there. A digest ACL keyed to alt_client's own credential keeps
+        # the test meaningful on all axes.
+        acl = [make_digest_acl("username", "password", all=True)]
+        alt_client.create("/1/2", b"val2", makepath=True, acl=acl)
 
         try:
             with pytest.raises(NoAuthError):
@@ -961,12 +972,11 @@ class TestClient:
         assert zkclient.client_state == KeeperState.CONNECTED
 
     def test_update_host_list(self, zkensemble):
-        from kazoo.client import KazooClient
         from kazoo.protocol.states import KeeperState
 
         hosts = f"{zkensemble.zk_ip}:{zkensemble.zk1_port}"
         # create a client with only one server in its list
-        client = KazooClient(hosts=hosts)
+        client = zkensemble.get_client(hosts=hosts)
         client.start()
 
         # try to change the chroot, not currently allowed
