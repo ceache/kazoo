@@ -17,14 +17,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Handle pip cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt', 'pyproject.toml', 'setup.cfg', 'tox.ini') }}
@@ -60,15 +60,15 @@ jobs:
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "pypy-3.11-v7.3.21"]
         zk-version: ["3.7.2", "3.8.6", "3.9.5"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Handle pip cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt', 'pyproject.toml', 'setup.cfg', 'tox.ini') }}
@@ -86,7 +86,7 @@ jobs:
       # run. A separate save step (below) warms the cache up on a miss.
       - name: Restore docker image cache
         id: docker-cache-restore
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: /tmp/docker-cache
           key: docker-zookeeper-${{ matrix.zk-version }}
@@ -130,13 +130,13 @@ jobs:
       - name: Archive docker image cache
         if: always() && steps.docker-cache-restore.outputs.cache-hit != 'true'
         continue-on-error: true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: /tmp/docker-cache
           key: ${{ steps.docker-cache-restore.outputs.cache-primary-key }}
 
       - name: Publish Codecov report
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v6
 
   test_axes:
     needs: [validate]
@@ -186,15 +186,15 @@ jobs:
             zk-auth: plain
             zk-features: reconfig
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Handle pip cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt', 'pyproject.toml', 'setup.cfg', 'tox.ini') }}
@@ -210,7 +210,7 @@ jobs:
       # tls/sasl_gssapi axes, so its key stays content-deterministic.
       - name: Restore docker image cache
         id: docker-cache-restore
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: /tmp/docker-cache-zk
           key: docker-zookeeper-${{ matrix.zk-version }}
@@ -220,7 +220,7 @@ jobs:
       - name: Restore docker build-base image cache
         if: matrix.axis == 'tls' || matrix.axis == 'sasl_gssapi'
         id: docker-base-cache-restore
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: /tmp/docker-cache-base
           key: docker-build-base
@@ -283,7 +283,7 @@ jobs:
       - name: Archive docker image cache
         if: always() && steps.docker-cache-restore.outputs.cache-hit != 'true'
         continue-on-error: true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: /tmp/docker-cache-zk
           key: ${{ steps.docker-cache-restore.outputs.cache-primary-key }}
@@ -291,7 +291,7 @@ jobs:
       - name: Archive docker build-base image cache
         if: always() && (matrix.axis == 'tls' || matrix.axis == 'sasl_gssapi') && steps.docker-base-cache-restore.outputs.cache-hit != 'true'
         continue-on-error: true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: /tmp/docker-cache-base
           key: ${{ steps.docker-base-cache-restore.outputs.cache-primary-key }}
@@ -302,14 +302,14 @@ jobs:
 
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Handle pip cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~\AppData\Local\pip\Cache
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt', 'pyproject.toml', 'setup.cfg', 'tox.ini') }}
