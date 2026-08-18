@@ -324,48 +324,21 @@ jobs:
       # layout (FR-011). The Windows job runs the plain auth/feature axis
       # against the fixed default ZK version (US4); the tiered auth/feature
       # matrix runs on the Linux job (FR-017).
+      #
+      # The bring-up lives in an idempotent script (start-wsl-dockerd.ps1):
+      # it keeps the WSL VM resident between steps (vmIdleTimeout + a keep-alive
+      # sleep) so the background dockerd survives the gap to the test step, and
+      # verifies reachability from the *Windows* docker CLI — the exact path the
+      # harness uses — not just from inside WSL. The test step re-runs the same
+      # script, so a VM that idled out between steps is re-established before
+      # pytest ever touches `docker info`.
       - name: Verify docker compose
         shell: pwsh
         run: docker compose version
 
       - name: Set up Linux docker daemon in WSL2
         shell: pwsh
-        run: |
-          # Docker engine lives inside WSL2 Ubuntu; the Windows docker CLI
-          # connects to it over tcp://localhost:2375 (WSL2 localhost
-          # forwarding). Run as root (-u root) so we don't depend on the
-          # distro's default (non-root) user for apt/dockerd; --no-launch
-          # avoids an interactive first-boot prompt hanging in CI. The script
-          # is built here (not inline) and CRLF is normalized to LF so stray
-          # \r characters — e.g. from a CRLF checkout on Windows — can never
-          # leak into bash. It is piped to `bash -s` via stdin rather than
-          # passed as a `bash -lc` argument: wsl.exe re-parses its command
-          # line on the Windows side and mangles shell specials like `>` and
-          # `&` (dockerd's `2>&1 &` gets truncated), which stdin avoids.
-          $wslSetup = @'
-          set -eux
-          apt-get update -qq
-          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io
-          # Ubuntu ships systemd and may already have started dockerd on the
-          # unix socket; stop it so our manually-launched daemon (which also
-          # listens on tcp://0.0.0.0:2375 for the Windows client) can bind.
-          service docker stop >/dev/null 2>&1 || true
-          nohup dockerd --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2375 >/tmp/dockerd.log 2>&1 </dev/null &
-          for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
-          docker info --format "OSType={{.OSType}} Server={{.ServerVersion}}"
-          # Trailing comment so any CRLF appended by the local pipe lands on a
-          # comment line instead of becoming a stray command.
-          # end
-          '@.Replace("`r`n", "`n").Replace("`r", "`n")
-
-          wsl --install Ubuntu --no-launch
-          $wslSetup | wsl -d Ubuntu -u root -- bash -s
-
-          $ostype = wsl -d Ubuntu -u root -- docker info --format "{{.OSType}}"
-          if ($LASTEXITCODE -ne 0 -or "$ostype".Trim() -ne "linux") {
-            wsl -d Ubuntu -u root -- cat /tmp/dockerd.log
-            throw "WSL2 docker daemon did not become ready (OSType=$ostype)"
-          }
+        run: pwsh -NoProfile -NonInteractive -File .github/scripts/start-wsl-dockerd.ps1
 
       - name: Install required dependencies
         shell: bash
@@ -375,7 +348,11 @@ jobs:
 
       - name: Test with pytest (plain axis)
         shell: bash
-        run: pytest kazoo/tests/integ -q
+        run: |
+          # Re-establish the WSL daemon right before the suite so tests never
+          # race a VM that idled out between steps; no-op if still reachable.
+          pwsh -NoProfile -NonInteractive -File .github/scripts/start-wsl-dockerd.ps1
+          pytest kazoo/tests/integ -q
         env:
           ZK_AUTH: plain
           ZK_FEATURES: standard
