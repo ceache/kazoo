@@ -83,15 +83,15 @@ jobs:
       # Cross-run Docker image cache: restore the pulled zookeeper image (one
       # tar per ZK version, shared with test_axes via the same key space) so
       # the 6 legs of this matrix stop pulling it from Docker Hub on every
-      # run. save-always keeps the cache refreshed from the first run on.
+      # run. A separate save step (below) warms the cache up on a miss.
       - name: Restore docker image cache
-        uses: actions/cache@v4
+        id: docker-cache-restore
+        uses: actions/cache/restore@v4
         with:
           path: /tmp/docker-cache
           key: docker-zookeeper-${{ matrix.zk-version }}
           restore-keys: |
             docker-zookeeper-
-          save-always: true
 
       - name: Load cached docker images
         run: |
@@ -115,8 +115,10 @@ jobs:
           ZK_AUTH: plain
           ZK_FEATURES: standard
 
-      # Repopulate the cache path with the current image so the cache post-step
-      # stores it even when the primary key missed on this run (cache warm-up).
+      # Repopulate the cache path with the current image, then archive it via
+      # actions/cache/save (warm-up). The save is skipped on a primary-key hit
+      # (the entry already exists) and continue-on-error tolerates a matrix
+      # leg racing to save the same key first on a cold run.
       - name: Save docker image cache
         if: always()
         run: |
@@ -124,6 +126,14 @@ jobs:
           if docker image inspect zookeeper:${{ matrix.zk-version }} >/dev/null 2>&1; then
             docker save zookeeper:${{ matrix.zk-version }} -o /tmp/docker-cache/zookeeper.tar
           fi
+
+      - name: Archive docker image cache
+        if: always() && steps.docker-cache-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/docker-cache
+          key: ${{ steps.docker-cache-restore.outputs.cache-primary-key }}
 
       - name: Publish Codecov report
         uses: codecov/codecov-action@v4
@@ -199,21 +209,21 @@ jobs:
       # + alpine, used by the certgen/KDC sidecar builds) is saved only by the
       # tls/sasl_gssapi axes, so its key stays content-deterministic.
       - name: Restore docker image cache
-        uses: actions/cache@v4
+        id: docker-cache-restore
+        uses: actions/cache/restore@v4
         with:
           path: /tmp/docker-cache-zk
           key: docker-zookeeper-${{ matrix.zk-version }}
           restore-keys: |
             docker-zookeeper-
-          save-always: true
 
       - name: Restore docker build-base image cache
         if: matrix.axis == 'tls' || matrix.axis == 'sasl_gssapi'
-        uses: actions/cache@v4
+        id: docker-base-cache-restore
+        uses: actions/cache/restore@v4
         with:
           path: /tmp/docker-cache-base
           key: docker-build-base
-          save-always: true
 
       - name: Load cached docker images
         run: |
@@ -251,8 +261,9 @@ jobs:
           ZK_AUTH: ${{ matrix.zk-auth }}
           ZK_FEATURES: ${{ matrix.zk-features }}
 
-      # Repopulate the cache paths so the cache post-steps store them even on
-      # a primary-key miss (cache warm-up). save-always handles the rest.
+      # Repopulate the cache paths, then archive them via actions/cache/save
+      # (warm-up on a primary-key miss). continue-on-error tolerates a matrix
+      # leg racing to save the same key first on a cold run.
       - name: Save docker image cache
         if: always()
         run: |
@@ -268,6 +279,22 @@ jobs:
               docker save alpine:3.20 -o /tmp/docker-cache-base/alpine.tar
             fi
           fi
+
+      - name: Archive docker image cache
+        if: always() && steps.docker-cache-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/docker-cache-zk
+          key: ${{ steps.docker-cache-restore.outputs.cache-primary-key }}
+
+      - name: Archive docker build-base image cache
+        if: always() && (matrix.axis == 'tls' || matrix.axis == 'sasl_gssapi') && steps.docker-base-cache-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/docker-cache-base
+          key: ${{ steps.docker-base-cache-restore.outputs.cache-primary-key }}
 
   test_windows:
     needs: [validate]
