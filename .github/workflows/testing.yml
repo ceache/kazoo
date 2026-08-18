@@ -338,7 +338,10 @@ jobs:
           # avoids an interactive first-boot prompt hanging in CI. The script
           # is built here (not inline) and CRLF is normalized to LF so stray
           # \r characters — e.g. from a CRLF checkout on Windows — can never
-          # leak into bash.
+          # leak into bash. It is piped to `bash -s` via stdin rather than
+          # passed as a `bash -lc` argument: wsl.exe re-parses its command
+          # line on the Windows side and mangles shell specials like `>` and
+          # `&` (dockerd's `2>&1 &` gets truncated), which stdin avoids.
           $wslSetup = @'
           set -eux
           apt-get update -qq
@@ -347,13 +350,16 @@ jobs:
           # unix socket; stop it so our manually-launched daemon (which also
           # listens on tcp://0.0.0.0:2375 for the Windows client) can bind.
           service docker stop >/dev/null 2>&1 || true
-          nohup dockerd --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2375 >/tmp/dockerd.log 2>&1 &
+          nohup dockerd --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2375 >/tmp/dockerd.log 2>&1 </dev/null &
           for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
           docker info --format "OSType={{.OSType}} Server={{.ServerVersion}}"
+          # Trailing comment so any CRLF appended by the local pipe lands on a
+          # comment line instead of becoming a stray command.
+          # end
           '@.Replace("`r`n", "`n").Replace("`r", "`n")
 
           wsl --install Ubuntu --no-launch
-          wsl -d Ubuntu -u root -- bash -lc $wslSetup
+          $wslSetup | wsl -d Ubuntu -u root -- bash -s
 
           $ostype = wsl -d Ubuntu -u root -- docker info --format "{{.OSType}}"
           if ($LASTEXITCODE -ne 0 -or "$ostype".Trim() -ne "linux") {
