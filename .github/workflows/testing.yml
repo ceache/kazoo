@@ -306,23 +306,28 @@ jobs:
         run: |
           # Docker engine lives inside WSL2 Ubuntu; the Windows docker CLI
           # connects to it over tcp://localhost:2375 (WSL2 localhost
-          # forwarding). Mirror the documented steps for hosted windows-2025.
-          # Run as root (-u root) so we don't depend on the distro's default
-          # (non-root) user for apt/dockerd; --no-launch avoids an interactive
-          # first-boot prompt hanging in CI.
+          # forwarding). Run as root (-u root) so we don't depend on the
+          # distro's default (non-root) user for apt/dockerd; --no-launch
+          # avoids an interactive first-boot prompt hanging in CI. The script
+          # is built here (not inline) and CRLF is normalized to LF so stray
+          # \r characters — e.g. from a CRLF checkout on Windows — can never
+          # leak into bash.
+          $wslSetup = @'
+          set -eux
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io
+          # Ubuntu ships systemd and may already have started dockerd on the
+          # unix socket; stop it so our manually-launched daemon (which also
+          # listens on tcp://0.0.0.0:2375 for the Windows client) can bind.
+          service docker stop >/dev/null 2>&1 || true
+          nohup dockerd --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2375 >/tmp/dockerd.log 2>&1 &
+          for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
+          docker info --format "OSType={{.OSType}} Server={{.ServerVersion}}"
+          '@.Replace("`r`n", "`n").Replace("`r", "`n")
+
           wsl --install Ubuntu --no-launch
-          wsl -d Ubuntu -u root -- bash -lc '
-            set -eux
-            apt-get update -qq
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io
-            # Ubuntu ships systemd and may already have started dockerd on the
-            # unix socket; stop it so our manually-launched daemon (which also
-            # listens on tcp://0.0.0.0:2375 for the Windows client) can bind.
-            service docker stop >/dev/null 2>&1 || true
-            nohup dockerd --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2375 >/tmp/dockerd.log 2>&1 &
-            for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
-            docker info --format "OSType={{.OSType}} Server={{.ServerVersion}}"
-          '
+          wsl -d Ubuntu -u root -- bash -lc $wslSetup
+
           $ostype = wsl -d Ubuntu -u root -- docker info --format "{{.OSType}}"
           if ($LASTEXITCODE -ne 0 -or "$ostype".Trim() -ne "linux") {
             wsl -d Ubuntu -u root -- cat /tmp/dockerd.log

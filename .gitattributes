@@ -1,0 +1,9 @@
+# GitHub Actions executes run: scripts from the checked-out file, and the
+# Windows git default (core.autocrlf=true) rewrites LF to CRLF on checkout,
+# leaking stray \r characters into bash scripts (e.g. the WSL2 step's
+# `wsl ... bash -lc '...'`). Force LF for YAML so every checkout is
+# byte-identical on all platforms.
+.github/workflows/*.yml  text eol=lf
+.github/workflows/*.yaml text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
