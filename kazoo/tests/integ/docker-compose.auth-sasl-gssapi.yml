@@ -107,7 +107,7 @@ services:
     volumes:
       - ${ZK_WORK_DIR}/certs/server/keystore.p12:/conf/keystore.p12:ro
       - ${ZK_WORK_DIR}/certs/server/truststore.p12:/conf/truststore.p12:ro
-      - ./jaas/sasl-gssapi.conf:/conf/jaas.conf:ro
+      - ${ZK_COMPOSE_DIR}/jaas/sasl-gssapi.conf:/conf/jaas.conf:ro
       - ${ZK_WORK_DIR}/krb5.conf:/conf/krb5.conf:ro
       - ${ZK_WORK_DIR}/keytabs/server.keytab:/conf/server.keytab:ro
 
@@ -123,7 +123,7 @@ services:
     volumes:
       - ${ZK_WORK_DIR}/certs/server/keystore.p12:/conf/keystore.p12:ro
       - ${ZK_WORK_DIR}/certs/server/truststore.p12:/conf/truststore.p12:ro
-      - ./jaas/sasl-gssapi.conf:/conf/jaas.conf:ro
+      - ${ZK_COMPOSE_DIR}/jaas/sasl-gssapi.conf:/conf/jaas.conf:ro
       - ${ZK_WORK_DIR}/krb5.conf:/conf/krb5.conf:ro
       - ${ZK_WORK_DIR}/keytabs/server.keytab:/conf/server.keytab:ro
 
@@ -139,6 +139,6 @@ services:
     volumes:
       - ${ZK_WORK_DIR}/certs/server/keystore.p12:/conf/keystore.p12:ro
       - ${ZK_WORK_DIR}/certs/server/truststore.p12:/conf/truststore.p12:ro
-      - ./jaas/sasl-gssapi.conf:/conf/jaas.conf:ro
+      - ${ZK_COMPOSE_DIR}/jaas/sasl-gssapi.conf:/conf/jaas.conf:ro
       - ${ZK_WORK_DIR}/krb5.conf:/conf/krb5.conf:ro
       - ${ZK_WORK_DIR}/keytabs/server.keytab:/conf/server.keytab:ro

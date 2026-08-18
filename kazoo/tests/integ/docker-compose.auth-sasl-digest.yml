@@ -5,8 +5,10 @@
 #   * JVMFLAGS            -> -Djava.security.auth.login.config=<JAAS file>
 #   * ZOO_CFG_EXTRA       -> SASLAuthenticationProvider (fully-qualified) +
 #     enforce.auth.enabled + enforce.auth.schemes=sasl
-#   * a read-only bind of the JAAS config (./jaas/sasl-digest.conf) at
-#     /conf/jaas.conf
+#   * a read-only bind of the JAAS config (${ZK_COMPOSE_DIR}/jaas/
+#     sasl-digest.conf) at /conf/jaas.conf — interpolated so the source can
+#     be translated to a daemon-visible mount path on Windows-remote setups
+#     (FR-011)
 #
 # The JAAS config registers the DigestLoginModule users
 # (user_super / user_jaasuser); clients authenticate with
@@ -34,14 +36,14 @@ services:
     environment:
       <<: *sasl_digest_environment
     volumes:
-      - ./jaas/sasl-digest.conf:/conf/jaas.conf:ro
+      - ${ZK_COMPOSE_DIR}/jaas/sasl-digest.conf:/conf/jaas.conf:ro
   zoo2-service:
     environment:
       <<: *sasl_digest_environment
     volumes:
-      - ./jaas/sasl-digest.conf:/conf/jaas.conf:ro
+      - ${ZK_COMPOSE_DIR}/jaas/sasl-digest.conf:/conf/jaas.conf:ro
   zoo3-service:
     environment:
       <<: *sasl_digest_environment
     volumes:
-      - ./jaas/sasl-digest.conf:/conf/jaas.conf:ro
+      - ${ZK_COMPOSE_DIR}/jaas/sasl-digest.conf:/conf/jaas.conf:ro

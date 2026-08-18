@@ -3,10 +3,12 @@ from __future__ import annotations
 import functools
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
 import uuid
+from importlib import resources
 from typing import TYPE_CHECKING
 
 if sys.version_info >= (3, 11):
@@ -503,6 +505,61 @@ def _ensure_docker_available(context: str) -> None:
             "`docker info` failed; is the Docker daemon running? The kazoo "
             "integration tests require a running Docker Engine."
         ) from None
+    _ensure_linux_docker_backend()
+
+
+def _daemon_mount_path(path: pathlib.Path) -> str:
+    """Return ``path`` as a bind-mount source the docker daemon can see.
+
+    Bind mounts are resolved by the *daemon* host, so a Windows client that
+    talks to a remote Linux engine over TCP (``DOCKER_HOST=tcp://...`` — e.g.
+    a WSL2-hosted dockerd on the GitHub Windows runner) must expose its
+    drives at the daemon's `/mnt/<drive>` mount points rather than as
+    Windows-style paths (``D:/a/b``). Docker Desktop's own WSL2 backend uses
+    the same ``/mnt`` layout, so this stays valid there too. When the client
+    targets a native engine (Docker Desktop, local Linux), the host path is
+    passed through unchanged (FR-011).
+    """
+    posix = path.as_posix()
+    host = os.environ.get("DOCKER_HOST", "")
+    if os.name == "nt" and host.startswith(("tcp://", "http://")):
+        drive = re.match(r"^([A-Za-z]):(/.+)$", posix)
+        if drive:
+            return f"/mnt/{drive.group(1).lower()}{drive.group(2)}"
+    return posix
+
+
+def _ensure_linux_docker_backend() -> None:
+    """Skip (never fail, SC-005) when the docker daemon is not a Linux backend.
+
+    The official ZooKeeper image is published for Linux only, so a
+    Windows-container daemon (e.g. the GitHub-hosted ``windows-latest``
+    runner, whose Moby engine serves Windows containers) cannot pull it and
+    ``compose up`` dies with ``no matching manifest for
+    windows(...)/amd64``. Detecting the daemon OS up front turns that into a
+    clean skip of the whole ensemble suite with an actionable reason instead
+    of a wall of per-test errors (FR-011: a real Windows host with Docker
+    Desktop's Linux backend passes normally).
+    """
+    try:
+        ostype = subprocess.run(
+            ["docker", "info", "--format", "{{.OSType}}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        # The daemon is reachable (checked above); an unusual driver just
+        # means this probe is unsupported, so do not hard-fail on it.
+        return
+    if ostype and ostype.lower() != "linux":
+        pytest.skip(
+            f"docker engine OSType is {ostype!r}, not 'linux': the "
+            "ZooKeeper official image is linux-only, so the ensemble suite "
+            "cannot run against a Windows-container docker backend (SC-005). "
+            "Run these tests with Docker Desktop (Linux containers) or a "
+            "Linux Docker Engine."
+        )
 
 
 def _build_capture_images(compose: DockerCompose, context: str) -> None:
@@ -767,11 +824,11 @@ def docker_env(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[KazooZkEnv]:
     tmp_path: pathlib.Path = tmp_path_factory.getbasetemp()
-    # Compose interpolates ${ZK_WORK_DIR} into bind-mount sources; on
-    # Windows the host path must be POSIX-style (C:/Users/...) for Docker
-    # Desktop, while host-side file ops below keep the native Path
-    # (FR-011).
-    os.environ["ZK_WORK_DIR"] = tmp_path.as_posix()
+    # Compose interpolates ${ZK_WORK_DIR} into bind-mount sources. Host-side
+    # file ops below keep the native Path; the env var is what compose hands
+    # to the daemon, so it may need translation to a daemon-visible mount
+    # path on Windows-remotes (see _daemon_mount_path) (FR-011).
+    os.environ["ZK_WORK_DIR"] = _daemon_mount_path(tmp_path)
     # Unique per-session compose project name keeps parallel test runs (and
     # any stray stacks from other projects) isolated from each other.
     os.environ["COMPOSE_PROJECT_NAME"] = f"kazoo-{uuid.uuid4().hex[:8]}"
@@ -815,10 +872,16 @@ def docker_compose(
     """
     from testcontainers.compose import DockerCompose
 
-    # compose files live next to the integration tests (conftest.py location).
-    context = str(
-        pathlib.Path(__file__).resolve().parent.parent / "tests" / "integ"
-    )
+    # compose files live next to the integration tests. Locate the directory
+    # via importlib.resources so discovery does not depend on __file__ (it
+    # resolves to the real on-disk dir for any filesystem-backed install).
+    context_path = pathlib.Path(resources.files("kazoo.tests").joinpath("integ"))
+    context = str(context_path)
+    # Relative bind-mount sources in the compose overlays (./jaas/...) are
+    # interpolated through ${ZK_COMPOSE_DIR} so they can be translated to a
+    # daemon-visible mount path on Windows-remote setups, exactly like
+    # ${ZK_WORK_DIR} above (FR-011).
+    os.environ["ZK_COMPOSE_DIR"] = _daemon_mount_path(context_path)
     _ensure_docker_available(context)
 
     compose = DockerCompose(
