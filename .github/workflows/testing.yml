@@ -235,7 +235,7 @@ jobs:
             for f in /tmp/docker-cache-base/*.tar; do
               [ -e "$f" ] && docker load -i "$f"
             done
-            docker pull eclipse-temurin:17-jdk-jammy
+            docker pull eclipse-temurin:17-jre-jammy
             docker pull alpine:3.20
           fi
 
@@ -272,8 +272,8 @@ jobs:
             docker save zookeeper:${{ matrix.zk-version }} -o /tmp/docker-cache-zk/zookeeper.tar
           fi
           if [ "${{ matrix.axis }}" = "tls" ] || [ "${{ matrix.axis }}" = "sasl_gssapi" ]; then
-            if docker image inspect eclipse-temurin:17-jdk-jammy >/dev/null 2>&1; then
-              docker save eclipse-temurin:17-jdk-jammy -o /tmp/docker-cache-base/temurin.tar
+            if docker image inspect eclipse-temurin:17-jre-jammy >/dev/null 2>&1; then
+              docker save eclipse-temurin:17-jre-jammy -o /tmp/docker-cache-base/temurin.tar
             fi
             if docker image inspect alpine:3.20 >/dev/null 2>&1; then
               docker save alpine:3.20 -o /tmp/docker-cache-base/alpine.tar

@@ -18,9 +18,10 @@
 # so the host can read it regardless of UID.
 #
 # eclipse-temurin is used because it ships both `openssl` (via the base image)
-# and `keytool` (via the JDK), avoiding a separate openssl image.
+# and `keytool` (via the JRE — the JDK variant adds ~260MB for no benefit
+# here), avoiding a separate openssl image.
 
-FROM eclipse-temurin:17-jdk-jammy
+FROM eclipse-temurin:17-jre-jammy
 
 ENV CERTS_DIR=/certs
 ENV KEYSTORE_PASS=changeit
