@@ -102,8 +102,6 @@ jobs:
 
       - name: Install required dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get -y install libevent-dev krb5-kdc krb5-admin-server libkrb5-dev
           python3 -m pip install --upgrade pip
           pip install -e '.[test]'
 
