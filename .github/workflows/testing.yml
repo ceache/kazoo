@@ -327,11 +327,12 @@ jobs:
       #
       # The bring-up lives in an idempotent script (start-wsl-dockerd.ps1):
       # it keeps the WSL VM resident between steps (vmIdleTimeout + a keep-alive
-      # sleep) so the background dockerd survives the gap to the test step, and
-      # verifies reachability from the *Windows* docker CLI — the exact path the
-      # harness uses — not just from inside WSL. The test step re-runs the same
-      # script, so a VM that idled out between steps is re-established before
-      # pytest ever touches `docker info`.
+      # sleep) and finds an endpoint the *Windows* docker CLI can actually dial —
+      # the WSL2 localhost relay is unreliable on hosted runners, so it falls
+      # back to the WSL VM's NAT IP, which the Windows host can always route to.
+      # The working host is published via GITHUB_ENV and a file the test step
+      # sources; the step-level env no longer pins DOCKER_HOST (it would
+      # override that export).
       - name: Verify docker compose
         shell: pwsh
         run: docker compose version
@@ -352,8 +353,8 @@ jobs:
           # Re-establish the WSL daemon right before the suite so tests never
           # race a VM that idled out between steps; no-op if still reachable.
           pwsh -NoProfile -NonInteractive -File .github/scripts/start-wsl-dockerd.ps1
+          export DOCKER_HOST="$(cat "$GITHUB_WORKSPACE/.start-wsl-dockerd.host" 2>/dev/null || echo tcp://localhost:2375)"
           pytest kazoo/tests/integ -q
         env:
           ZK_AUTH: plain
           ZK_FEATURES: standard
-          DOCKER_HOST: tcp://localhost:2375

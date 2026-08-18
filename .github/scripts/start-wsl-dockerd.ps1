@@ -1,25 +1,24 @@
 # Idempotently ensure a Linux dockerd runs inside WSL2 and is reachable from
-# the Windows docker CLI over tcp://localhost:2375.
+# the Windows docker CLI over TCP.
 #
 # Callable from any job step (PowerShell via `pwsh -File`, or bash with
 # `pwsh -NoProfile -NonInteractive -File`). Safe to run repeatedly: if the
 # daemon is already reachable it is a fast-path no-op; otherwise it writes the
 # WSL idle settings, (re)installs the distro if missing and (re)launches
-# dockerd, then verifies the *Windows-side* view the test harness actually
-# uses.
+# dockerd, then finds an endpoint the *Windows* CLI can actually dial and
+# publishes it (GITHUB_ENV + a file the test step sources).
 #
 # Background: the hosted Windows engine (Moby) only serves Windows containers,
 # while the official ZooKeeper image is linux-only, so the ensemble suite runs
-# against a Linux daemon in WSL2 (FR-011). WSL reaps an idle VM (default ~60s)
-# once its last console exits, killing any dockerd it launched; job steps are
-# separated by runs of the pip/test commands, so the daemon must survive the
-# gap (vmIdleTimeout) and be re-established at the start of the step that uses
-# it. Bind-mount sources are translated to the daemon's /mnt/<drive> layout by
+# against a Linux daemon in WSL2 (FR-011). The WSL2 127.0.0.1 localhost relay
+# is unreliable on hosted runners (the Windows CLI cannot reach
+# tcp://localhost:2375 even though dockerd is up), so we fall back to the WSL
+# VM's NAT IP, which the Windows host can always route to via the WSL vSwitch.
+# Bind-mount sources are translated to the daemon's /mnt/<drive> layout by
 # kazoo_ensemble.py, so /mnt/d:/... is handled there, not here.
 
 $ErrorActionPreference = 'Stop'
 $Distro = 'Ubuntu'
-$env:DOCKER_HOST = 'tcp://localhost:2375'
 
 function Test-WindowsDocker {
     docker info *> $null
@@ -28,15 +27,33 @@ function Test-WindowsDocker {
     return ($os -eq 'linux')
 }
 
-# Fast path: daemon already up from an earlier invocation in the same job.
-if (Test-WindowsDocker) {
+function Publish-Host {
+    # Record the working endpoint for the test step (GITHUB_ENV reaches later
+    # steps; the file is sourced in the same step for belt and suspenders).
+    $file = Join-Path $env:GITHUB_WORKSPACE '.start-wsl-dockerd.host'
+    Set-Content -Path $file -Value $env:DOCKER_HOST -NoNewline
+    Add-Content -Path $env:GITHUB_ENV -Value "DOCKER_HOST=$env:DOCKER_HOST"
+}
+
+# Fast path: the host exported by the setup step (e.g. the WSL NAT IP) still
+# answers, e.g. when the test step re-invokes this script.
+if ($env:DOCKER_HOST -and (Test-WindowsDocker)) {
     Write-Host "dockerd already reachable at $env:DOCKER_HOST"
+    Publish-Host
     exit 0
 }
 
-# Keep the WSL VM resident across steps so the background dockerd survives the
-# gap between job steps (default ~60s idle reap would kill it). Applied once;
-# `wsl --shutdown` forces the next VM boot to pick the config up.
+# Prefer the WSL2 127.0.0.1 relay where the host supports it.
+$env:DOCKER_HOST = 'tcp://localhost:2375'
+if (Test-WindowsDocker) {
+    Write-Host "dockerd reachable via the WSL relay at $env:DOCKER_HOST"
+    Publish-Host
+    exit 0
+}
+
+# Keep the WSL VM resident across steps so the daemon does not die in the gap
+# between job steps (default ~60s idle reap). Applied once; `wsl --shutdown`
+# forces the next VM boot to pick the config up.
 $wslConfig = Join-Path $env:USERPROFILE '.wslconfig'
 if (-not (Test-Path $wslConfig) -or
     -not (Get-Content $wslConfig -Raw -ErrorAction SilentlyContinue |
@@ -87,15 +104,33 @@ if ($LASTEXITCODE -ne 0) {
     throw "WSL2 dockerd (re)start failed"
 }
 
-# Wait for the Windows client -> WSL daemon TCP path (localhost relay) to come
-# up; this is the exact path the test harness uses, so failing here is fatal.
+# Dial candidates in order: localhost relay (explicit 127.0.0.1, since some
+# hosts resolve `localhost` to ::1 which the relay never binds), every IP the
+# guest reports. The first one the Windows CLI can reach wins -- this is the
+# exact path the test harness uses, so failing here is fatal.
+$candidates = @('tcp://localhost:2375', 'tcp://127.0.0.1:2375')
+$wslIpRaw = (wsl.exe -d $Distro -u root -- hostname -I 2>$null | Out-String).Trim()
+foreach ($ip in ($wslIpRaw -split '\s+' | Where-Object { $_ })) {
+    $candidates += "tcp://${ip}:2375"
+}
+
 $deadline = (Get-Date).AddSeconds(90)
-while (-not (Test-WindowsDocker)) {
+$working = $null
+while (-not $working) {
+    foreach ($h in $candidates) {
+        $env:DOCKER_HOST = $h
+        if (Test-WindowsDocker) {
+            $working = $h
+            break
+        }
+    }
+    if ($working) { break }
     if ((Get-Date) -gt $deadline) {
         wsl.exe -d $Distro -u root -- cat /tmp/dockerd.log
-        throw "Windows docker CLI cannot reach the WSL dockerd at $env:DOCKER_HOST"
+        throw "Windows docker CLI cannot reach the WSL dockerd (tried: $($candidates -join ', '))"
     }
     Start-Sleep -Seconds 2
 }
 Write-Host "dockerd ready at $env:DOCKER_HOST (OSType=linux)"
+Publish-Host
 exit 0
