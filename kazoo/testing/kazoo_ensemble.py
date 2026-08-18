@@ -875,7 +875,7 @@ def docker_compose(
     # compose files live next to the integration tests. Locate the directory
     # via importlib.resources so discovery does not depend on __file__ (it
     # resolves to the real on-disk dir for any filesystem-backed install).
-    context_path = pathlib.Path(resources.files("kazoo.tests").joinpath("integ"))
+    context_path = pathlib.Path(resources.files("kazoo.tests") / "integ")
     context = str(context_path)
     # Relative bind-mount sources in the compose overlays (./jaas/...) are
     # interpolated through ${ZK_COMPOSE_DIR} so they can be translated to a

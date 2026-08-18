@@ -80,6 +80,26 @@ jobs:
       - name: Verify docker compose
         run: docker compose version
 
+      # Cross-run Docker image cache: restore the pulled zookeeper image (one
+      # tar per ZK version, shared with test_axes via the same key space) so
+      # the 6 legs of this matrix stop pulling it from Docker Hub on every
+      # run. save-always keeps the cache refreshed from the first run on.
+      - name: Restore docker image cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/docker-cache
+          key: docker-zookeeper-${{ matrix.zk-version }}
+          restore-keys: |
+            docker-zookeeper-
+          save-always: true
+
+      - name: Load cached docker images
+        run: |
+          for f in /tmp/docker-cache/*.tar; do
+            [ -e "$f" ] && docker load -i "$f"
+          done
+          docker pull zookeeper:${{ matrix.zk-version }}
+
       - name: Install required dependencies
         run: |
           sudo apt-get update
@@ -96,6 +116,16 @@ jobs:
           ZOOKEEPER_VERSION: ${{ matrix.zk-version }}
           ZK_AUTH: plain
           ZK_FEATURES: standard
+
+      # Repopulate the cache path with the current image so the cache post-step
+      # stores it even when the primary key missed on this run (cache warm-up).
+      - name: Save docker image cache
+        if: always()
+        run: |
+          mkdir -p /tmp/docker-cache
+          if docker image inspect zookeeper:${{ matrix.zk-version }} >/dev/null 2>&1; then
+            docker save zookeeper:${{ matrix.zk-version }} -o /tmp/docker-cache/zookeeper.tar
+          fi
 
       - name: Publish Codecov report
         uses: codecov/codecov-action@v4
@@ -166,6 +196,41 @@ jobs:
       - name: Verify docker compose
         run: docker compose version
 
+      # Cross-run Docker image cache (shared with the `test` matrix). The
+      # zookeeper tar is restored by every axis; the build-base tar (temurin
+      # + alpine, used by the certgen/KDC sidecar builds) is saved only by the
+      # tls/sasl_gssapi axes, so its key stays content-deterministic.
+      - name: Restore docker image cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/docker-cache-zk
+          key: docker-zookeeper-${{ matrix.zk-version }}
+          restore-keys: |
+            docker-zookeeper-
+          save-always: true
+
+      - name: Restore docker build-base image cache
+        if: matrix.axis == 'tls' || matrix.axis == 'sasl_gssapi'
+        uses: actions/cache@v4
+        with:
+          path: /tmp/docker-cache-base
+          key: docker-build-base
+          save-always: true
+
+      - name: Load cached docker images
+        run: |
+          for f in /tmp/docker-cache-zk/*.tar; do
+            [ -e "$f" ] && docker load -i "$f"
+          done
+          docker pull zookeeper:${{ matrix.zk-version }}
+          if [ "${{ matrix.axis }}" = "tls" ] || [ "${{ matrix.axis }}" = "sasl_gssapi" ]; then
+            for f in /tmp/docker-cache-base/*.tar; do
+              [ -e "$f" ] && docker load -i "$f"
+            done
+            docker pull eclipse-temurin:17-jdk-jammy
+            docker pull alpine:3.20
+          fi
+
       # Host Kerberos client for the sasl_gssapi axis: kinit must be on PATH
       # (kazoo_ensemble.py invokes it for the KDC sidecar) and libkrb5-dev is
       # required to compile the `kerberos` python module from sdist.
@@ -187,6 +252,24 @@ jobs:
           ZOOKEEPER_VERSION: ${{ matrix.zk-version }}
           ZK_AUTH: ${{ matrix.zk-auth }}
           ZK_FEATURES: ${{ matrix.zk-features }}
+
+      # Repopulate the cache paths so the cache post-steps store them even on
+      # a primary-key miss (cache warm-up). save-always handles the rest.
+      - name: Save docker image cache
+        if: always()
+        run: |
+          mkdir -p /tmp/docker-cache-zk /tmp/docker-cache-base
+          if docker image inspect zookeeper:${{ matrix.zk-version }} >/dev/null 2>&1; then
+            docker save zookeeper:${{ matrix.zk-version }} -o /tmp/docker-cache-zk/zookeeper.tar
+          fi
+          if [ "${{ matrix.axis }}" = "tls" ] || [ "${{ matrix.axis }}" = "sasl_gssapi" ]; then
+            if docker image inspect eclipse-temurin:17-jdk-jammy >/dev/null 2>&1; then
+              docker save eclipse-temurin:17-jdk-jammy -o /tmp/docker-cache-base/temurin.tar
+            fi
+            if docker image inspect alpine:3.20 >/dev/null 2>&1; then
+              docker save alpine:3.20 -o /tmp/docker-cache-base/alpine.tar
+            fi
+          fi
 
   test_windows:
     needs: [validate]
