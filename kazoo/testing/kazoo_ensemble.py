@@ -639,11 +639,13 @@ def _export_krb5_client_env(
     raise "not exactly 1 publisher" because the same TargetPort maps both
     protocols).
 
-    The transport prefix is written explicitly as ``tcp/``: on macOS, Docker
-    Desktop's userland proxy silently drops the KDC's UDP replies, so a
-    plain ``kdc = host:port`` entry leaves Heimdal stuck waiting for a UDP
-    datagram that never arrives (``unable to reach any KDC``). Forcing TCP
-    makes the client reach the KDC reliably on every platform (FR-012).
+    The entry is written as plain ``kdc = host:port`` (no ``tcp/`` transport
+    prefix): the ``tcp/`` prefix is Heimdal-only syntax, and MIT krb5 (the
+    client on Linux CI) parses ``tcp/host:port`` as an unresolvable hostname
+    (``Cannot contact any KDC``). MIT clients try UDP first and fall back to
+    TCP, and modern Docker Desktop forwards UDP to containers, so the plain
+    ``host:port`` entry reaches the KDC reliably on both implementations;
+    both transports are published on the same host port (FR-012).
 
     The client is pointed at a *fresh per-run* FILE credential cache. Without
     this, macOS defaults to the shared ``API:...`` cache, which may still hold
@@ -682,7 +684,7 @@ def _export_krb5_client_env(
         f" rdns = false\n"
         f"[realms]\n"
         f" EXAMPLE.ORG = {{\n"
-        f"  kdc = tcp/{kdc_host}:{kdc_port}\n"
+        f"  kdc = {kdc_host}:{kdc_port}\n"
         f" }}\n",
         encoding="utf-8",
     )
@@ -715,7 +717,7 @@ def _export_krb5_client_env(
         raise RuntimeError(
             "sasl_gssapi: host-side kinit failed; KDC unreachable from "
             f"client context (rc={kinit_rc}). See {host_krb5} and the "
-            "tcp/ transport note in the kazoo_ensemble module docstring."
+            "transport-format note in the kazoo_ensemble module docstring."
         )
     os.environ["KRB5CCNAME"] = f"FILE:{ccache}"
 
