@@ -1175,3 +1175,114 @@ class TestSkipVersionMarkerFixture:
                 self._request(item),
                 self._env(),
             )
+
+
+class _FakePublisher:
+    def __init__(self, protocol, port, url):
+        self.Protocol = protocol
+        self.PublishedPort = port
+        self._url = url
+
+    def normalize(self):
+        return type("N", (), {"URL": self._url})()
+
+
+class _FakeKdcCompose:
+    def __init__(self, publishers):
+        self._publishers = publishers
+
+    def get_container(self, name):
+        assert name == "kdc"
+        return type("C", (), {"Publishers": self._publishers})()
+
+
+class TestExportKrb5ClientEnv:
+    """KDC host resolution + host-side kinit (T040)."""
+
+    _KEYS = ("KRB5_CONFIG", "KRB5_CLIENT_KTNAME", "KRB5CCNAME")
+
+    def _env(self, workdir):
+        return common.KazooZkEnv(
+            version="3.9.5",
+            workdir=workdir,
+            auth=common.ZKAuthMode.SASL_GSSAPI,
+            features=(common.ZKFeature.STANDARD,),
+        )
+
+    def _kinit(self, rc=0):
+        def fake_run(cmd, **kwargs):
+            assert cmd[0] == "kinit"
+            return type("P", (), {"returncode": rc})()
+
+        return fake_run
+
+    def test_success_wildcard_host_rewritten(self, tmp_path, monkeypatch):
+        snapshot = _env_snapshot(self._KEYS)
+        try:
+            publisher = _FakePublisher("tcp", 16888, "0.0.0.0")
+            monkeypatch.setattr(common.subprocess, "run", self._kinit(0))
+            common._export_krb5_client_env(
+                self._env(tmp_path), _FakeKdcCompose([publisher])
+            )
+            assert os.environ["KRB5_CONFIG"] == str(
+                tmp_path / "krb5.client.conf"
+            )
+            assert os.environ["KRB5_CLIENT_KTNAME"] == str(
+                tmp_path / "keytabs" / "client.keytab"
+            )
+            assert os.environ["KRB5CCNAME"] == (
+                f"FILE:{tmp_path / ('krb5cc-' + str(os.getpid()))}"
+            )
+            conf = (tmp_path / "krb5.client.conf").read_text()
+            assert "kdc = 127.0.0.1:16888" in conf
+        finally:
+            _env_restore(snapshot)
+
+    def test_success_explicit_host_kept(self, tmp_path, monkeypatch):
+        snapshot = _env_snapshot(self._KEYS)
+        try:
+            publisher = _FakePublisher("tcp", 16888, "kdc.local")
+            monkeypatch.setattr(common.subprocess, "run", self._kinit(0))
+            common._export_krb5_client_env(
+                self._env(tmp_path), _FakeKdcCompose([publisher])
+            )
+            conf = (tmp_path / "krb5.client.conf").read_text()
+            assert "kdc = kdc.local:16888" in conf
+        finally:
+            _env_restore(snapshot)
+
+    def test_missing_protocol_is_non_tcp(self, tmp_path, monkeypatch):
+        snapshot = _env_snapshot(self._KEYS)
+        try:
+            publisher = _FakePublisher(None, 16888, "0.0.0.0")
+            monkeypatch.setattr(common.subprocess, "run", self._kinit(0))
+            with pytest.raises(RuntimeError, match="no TCP publisher"):
+                common._export_krb5_client_env(
+                    self._env(tmp_path), _FakeKdcCompose([publisher])
+                )
+        finally:
+            _env_restore(snapshot)
+
+    def test_only_udp_publisher_raises(self, tmp_path, monkeypatch):
+        snapshot = _env_snapshot(self._KEYS)
+        try:
+            publisher = _FakePublisher("udp", 16888, "0.0.0.0")
+            monkeypatch.setattr(common.subprocess, "run", self._kinit(0))
+            with pytest.raises(RuntimeError, match="no TCP publisher"):
+                common._export_krb5_client_env(
+                    self._env(tmp_path), _FakeKdcCompose([publisher])
+                )
+        finally:
+            _env_restore(snapshot)
+
+    def test_kinit_failure_raises(self, tmp_path, monkeypatch):
+        snapshot = _env_snapshot(self._KEYS)
+        try:
+            publisher = _FakePublisher("tcp", 16888, "127.0.0.1")
+            monkeypatch.setattr(common.subprocess, "run", self._kinit(1))
+            with pytest.raises(RuntimeError, match="kinit failed"):
+                common._export_krb5_client_env(
+                    self._env(tmp_path), _FakeKdcCompose([publisher])
+                )
+        finally:
+            _env_restore(snapshot)
