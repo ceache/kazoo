@@ -25,7 +25,7 @@ import threading
 
 import pytest
 
-from kazoo.testing import common
+from kazoo.testing import common, fixtures
 
 
 class TestImportSurface:
@@ -217,42 +217,60 @@ class TestResolveAxisOptionsWrapper:
         "ZK_CAPTURE_JVMFLAGS",
     )
 
-    def _clean_and_restore(self, monkeypatch):
-        for key in self._ENV_KEYS:
-            monkeypatch.delenv(key, raising=False)
+    def _env_snapshot(self):
+        return {k: os.environ.get(k) for k in self._ENV_KEYS}
 
-    def test_options_wired_through(self, monkeypatch):
-        self._clean_and_restore(monkeypatch)
-        config = _FakeConfig(
-            {
-                "--zk-version": "3.8.6",
-                "--zk-auth": "digest",
-                "--zk-features": "ttl,reconfig",
-            }
-        )
-        version_value, auth, features = common._resolve_axis_options(config)
-        assert version_value == "3.8.6"
-        assert auth is common.ZKAuthMode.DIGEST
-        assert features == (common.ZKFeature.TTL, common.ZKFeature.RECONFIG)
-        assert os.environ["ZK_VERSION"] == "3.8.6"
-        assert os.environ["ZK_AUTH"] == "digest"
-        assert os.environ["ZK_FEATURES"] == "ttl,reconfig"
+    def _env_restore(self, snapshot):
+        for key, value in snapshot.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def test_options_wired_through(self):
+        snapshot = self._env_snapshot()
+        try:
+            config = _FakeConfig(
+                {
+                    "--zk-version": "3.8.6",
+                    "--zk-auth": "digest",
+                    "--zk-features": "ttl,reconfig",
+                }
+            )
+            version_value, auth, features = common._resolve_axis_options(
+                config
+            )
+            assert version_value == "3.8.6"
+            assert auth is common.ZKAuthMode.DIGEST
+            assert features == (
+                common.ZKFeature.TTL,
+                common.ZKFeature.RECONFIG,
+            )
+            assert os.environ["ZK_VERSION"] == "3.8.6"
+            assert os.environ["ZK_AUTH"] == "digest"
+            assert os.environ["ZK_FEATURES"] == "ttl,reconfig"
+        finally:
+            self._env_restore(snapshot)
 
     def test_env_fallback_when_options_absent(self, monkeypatch):
-        monkeypatch.setenv("ZK_VERSION", "3.6.4")
-        monkeypatch.setenv("ZK_AUTH", "tls")
-        monkeypatch.setenv("ZK_FEATURES", "capture")
-        version_value, auth, features = common._resolve_axis_options(
-            _FakeConfig()
-        )
-        assert version_value == "3.6.4"
-        assert auth is common.ZKAuthMode.TLS
-        assert features == (common.ZKFeature.CAPTURE,)
-        assert (
-            os.environ["ZK_AUTH_JVMFLAGS"]
-            == common.AUTH_JVM_FLAGS[common.ZKAuthMode.TLS]
-        )
-        assert os.environ["ZK_CAPTURE_JVMFLAGS"] != ""
+        snapshot = self._env_snapshot()
+        try:
+            monkeypatch.setenv("ZK_VERSION", "3.6.4")
+            monkeypatch.setenv("ZK_AUTH", "tls")
+            monkeypatch.setenv("ZK_FEATURES", "capture")
+            version_value, auth, features = common._resolve_axis_options(
+                _FakeConfig()
+            )
+            assert version_value == "3.6.4"
+            assert auth is common.ZKAuthMode.TLS
+            assert features == (common.ZKFeature.CAPTURE,)
+            assert (
+                os.environ["ZK_AUTH_JVMFLAGS"]
+                == common.AUTH_JVM_FLAGS[common.ZKAuthMode.TLS]
+            )
+            assert os.environ["ZK_CAPTURE_JVMFLAGS"] != ""
+        finally:
+            self._env_restore(snapshot)
 
 
 class TestMarkerEvaluation:
@@ -897,3 +915,263 @@ class TestDumpEnsembleLogs:
             common.set_compose_handle(None)
         captured = capsys.readouterr()
         assert "failed to fetch logs" in captured.out
+
+
+def _call_fixture(fixture, *args, **kwargs):
+    """Invoke a @pytest.fixture-decorated function body directly."""
+    return fixture.__wrapped__(*args, **kwargs)
+
+
+class _MarkerConfig:
+    def __init__(self):
+        self.lines = []
+
+    def addinivalue_line(self, group, line):
+        self.lines.append((group, line))
+
+
+class _RecordItem(_FakeItem):
+    def __init__(self, markers=None):
+        super().__init__(markers)
+        self.added = []
+
+    def add_marker(self, marker):
+        self.added.append(marker)
+
+
+class _TmpPathFactory:
+    def __init__(self, path):
+        self._path = path
+
+    def getbasetemp(self):
+        return self._path
+
+
+class _NodeRequest:
+    def __init__(self, nodeid):
+        self.node = type("N", (), {"nodeid": nodeid})()
+
+
+def _env_snapshot(keys):
+    return {k: os.environ.get(k) for k in keys}
+
+
+def _env_restore(snapshot):
+    for key, value in snapshot.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+class TestFixtureHooks:
+    """Pytest glue hooks (T035)."""
+
+    def test_addoption_registers_axes(self):
+        parser = pytest.Parser()
+        fixtures.pytest_addoption(parser)
+        options = {o.dest: o.attrs() for o in parser._groups[0].options}
+        assert set(options) == {"zk_version", "zk_auth", "zk_features"}
+        assert options["zk_version"]["default"] is None
+        assert options["zk_auth"]["choices"] == [
+            mode.value for mode in common.ZKAuthMode
+        ]
+
+    def test_configure_registers_markers(self):
+        config = _MarkerConfig()
+        fixtures.pytest_configure(config)
+        groups = {group for group, _line in config.lines}
+        assert groups == {"markers"}
+        joined = "\n".join(line for _group, line in config.lines)
+        for marker in (
+            "skip_if_zk_version",
+            "zk_version(",
+            "zk_auth(",
+            "zk_features(",
+        ):
+            assert marker in joined
+
+    def _axis_config(self):
+        return _FakeConfig(
+            {
+                "--zk-version": "3.9.5",
+                "--zk-auth": "digest",
+                "--zk-features": "standard",
+            }
+        )
+
+    def test_collection_modifyitems_skips_incompatible(self, monkeypatch):
+        keys = (
+            "ZK_VERSION",
+            "ZK_AUTH",
+            "ZK_FEATURES",
+            "ZK_AUTH_JVMFLAGS",
+            "ZK_CAPTURE_JVMFLAGS",
+        )
+        snapshot = _env_snapshot(keys)
+        try:
+            incompatible = _RecordItem({"zk_version": _FakeMarker(("<3.8",))})
+            compatible = _RecordItem()
+            fixtures.pytest_collection_modifyitems(
+                None, self._axis_config(), [incompatible, compatible]
+            )
+            assert len(incompatible.added) == 1
+            assert compatible.added == []
+        finally:
+            _env_restore(snapshot)
+
+    def test_sessionfinish_noop_on_success(self, capsys):
+        fixtures.pytest_sessionfinish(None, 0)
+        assert capsys.readouterr().out == ""
+
+    def test_sessionfinish_interrupted_reports_artifacts(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        captures = tmp_path / "captures"
+        captures.mkdir()
+        (captures / "kazoo-client-zoo1-1.pcapng").write_bytes(_SH_BYTES)
+        monkeypatch.setenv("ZK_WORK_DIR", str(tmp_path))
+        fixtures.pytest_sessionfinish(None, pytest.ExitCode.INTERRUPTED)
+        assert (
+            "interrupted capture left readable partial artifacts"
+            in capsys.readouterr().out
+        )
+
+    def test_sessionfinish_interrupted_without_artifacts(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        monkeypatch.delenv("ZK_WORK_DIR", raising=False)
+        session = type(
+            "S", (), {"config": type("C", (), {"rootpath": tmp_path})()}
+        )()
+        fixtures.pytest_sessionfinish(session, pytest.ExitCode.INTERRUPTED)
+        assert capsys.readouterr().out == ""
+
+
+class TestDockerEnvFixture:
+    """Session env-var wiring (T036)."""
+
+    _KEYS = (
+        "ZK_WORK_DIR",
+        "ZK_VERSION",
+        "ZK_AUTH",
+        "ZK_FEATURES",
+        "ZK_AUTH_JVMFLAGS",
+        "ZK_CAPTURE_JVMFLAGS",
+        "COMPOSE_PROJECT_NAME",
+        "ZOO1_CLIENT_PORT",
+        "ZOO1_SECURE_PORT",
+        "ZOO2_CLIENT_PORT",
+        "ZOO2_SECURE_PORT",
+        "ZOO3_CLIENT_PORT",
+        "ZOO3_SECURE_PORT",
+    )
+
+    def test_sets_environment_and_axis(self, tmp_path):
+        snapshot = _env_snapshot(self._KEYS)
+        try:
+            config = _FakeConfig(
+                {
+                    "--zk-version": "3.8.6",
+                    "--zk-auth": "digest",
+                    "--zk-features": "ttl",
+                }
+            )
+            env = _call_fixture(
+                fixtures.docker_env, config, _TmpPathFactory(tmp_path)
+            )
+            assert isinstance(env, common.KazooZkEnv)
+            assert env.version == "3.8.6"
+            assert env.auth is common.ZKAuthMode.DIGEST
+            assert env.features == (common.ZKFeature.TTL,)
+            assert os.environ["ZK_WORK_DIR"] == tmp_path.as_posix()
+            assert os.environ["COMPOSE_PROJECT_NAME"].startswith("kazoo-")
+        finally:
+            _env_restore(snapshot)
+
+    def test_fixed_per_member_ports(self, tmp_path):
+        snapshot = _env_snapshot(self._KEYS)
+        try:
+            env = _call_fixture(
+                fixtures.docker_env, _FakeConfig(), _TmpPathFactory(tmp_path)
+            )
+            ports = [int(os.environ[f"ZOO{i}_CLIENT_PORT"]) for i in (1, 2, 3)]
+            assert all(22300 <= p < 22300 + 500 * 6 for p in ports)
+            assert ports == sorted(ports)
+            assert env.auth is common.ZKAuthMode.PLAIN
+        finally:
+            _env_restore(snapshot)
+
+
+class TestDockerComposeConfigFixture:
+    """Overlay + JVM-flags resolution (T037)."""
+
+    def test_resolves_files_and_jvmflags(self, tmp_path, monkeypatch):
+        env = common.KazooZkEnv(
+            version="3.9.5",
+            workdir=tmp_path,
+            auth=common.ZKAuthMode.TLS,
+            features=(common.ZKFeature.RECONFIG,),
+        )
+        monkeypatch.delenv("ZK_FEATURES_JVMFLAGS", raising=False)
+        result = _call_fixture(fixtures.docker_compose_config, env)
+        assert result["version"] == "3.9.5"
+        assert result["auth"] is common.ZKAuthMode.TLS
+        assert result["features"] == (common.ZKFeature.RECONFIG,)
+        assert result["compose_files"] == [
+            "docker-compose.base.yml",
+            "docker-compose.auth-tls.yml",
+        ]
+        assert os.environ["ZK_FEATURES_JVMFLAGS"] == (
+            "-Dzookeeper.reconfigEnabled=true"
+        )
+
+
+class TestZkChrootFixture:
+    """Per-test chroot generation (T038)."""
+
+    def test_unique_per_nodeid(self):
+        chroot = _call_fixture(
+            fixtures.zkchroot, _NodeRequest("tests/test_x/test_y")
+        )
+        assert chroot.startswith("/test_y-")
+        assert len(chroot) == len("/test_y-") + 8
+
+
+class TestSkipVersionMarkerFixture:
+    """Legacy skip_if_zk_version evaluation (T039)."""
+
+    def _env(self, version="3.9.5"):
+        return common.KazooZkEnv(
+            version=version,
+            workdir=pathlib.Path("/tmp"),
+            auth=common.ZKAuthMode.PLAIN,
+            features=(common.ZKFeature.STANDARD,),
+        )
+
+    def _request(self, item):
+        return type("R", (), {"node": item})()
+
+    def test_no_marker_returns(self):
+        _call_fixture(
+            fixtures.check_skip_version_marker,
+            self._request(_FakeItem()),
+            self._env(),
+        )
+
+    def test_non_matching_marker_returns(self):
+        item = _FakeItem({"skip_if_zk_version": _FakeMarker(("<3.8",))})
+        _call_fixture(
+            fixtures.check_skip_version_marker,
+            self._request(item),
+            self._env(),
+        )
+
+    def test_matching_marker_skips(self):
+        item = _FakeItem({"skip_if_zk_version": _FakeMarker(("<3.10",))})
+        with pytest.raises(pytest.skip.Exception):
+            _call_fixture(
+                fixtures.check_skip_version_marker,
+                self._request(item),
+                self._env(),
+            )
