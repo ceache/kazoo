@@ -22,8 +22,8 @@ cell.
 * ``test_capture_with_feature_combo_ttl`` /
   ``test_capture_with_feature_combo_reconfig`` -- capture composes with the
   ttl/reconfig server features.
-* ``test_non_tls_emits_no_keylog`` -- the FR-006 edge: no decryption material
-  is emitted unless the tls flavor is active.
+* ``test_non_tls_emits_no_keylog`` -- the no-decryption-material edge: no
+  keylog is emitted unless the tls flavor is active.
 
 Per the network-holder split (docker-compose.base.yml), capture is now **per
 member**: one ``zooN-capture`` sidecar joins each member's network namespace
@@ -306,7 +306,7 @@ def _wait_for_container_pcapng_magic(docker_compose, member: str) -> bytes:
             + (f" ({last_error})" if last_error else "")
         )
     # A pcapng SHB leads the file; legacy pcap (D4 C3 B2 A1) is not expected
-    # (tshark writes pcapng natively, FR-004).
+    # (tshark writes pcapng natively).
     assert (
         last_magic in _PCAPNG_MAGIC
     ), f"{member}: not a pcapng header ({last_magic!r})"

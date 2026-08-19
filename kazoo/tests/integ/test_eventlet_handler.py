@@ -28,7 +28,7 @@ def _make_eventlet_handler():
 # The zkclient fixture is shadowed for this module so every test (including
 # those inherited from kazoo.tests.integ.test_client.TestClient and
 # kazoo.tests.integ.test_lock.TestKazooLock/TestSemaphore) talks to the
-# ensemble through an eventlet-handler client (handler-specific; R-08).
+# ensemble through an eventlet-handler client (handler-specific).
 @pytest.fixture
 def zkclient(zkensemble, zkchroot):
     # Guard against fixture-ordering: the inherited autouse set-up fixtures

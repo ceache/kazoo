@@ -1,7 +1,7 @@
 # Feature overlay: capture
 #
 # Layers the network-capture capability onto the ensemble stack whenever the
-# `capture` axis value is active (see specs/002-network-capture/).
+# `capture` axis value is active.
 #
 #   * capture sidecars (build ./dockerfiles/capture) -> one tshark process PER
 #     ensemble member (`zoo1-capture`/`zoo2-capture`/`zoo3-capture`), each
@@ -11,25 +11,21 @@
 #     per-run file under ${ZK_WORK_DIR}/captures/; the bind mount survives
 #     `docker compose down --volumes`.
 #
-# ARCHITECTURE NOTE: why the sidecar lives in the member's netns (vs. the
-# earlier host-netns design):
+# ARCHITECTURE NOTE: why the sidecar lives in the member's netns:
 #
-#   * The plan originally ran ONE sidecar on the compose bridge in promiscuous
-#     mode (`-i eth0`). On Docker Desktop (macOS/Windows) that bridge is a
-#     userspace stack (gvisor-tap) that never mirrors other containers' unicast
-#     frames onto a peer's veth, so tshark captured nothing but its own
-#     traffic. A single host-netns sidecar (`-i any`, R-01) fixed the bridge
-#     problem but observed traffic for ALL three members at once and tied the
-#     whole capture to the host namespace.
+#   * One sidecar per member joins the member's netns and taps the member's
+#     own `eth0` NON-promiscuously (-p), so its capture is exactly the traffic
+#     reaching the ZooKeeper JVM in that namespace — on BOTH Docker Desktop
+#     (macOS/Windows) and native Linux — with no bridge-mirroring dependency.
+#     A host-netns tap would observe traffic for all three members at once
+#     and tie the capture to the host namespace, and a bridge-side promiscuous
+#     tap is unreliable on Docker Desktop's userspace bridge (gvisor-tap),
+#     which never mirrors other containers' unicast frames onto a peer's veth.
 #   * The network-holder split (docker-compose.base.yml header) makes the
 #     deterministic per-member tap possible: each `zooN-capture` joins the
-#     member's netns and taps the member's own `eth0` NON-promiscuously (-p).
-#     The traffic passing through that interface is precisely the traffic
-#     reaching the ZooKeeper JVM in the same namespace — on BOTH Docker Desktop
-#     and native Linux — with no bridge-mirroring dependency. Because the
-#     holder owns the netns, a member restart (`docker compose stop
-#     zooN-service`) never kills the sidecar's tap: the capture continues
-#     across the member's downtime.
+#     member's netns. Because the holder owns the netns, a member restart
+#     (`docker compose stop zooN-service`) never kills the sidecar's tap: the
+#     capture continues across the member's downtime.
 #   * `-p` (no promiscuous mode) keeps the sidecar's privileges minimal; the
 #     capture filter (client ports only, no quorum ports) keeps the artifact
 #     scoped to client traffic.
@@ -37,7 +33,7 @@
 # NOTE: never set SERVER_JVMFLAGS here — compose merges environment maps
 # wholesale per key and would silently override the base interpolation. The
 # -javaagent flag is injected only through the base file's
-# ${ZK_CAPTURE_JVMFLAGS} slot (see specs/002-network-capture/research.md R-02).
+# ${ZK_CAPTURE_JVMFLAGS} slot.
 #
 # NOTE: volumes/ports are plain lists — docker-compose concatenates them with
 # the base file's lists across files, so no anchor merge is needed.

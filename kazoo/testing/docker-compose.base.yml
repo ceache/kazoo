@@ -45,7 +45,7 @@
 #     point.
 #
 # The split exists so that stopping/restarting the ZooKeeper *process*
-# (failure-injection tests, FR-009) never tears down the network namespace: the
+# (failure-injection tests) never tears down the network namespace: the
 # holder keeps running, and the capture sidecar (`zooN-capture`, layered by
 # docker-compose.features-capture.yml) keeps its tap on the member's interface
 # across a member restart. Without the holder, `docker compose stop zoo1` would
@@ -80,8 +80,7 @@ x-zoo-environment: &zoo_env
   # capture keylog flag (ZK_CAPTURE_JVMFLAGS) are interpolated here from the
   # host environment; never override SERVER_JVMFLAGS from an overlay file.
   # ZK_CAPTURE_JVMFLAGS is set to the -javaagent: keylog flag only when
-  # `capture` is active on the tls flavor (see
-  # specs/002-network-capture/research.md R-02).
+  # `capture` is active on the tls flavor.
   SERVER_JVMFLAGS: >-
     -Dzookeeper.root.logger=INFO,CONSOLE,ROLLINGFILE
     ${ZK_FEATURES_JVMFLAGS}
