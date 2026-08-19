@@ -20,6 +20,8 @@ from __future__ import annotations
 import importlib
 import os
 import pathlib
+import subprocess
+import threading
 
 import pytest
 
@@ -617,3 +619,281 @@ class TestKrb5Conf:
         content = conf.read_text(encoding="utf-8")
         assert "default_realm = EXAMPLE.ORG" in content
         assert "kdc = 127.0.0.1:16888" in content
+
+
+class TestBreakConnection:
+    """lose_connection / expire_session / __break_connection (T030)."""
+
+    def _fake_client(self, states):
+        class _FakeHandler:
+            event_object = threading.Event
+
+        class _FakeClient:
+            def __init__(self):
+                self.handler = _FakeHandler()
+                self.listener = None
+                self.retried = False
+                self.get_async = None
+
+            def add_listener(self, fn):
+                self.listener = fn
+
+            def _call(self, event, arg):
+                for state in states:
+                    self.listener(state)
+
+            def retry(self, fn, *args, **kwargs):
+                self.retried = True
+
+        return _FakeClient()
+
+    @pytest.mark.parametrize(
+        "method,states",
+        [
+            (
+                "lose_connection",
+                (
+                    common.KazooState.CONNECTED,
+                    common.KazooState.SUSPENDED,
+                    common.KazooState.CONNECTED,
+                ),
+            ),
+            (
+                "expire_session",
+                (
+                    common.KazooState.CONNECTED,
+                    common.KazooState.LOST,
+                    common.KazooState.CONNECTED,
+                ),
+            ),
+        ],
+    )
+    def test_happy_path(self, method, states):
+        client = self._fake_client(states)
+        getattr(_make_ensemble(), method)(client)
+        assert client.retried is True
+
+    @pytest.mark.parametrize("method", ["lose_connection", "expire_session"])
+    def test_explicit_event_factory(self, method):
+        expected = {
+            "lose_connection": common.KazooState.SUSPENDED,
+            "expire_session": common.KazooState.LOST,
+        }[method]
+        states = (
+            common.KazooState.CONNECTED,
+            expected,
+            common.KazooState.CONNECTED,
+        )
+        client = self._fake_client(states)
+        getattr(_make_ensemble(), method)(
+            client, event_factory=threading.Event
+        )
+        assert client.retried is True
+
+
+class _ImmediateEvent(threading.Event):
+    def wait(self, timeout=None):
+        return self.is_set()
+
+
+class TestBreakConnectionTimeouts:
+    """Timeout paths in __break_connection (T030)."""
+
+    def _client(self, states):
+        class _FakeClient:
+            def __init__(self):
+                self.listener = None
+                self.get_async = None
+
+            def add_listener(self, fn):
+                self.listener = fn
+
+            def _call(self, event, arg):
+                for state in states:
+                    self.listener(state)
+
+        return _FakeClient()
+
+    def test_lost_notification_timeout(self):
+        client = self._client(())
+        with pytest.raises(Exception, match="Failed to get notified"):
+            _make_ensemble().lose_connection(
+                client, event_factory=lambda: _ImmediateEvent()
+            )
+
+    def test_reconnect_timeout(self):
+        client = self._client((common.KazooState.SUSPENDED,))
+        with pytest.raises(Exception, match="Failed to see client reconnect"):
+            _make_ensemble().lose_connection(
+                client, event_factory=lambda: _ImmediateEvent()
+            )
+
+
+class _ComposeCommand:
+    def __init__(self):
+        self.compose_command_property = ["docker", "compose"]
+        self.context = "/tmp/compose"
+
+    def docker_compose_command(self):
+        return ["docker", "compose"]
+
+
+class TestRunCompose:
+    """_run_compose / stop / start subprocess plumbing (T031)."""
+
+    def _ensemble(self):
+        return common.ZkEnsemble(
+            zk_ip="127.0.0.1",
+            zk1_port=2181,
+            zk2_port=2182,
+            zk3_port=2183,
+            version="3.9.5",
+            compose=_ComposeCommand(),
+            workdir=pathlib.Path("/tmp"),
+            auth=common.ZKAuthMode.PLAIN,
+            features=(common.ZKFeature.STANDARD,),
+        )
+
+    def test_stop_start(self, monkeypatch):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs.get("cwd")))
+
+        monkeypatch.setattr(common.subprocess, "run", fake_run)
+        ensemble = self._ensemble()
+        ensemble.stop("zoo1")
+        ensemble.start("zoo2")
+        assert calls == [
+            (["docker", "compose", "stop", "zoo1-service"], "/tmp/compose"),
+            (["docker", "compose", "start", "zoo2-service"], "/tmp/compose"),
+        ]
+
+
+class _Proc:
+    def __init__(self, stdout=""):
+        self.stdout = stdout
+
+
+class TestEnsureDockerAvailable:
+    """Docker preflight checks and their failure modes (T032)."""
+
+    def test_available(self, monkeypatch):
+        def fake_run(*args, **kwargs):
+            return _Proc("linux\n")
+
+        monkeypatch.setattr(common.subprocess, "run", fake_run)
+        common._ensure_docker_available("/tmp")
+
+    def test_missing_docker_cli(self, monkeypatch):
+        def fake_run(*args, **kwargs):
+            raise FileNotFoundError
+
+        monkeypatch.setattr(common.subprocess, "run", fake_run)
+        with pytest.raises(RuntimeError, match="docker. CLI was not found"):
+            common._ensure_docker_available("/tmp")
+
+    def test_compose_plugin_missing(self, monkeypatch):
+        def fake_run(*args, **kwargs):
+            raise subprocess.CalledProcessError(1, ["docker", "compose"])
+
+        monkeypatch.setattr(common.subprocess, "run", fake_run)
+        with pytest.raises(RuntimeError, match="Compose v2 plugin"):
+            common._ensure_docker_available("/tmp")
+
+    def test_daemon_not_running(self, monkeypatch):
+        calls = []
+
+        def fake_run(*args, **kwargs):
+            calls.append(args[0])
+            if len(calls) == 1:
+                return _Proc("linux\n")
+            raise FileNotFoundError
+
+        monkeypatch.setattr(common.subprocess, "run", fake_run)
+        with pytest.raises(RuntimeError, match="daemon"):
+            common._ensure_docker_available("/tmp")
+
+    def test_windows_backend_skips(self, monkeypatch):
+        def fake_run(*args, **kwargs):
+            return _Proc("windows\n")
+
+        monkeypatch.setattr(common.subprocess, "run", fake_run)
+        with pytest.raises(pytest.skip.Exception):
+            common._ensure_linux_docker_backend()
+
+    def test_ostype_probe_failure_tolerated(self, monkeypatch):
+        def fake_run(*args, **kwargs):
+            raise FileNotFoundError
+
+        monkeypatch.setattr(common.subprocess, "run", fake_run)
+        common._ensure_linux_docker_backend()
+
+
+class TestBuildCaptureImages:
+    """In-repo capture image build preflight (T033)."""
+
+    def test_success(self, monkeypatch):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+
+        monkeypatch.setattr(common.subprocess, "run", fake_run)
+        common._build_capture_images(_ComposeCommand(), "/tmp")
+        assert calls == [["docker", "compose", "build"]]
+
+    def test_failure_uses_stderr(self, monkeypatch):
+        def fake_run(cmd, **kwargs):
+            raise subprocess.CalledProcessError(1, cmd, stderr=b"boom\n")
+
+        monkeypatch.setattr(common.subprocess, "run", fake_run)
+        with pytest.raises(RuntimeError, match="boom"):
+            common._build_capture_images(_ComposeCommand(), "/tmp")
+
+    def test_failure_falls_back_to_stdout(self, monkeypatch):
+        def fake_run(cmd, **kwargs):
+            raise subprocess.CalledProcessError(
+                1, cmd, b"stdout-detail\n", b""
+            )
+
+        monkeypatch.setattr(common.subprocess, "run", fake_run)
+        with pytest.raises(RuntimeError, match="stdout-detail"):
+            common._build_capture_images(_ComposeCommand(), "/tmp")
+
+
+class TestDumpEnsembleLogs:
+    """Best-effort member log dump (T034)."""
+
+    def test_no_handle_noop(self):
+        common.set_compose_handle(None)
+        common.dump_ensemble_logs()
+
+    def test_bytes_and_str_streams(self, capsys):
+        class _Fake:
+            def get_logs(self, service):
+                return (b"out bytes\n", "err text")
+
+        common.set_compose_handle(_Fake())
+        try:
+            common.dump_ensemble_logs()
+        finally:
+            common.set_compose_handle(None)
+        captured = capsys.readouterr()
+        assert "zoo1-service stdout" in captured.out
+        assert "out bytes" in captured.out
+        assert "zoo1-service stderr" in captured.out
+        assert "err text" in captured.out
+
+    def test_get_logs_exception(self, capsys):
+        class _Fake:
+            def get_logs(self, service):
+                raise RuntimeError("boom")
+
+        common.set_compose_handle(_Fake())
+        try:
+            common.dump_ensemble_logs()
+        finally:
+            common.set_compose_handle(None)
+        captured = capsys.readouterr()
+        assert "failed to fetch logs" in captured.out
