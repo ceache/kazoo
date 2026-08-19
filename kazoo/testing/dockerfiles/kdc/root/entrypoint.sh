@@ -11,7 +11,7 @@
 #                                 plus a combined server.keytab
 #
 # Everything is created world-readable so the host-side test process (any
-# UID) and the zoo containers can consume it (FR-011, R-08). The KDC listens
+# UID) and the zoo containers can consume it. The KDC listens
 # on 0.0.0.0:${KDC_PORT} so the zoo containers can reach it at
 # ${KDC_SERVICE}:${KDC_PORT} over the compose network.
 

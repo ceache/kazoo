@@ -37,7 +37,7 @@ class TestKazooLease:
                 cl.close()
 
     def _get_client(self, **opts):
-        # Mirrors the legacy _get_client(): additional clients connected to
+        # Additional clients connected to
         # the same chrooted namespace as ``self.client``.
         c = self.zkensemble.get_client(**opts)
         c.chroot = self.chroot

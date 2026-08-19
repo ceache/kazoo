@@ -317,8 +317,6 @@ class ZkEnsemble:
 
     def _apply_superadmin_auth(self, kwargs: dict[str, Any]) -> None:
         """Merge the superadmin digest credentials into ``kwargs`` in place."""
-        if "hosts" in kwargs:
-            return
         auth_data = kwargs.pop("auth_data", None)
         if auth_data is None:
             kwargs["auth_data"] = [("digest", "super:super_secret")]
@@ -529,7 +527,7 @@ def _daemon_mount_path(
 
 
 def _ensure_linux_docker_backend() -> None:
-    """Skip (never fail, SC-005) when the docker daemon is not a Linux backend.
+    """Skip (never fail) when the docker daemon is not a Linux backend.
 
     The official ZooKeeper image is published for Linux only, so a
     Windows-container daemon (e.g. the GitHub-hosted ``windows-latest``
@@ -537,8 +535,8 @@ def _ensure_linux_docker_backend() -> None:
     ``compose up`` dies with ``no matching manifest for
     windows(...)/amd64``. Detecting the daemon OS up front turns that into a
     clean skip of the whole ensemble suite with an actionable reason instead
-    of a wall of per-test errors (FR-011: a real Windows host with Docker
-    Desktop's Linux backend passes normally).
+    of a wall of per-test errors (a real Windows host with Docker Desktop's
+    Linux backend passes normally).
     """
     try:
         ostype = subprocess.run(
@@ -555,7 +553,7 @@ def _ensure_linux_docker_backend() -> None:
         pytest.skip(
             f"docker engine OSType is {ostype!r}, not 'linux': the "
             "ZooKeeper official image is linux-only, so the ensemble suite "
-            "cannot run against a Windows-container docker backend (SC-005). "
+            "cannot run against a Windows-container docker backend. "
             "Run these tests with Docker Desktop (Linux containers) or a "
             "Linux Docker Engine."
         )

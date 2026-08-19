@@ -1,7 +1,7 @@
 #!/bin/sh
-# Capture entrypoint (formerly ENTRYPOINT ["tshark"]).
+# Capture entrypoint (delivers the tshark image a command).
 #
-# The capture service's compose `command:` is flags-only (R-03/T010); this
+# The capture service's compose `command:` is flags-only; this
 # wrapper appends a uniquely-named `-w` output file so that a sidecar restart
 # (e.g. an engine or holder restart recreating the container) never overwrites
 # a previous capture. The artifact is intentionally a *collection* of

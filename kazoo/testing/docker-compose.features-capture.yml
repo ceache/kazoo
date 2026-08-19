@@ -29,7 +29,7 @@
 #     and native Linux — with no bridge-mirroring dependency. Because the
 #     holder owns the netns, a member restart (`docker compose stop
 #     zooN-service`) never kills the sidecar's tap: the capture continues
-#     across the member's downtime (FR-009 / quickstart invariants).
+#     across the member's downtime.
 #   * `-p` (no promiscuous mode) keeps the sidecar's privileges minimal; the
 #     capture filter (client ports only, no quorum ports) keeps the artifact
 #     scoped to client traffic.
@@ -46,10 +46,10 @@
 # the member name. The Dockerfile's ENTRYPOINT is the capture-entrypoint.sh
 # wrapper, which consumes that member name for the output filename and appends
 # `-w`; compose appends `command` to the entrypoint, so a `tshark` prefix here
-# would double-execute the binary (R-03, T010). Do NOT specify `-w` in command.
+# would double-execute the binary. Do NOT specify `-w` in command.
 #
 # On the tls flavor this overlay additionally provisions the JSSE keylog
-# agent (R-02/R-10): the `tls-secrets-agent` sidecar downloads the pinned,
+# agent: the `tls-secrets-agent` sidecar downloads the pinned,
 # checksum-verified `extract-tls-secrets` jar into ${ZK_WORK_DIR}/agent and
 # signals readiness with a `.ready` healthcheck. The zoo services depend on
 # that healthcheck and mount the jar read-only at /agent/extract-tls-secrets.jar,
@@ -58,7 +58,7 @@
 # `tls`+`capture` run never launches a JVM with a missing `-javaagent:` jar.
 
 services:
-  # JSSE keylog agent provisioner (R-02/R-10): downloads the pinned jar at
+  # JSSE keylog agent provisioner: downloads the pinned jar at
   # build time (dockerfiles/tls-secrets-agent) and installs it into the shared
   # ${ZK_WORK_DIR}/agent mount. The zoo services depend on this service's
   # healthcheck, so the jar always exists before any JVM starts. Harmless on
@@ -104,18 +104,18 @@ services:
       zoo1:
         condition: service_started
     # tshark/dumpcap need raw + interface privileges even in the member netns
-    # (R-06).
+    #
     cap_add:
       - NET_RAW
       - NET_ADMIN
     # Full-length frames (-s 0) of all client-port traffic — clear 2181 and
-    # secure 2281 (FR-002/FR-005). Quorum ports (2888/3888) are not captured.
+    # secure 2281. Quorum ports (2888/3888) are not captured.
     # First token `zoo1` is the member name for the output filename.
     command: >
       zoo1 -i eth0 -p -s 0
       -f "tcp port 2181 or tcp port 2281"
     volumes:
-      # Bind mount: survives `docker compose down --volumes` (R-05).
+      # Bind mount: survives `docker compose down --volumes`.
       - ${ZK_WORK_DIR}/captures:/captures
 
   zoo2-capture:

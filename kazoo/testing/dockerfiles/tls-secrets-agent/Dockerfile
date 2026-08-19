@@ -1,9 +1,9 @@
 # JSSE keylog agent provisioner for the kazoo integration-test suite.
 #
-# On the `tls` auth flavor with `capture` active (R-02), the ensemble JVMs are
+# On the `tls` auth flavor with `capture` active, the ensemble JVMs are
 # launched with `-javaagent:/agent/extract-tls-secrets.jar=<keylog path>` so
 # that TLS session secrets are exported in SSLKEYLOGFILE format, letting the
-# captured pcapng artifacts be decrypted with the emitted keylog (FR-006).
+# captured pcapng artifacts be decrypted with the emitted keylog.
 #
 # This image downloads the **pinned, checksum-verified** `extract-tls-secrets`
 # 5.0.0 agent jar at build time (exactly like `apk add tshark` in the capture
@@ -11,14 +11,14 @@
 # the jar into the shared ${ZK_WORK_DIR}/agent mount and touches a `.ready`
 # marker. The ZooKeeper servers mount the jar read-only at
 # /agent/extract-tls-secrets.jar and their healthcheck/dependency on this
-# service guarantees the jar exists before any JVM starts (R-10).
+# service guarantees the jar exists before any JVM starts.
 #
-# Supply-chain discipline (FR-009/FR-010): the version (5.0.0) and SHA-256
+# Supply-chain discipline: the version (5.0.0) and SHA-256
 # (015418eaf3…) are pinned here so the agent environment is reproducible and
 # auditable, mirroring the pinned base images and `apk` packages. The SHA-256
 # is verified at build time via `sha256sum -c`; a download/checksum failure
 # aborts the image build, which the capture preflight surfaces as an
-# actionable error before the stack starts (R-07).
+# actionable error before the stack starts.
 
 FROM alpine:3.20
 

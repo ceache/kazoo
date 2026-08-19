@@ -17,7 +17,7 @@
 #       └── cacert.pem             # CA cert (for kazoo's `ca` argument)
 #
 # All files are made world-readable so the host-side test process (any UID)
-# can consume them from the shared ${ZK_WORK_DIR}/certs bind mount (FR-011).
+# can consume them from the shared ${ZK_WORK_DIR}/certs bind mount.
 # Nothing is ever written outside $CERTS_DIR.
 
 set -eu

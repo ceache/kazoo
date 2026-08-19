@@ -1,7 +1,7 @@
 # Authentication overlay: sasl_gssapi
 #
 # GSSAPI (Kerberos) client authentication tunneled over TLS, configured
-# entirely through the official image's public interfaces (FR-002, FR-012):
+# entirely through the official image's public interfaces:
 #
 #   * kdc sidecar (build ./dockerfiles/kdc) provisions a throwaway realm
 #     (EXAMPLE.ORG), per-SPN keytabs and a combined server.keytab into the

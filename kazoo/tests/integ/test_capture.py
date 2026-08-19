@@ -1,4 +1,4 @@
-"""Integration self-check tests for the ``capture`` axis (US1).
+"""Integration self-check tests for the ``capture`` axis.
 
 These tests validate the network-capture feature (see
 ``specs/002-network-capture/``) from inside a capture-enabled session. They
@@ -7,21 +7,21 @@ skipped otherwise by the existing ``zk_features`` marker machinery
 (``kazoo.testing.fixtures``), so the same file is safe in every matrix
 cell.
 
-* ``test_capture_feature_active`` -- the axis wiring (R-04): the capture
+* ``test_capture_feature_active`` -- the axis wiring: the capture
   overlay is layered onto the compose file list.
-* ``test_artifact_exists_and_valid`` -- the artifact contract (FR-002/FR-003):
+* ``test_artifact_exists_and_valid`` -- the artifact contract:
   every member's tshark sidecar holds open a ``kazoo-client-zooN-*.pcapng``
   that already carries real client-port frames and a structurally valid pcapng
   header.
-* ``test_tls_keylog_emitted`` -- the decryption-material contract (R-02/R-09):
+* ``test_tls_keylog_emitted`` -- the decryption-material contract:
   on the tls flavor the ensemble emits a non-empty SSLKEYLOGFILE-format keylog
   plus the context certs into ``captures/tls/``.
-* ``test_capture_outcomes_identical`` -- the parity contract (FR-007/SC-005):
+* ``test_capture_outcomes_identical`` -- the parity contract:
   the ``capture`` axis never changes any test's run/skip/fail classification
   (verified via the marker machinery).
 * ``test_capture_with_feature_combo_ttl`` /
   ``test_capture_with_feature_combo_reconfig`` -- capture composes with the
-  ttl/reconfig server features (FR-012, quickstart V8).
+  ttl/reconfig server features.
 * ``test_non_tls_emits_no_keylog`` -- the FR-006 edge: no decryption material
   is emitted unless the tls flavor is active.
 
@@ -43,7 +43,7 @@ answer differs between Docker Desktop and native Linux:
   flushed into it continuously. This works identically on every platform, so
   it is the required gate.
 * **Host-side (best effort):** on native Linux the bind mount mirrors the
-  live file immediately, mirroring the quickstart V1 end-of-session view. On
+  live file immediately. On
   Docker Desktop, virtiofs only syncs the host's view of an open,
   actively-written file back once the writing process exits, so the host
   mount is expected to be empty or absent *while the session is running*;
@@ -51,9 +51,8 @@ answer differs between Docker Desktop and native Linux:
   check. The host probe therefore hard-fails only when a file is present
   but malformed, and tolerates the stale/absent Docker Desktop view.
 
-Per the plan, the host needs no capture tooling (FR-009); ``capinfos`` is an
-optional extra exercised only when it happens to be installed and the host
-view is readable.
+The host needs no capture tooling; ``capinfos`` is an optional extra
+exercised only when it happens to be installed and the host view is readable.
 """
 
 from __future__ import annotations
@@ -89,7 +88,7 @@ _CAPTURE_SERVICES = tuple(f"{m}-capture" for m in _MEMBERS)
 def test_capture_feature_active(docker_compose_config):
     """A capture-enabled run must not be skipped and must layer the overlay."""
     # Running at all proves the ``zk_features(require=["capture"])`` marker did
-    # not skip this item (R-04/marker machinery).
+    # not skip this item (marker machinery).
     assert _CAPTURE_OVERLAY in docker_compose_config["compose_files"]
 
 
@@ -116,7 +115,7 @@ def test_artifact_exists_and_valid(docker_compose, zkclient):
 
     # Host-side probe: assert existence+validity when the bind mount actually
     # mirrors the live files (native Linux); tolerate Docker Desktop's stale
-    # virtiofs view mid-session (validated post-session by quickstart V1).
+    # virtiofs view mid-session (see module docstring).
     artifacts = list(
         Path(os.environ["ZK_WORK_DIR"]).glob("captures/kazoo-client-*.pcapng")
     )
@@ -126,14 +125,14 @@ def test_artifact_exists_and_valid(docker_compose, zkclient):
 @pytest.mark.zk_auth("tls")
 @pytest.mark.zk_features(require=["capture"])
 def test_tls_keylog_emitted(docker_env, zkclient):
-    """The tls+capture run emits the TLS decryption material (R-02/R-09).
+    """The tls+capture run emits the TLS decryption material.
 
     On the tls flavor the ensemble JVMs run the ``extract-tls-secrets`` agent,
     which writes an SSLKEYLOGFILE-format keylog per node. This test drives real
     TLS client traffic, then exercises the same assembly routine the harness
     teardown runs (``_assemble_tls_keylog``) to assert ``captures/tls/``
     contains a non-empty keylog plus the context certificates. No private key
-    is ever emitted (FR-006).
+    is ever emitted.
     """
     # Drive real TLS traffic (the handshake the agent's keylog captures).
     zkclient.create("/tls-keylog-selfcheck", b"x")
@@ -167,7 +166,7 @@ def test_tls_keylog_emitted(docker_env, zkclient):
 @pytest.mark.zk_auth(skip=("tls",))
 @pytest.mark.zk_features(require=["capture"])
 def test_non_tls_emits_no_keylog(docker_env):
-    """Non-tls capture runs must not emit TLS decryption material (R-09 edge).
+    """Non-tls capture runs must not emit TLS decryption material.
 
     The keylog agent is only attached on the tls flavor, so ``captures/tls/``
     must not exist anywhere else (plain, digest, sasl_digest, sasl_gssapi).
@@ -183,13 +182,13 @@ def test_non_tls_emits_no_keylog(docker_env):
 def test_capture_outcomes_identical(request, docker_env):
     """Adding the ``capture`` feature must not alter any test's outcome.
 
-    FR-007/SC-005: capture is observational (a tshark sidecar plus, on tls, a
-    passive keylog agent), so it must not change which tests run, skip, or
-    fail (quickstart V4–V5). We prove this through the marker machinery
-    itself: re-evaluate every collected item's axis markers with the active
-    feature set and with ``capture`` removed, and require identical
-    run/skip/fail classifications. Only the capture-gated self-check tests
-    themselves are exempt (they are supposed to skip without the axis value).
+    Capture is observational (a tshark sidecar plus, on tls, a passive keylog
+    agent), so it must not change which tests run, skip, or fail. We prove
+    this through the marker machinery itself: re-evaluate every collected
+    item's axis markers with the active feature set and with ``capture``
+    removed, and require identical run/skip/fail classifications. Only the
+    capture-gated self-check tests themselves are exempt (they are supposed
+    to skip without the axis value).
     """
     items = list(request.session.items)
     assert items, "no collected items to parity-check"
@@ -221,7 +220,7 @@ def test_capture_outcomes_identical(request, docker_env):
 
 @pytest.mark.zk_features(require=["capture", "ttl"])
 def test_capture_with_feature_combo_ttl(docker_compose, zkclient):
-    """Capture composes with the ttl server feature (FR-012, quickstart V8).
+    """Capture composes with the ttl server feature.
 
     The per-member capture sidecars must work identically when the ttl server
     feature is also active; the pcapng of at least one member must carry
@@ -235,7 +234,7 @@ def test_capture_with_feature_combo_ttl(docker_compose, zkclient):
 
 @pytest.mark.zk_features(require=["capture", "reconfig"])
 def test_capture_with_feature_combo_reconfig(docker_compose, zkclient):
-    """Capture composes with the reconfig server feature (FR-012, V8)."""
+    """Capture composes with the reconfig server feature."""
     zkclient.create("/capture-reconfig-combo", b"y")
     assert zkclient.get("/capture-reconfig-combo")[0] == b"y"
     _assert_container_frames_present(docker_compose)
@@ -319,7 +318,7 @@ def _assert_container_frames_present(docker_compose) -> None:
 
     tshark writes captured packet data to the pcapng in flushes, so like the
     magic gate this polls (up to ~10s) until frames become readable rather
-    than asserting on the first read (R-05: clean in-band flush during the
+    than asserting on the first read (a clean in-band flush during the
     session, plus the final flush at teardown). The Kazoo client connects to
     a single ensemble member, so frames may appear on any one capture; the
     union across all members must include a client port.
@@ -387,8 +386,8 @@ def _probe_host_artifacts(
 
     Hard-fails only when a host file exists but disagrees with the
     container-side artifact (i.e. a genuinely inconsistent bind mount).
-    Skips silently when the host cannot reflect the live file yet — the
-    quickstart V1 post-session capinfos gate covers that case.
+    Skips silently when the host cannot reflect the live file yet; the
+    post-session ``capinfos`` check covers that case.
     """
     if not artifacts:
         return  # not yet visible on the host (expected on Docker Desktop)
@@ -410,10 +409,9 @@ def _probe_host_artifacts(
 def _run_capinfos_if_available(artifacts: list[Path]) -> None:
     """Validate with ``capinfos`` when the optional host tool is present.
 
-    The plan guarantees the host needs no capture tooling (FR-009); the
-    quickstart V1 manual check is the authoritative capinfos gate.
-    When capinfos *is* installed we still exercise it here for automated
-    coverage, tolerating the transient "in progress" state of a live capture.
+    The host needs no capture tooling; this is an optional extra exercised
+    when capinfos *is* installed, tolerating the transient "in progress"
+    state of a live capture.
     """
     capinfos = shutil.which("capinfos")
     if capinfos is None:
@@ -426,7 +424,7 @@ def _run_capinfos_if_available(artifacts: list[Path]) -> None:
             timeout=60,
         )
         # ``returncode != 0`` would mean the tool could not parse the file; a
-        # mid-capture file is expected to remain readable (R-05).
+        # mid-capture file is expected to remain readable.
         assert (
             result.returncode == 0
         ), f"capinfos failed on {artifact}:\n{result.stdout}\n{result.stderr}"

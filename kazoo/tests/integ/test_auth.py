@@ -1,4 +1,4 @@
-"""Authentication integration tests for the auth axis (US3).
+"""Authentication integration tests for the auth axis.
 
 Each auth flavor (digest, sasl_digest, tls, sasl_gssapi) is exercised with:
 
@@ -21,6 +21,7 @@ Notes on negative SASL assertions:
   negative tests wait for the session to become unusable instead of asserting
   exclusively on ``start()`` raising.
 """
+
 from __future__ import annotations
 
 import time

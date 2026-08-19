@@ -77,7 +77,7 @@ class TestKazooLock:
         return test_util.Wait()
 
     def _get_client(self, **opts):
-        # Mirrors the legacy _get_client(): an additional client connected to
+        # An additional client connected to
         # the same chrooted namespace as ``self.client``.
         c = self.zkensemble.get_client(**opts)
         c.chroot = self.chroot

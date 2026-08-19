@@ -8,7 +8,7 @@
 #   * a read-only bind of the JAAS config (${ZK_COMPOSE_DIR}/jaas/
 #     sasl-digest.conf) at /conf/jaas.conf — interpolated so the source can
 #     be translated to a daemon-visible mount path on Windows-remote setups
-#     (FR-011)
+#     
 #
 # The JAAS config registers the DigestLoginModule users
 # (user_super / user_jaasuser); clients authenticate with

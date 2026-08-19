@@ -18,8 +18,12 @@ The pure-function groups aim for 100% branch coverage of
 from __future__ import annotations
 
 import importlib
+import os
+import pathlib
 
 import pytest
+
+from kazoo.testing import common
 
 
 class TestImportSurface:
@@ -76,3 +80,540 @@ class TestImportSurface:
     def test_kazoo_tests_conftest_removed(self) -> None:
         with pytest.raises(ModuleNotFoundError):
             importlib.import_module("kazoo.tests.conftest")
+
+
+class _FakeMarker:
+    """Minimal stand-in for a pytest marker."""
+
+    def __init__(self, args=(), kwargs=None):
+        self.args = tuple(args)
+        self.kwargs = dict(kwargs or {})
+
+
+class _FakeItem:
+    """Minimal item stand-in exposing get_closest_marker."""
+
+    def __init__(self, markers=None):
+        self._markers = markers or {}
+
+    def get_closest_marker(self, name):
+        return self._markers.get(name)
+
+
+def _make_ensemble(
+    auth: common.ZKAuthMode = common.ZKAuthMode.PLAIN,
+    features: tuple = (common.ZKFeature.STANDARD,),
+    workdir=None,
+):
+    return common.ZkEnsemble(
+        zk_ip="127.0.0.1",
+        zk1_port=2181,
+        zk2_port=2182,
+        zk3_port=2183,
+        version="3.9.5",
+        compose=None,
+        workdir=workdir if workdir is not None else pathlib.Path("/tmp"),
+        auth=auth,
+        features=features,
+    )
+
+
+class TestResolveAxisOptions:
+    """resolve_axis_options: env defaults, CLI overrides, parsing (T023)."""
+
+    def test_env_defaults(self):
+        version, auth, features, env = common.resolve_axis_options(
+            None, None, None, {}
+        )
+        assert version == common.ZK_DEFAULT_VERSION
+        assert auth is common.ZKAuthMode.PLAIN
+        assert features == (common.ZKFeature.STANDARD,)
+        assert env["ZK_VERSION"] == common.ZK_DEFAULT_VERSION
+        assert env["ZK_AUTH"] == "plain"
+        assert env["ZK_FEATURES"] == "standard"
+        assert env["ZK_AUTH_JVMFLAGS"] == ""
+        assert env["ZK_CAPTURE_JVMFLAGS"] == ""
+
+    def test_environment_values(self):
+        version, auth, features, env = common.resolve_axis_options(
+            None,
+            None,
+            None,
+            {
+                "ZK_VERSION": "3.8.6",
+                "ZK_AUTH": "digest",
+                "ZK_FEATURES": "ttl, reconfig",
+            },
+        )
+        assert version == "3.8.6"
+        assert auth is common.ZKAuthMode.DIGEST
+        assert features == (common.ZKFeature.TTL, common.ZKFeature.RECONFIG)
+        assert (
+            env["ZK_AUTH_JVMFLAGS"]
+            == common.AUTH_JVM_FLAGS[common.ZKAuthMode.DIGEST]
+        )
+
+    def test_options_override_environment(self):
+        version, auth, features, env = common.resolve_axis_options(
+            "3.7.2",
+            "tls",
+            "capture",
+            {
+                "ZK_VERSION": "3.9.5",
+                "ZK_AUTH": "plain",
+                "ZK_FEATURES": "standard",
+            },
+        )
+        assert version == "3.7.2"
+        assert auth is common.ZKAuthMode.TLS
+        assert features == (common.ZKFeature.CAPTURE,)
+        assert env["ZK_VERSION"] == "3.7.2"
+        assert env["ZK_AUTH"] == "tls"
+        assert env["ZK_FEATURES"] == "capture"
+
+    def test_empty_feature_segments_are_filtered(self):
+        _version, _auth, features, env = common.resolve_axis_options(
+            None, None, "ttl,,reconfig", {}
+        )
+        assert features == (common.ZKFeature.TTL, common.ZKFeature.RECONFIG)
+        assert env["ZK_FEATURES"] == "ttl,reconfig"
+
+    def test_capture_jvmflags_only_for_tls_capture(self):
+        _v, _a, features, env = common.resolve_axis_options(
+            None, "tls", "capture", {}
+        )
+        assert features == (common.ZKFeature.CAPTURE,)
+        assert env["ZK_CAPTURE_JVMFLAGS"] == (
+            "-javaagent:/agent/extract-tls-secrets.jar=/logs/tls-secrets.log"
+        )
+
+    def test_capture_jvmflags_empty_without_tls(self):
+        _v, _a, _features, env = common.resolve_axis_options(
+            None, "plain", "capture", {}
+        )
+        assert env["ZK_CAPTURE_JVMFLAGS"] == ""
+
+
+class _FakeConfig:
+    """Stand-in pytest config exposing getoption."""
+
+    def __init__(self, options=None):
+        self._options = dict(options or {})
+
+    def getoption(self, name):
+        return self._options.get(name)
+
+
+class TestResolveAxisOptionsWrapper:
+    """_resolve_axis_options: pytest-option plumbing (T023a)."""
+
+    _ENV_KEYS = (
+        "ZK_VERSION",
+        "ZK_AUTH",
+        "ZK_FEATURES",
+        "ZK_AUTH_JVMFLAGS",
+        "ZK_CAPTURE_JVMFLAGS",
+    )
+
+    def _clean_and_restore(self, monkeypatch):
+        for key in self._ENV_KEYS:
+            monkeypatch.delenv(key, raising=False)
+
+    def test_options_wired_through(self, monkeypatch):
+        self._clean_and_restore(monkeypatch)
+        config = _FakeConfig(
+            {
+                "--zk-version": "3.8.6",
+                "--zk-auth": "digest",
+                "--zk-features": "ttl,reconfig",
+            }
+        )
+        version_value, auth, features = common._resolve_axis_options(config)
+        assert version_value == "3.8.6"
+        assert auth is common.ZKAuthMode.DIGEST
+        assert features == (common.ZKFeature.TTL, common.ZKFeature.RECONFIG)
+        assert os.environ["ZK_VERSION"] == "3.8.6"
+        assert os.environ["ZK_AUTH"] == "digest"
+        assert os.environ["ZK_FEATURES"] == "ttl,reconfig"
+
+    def test_env_fallback_when_options_absent(self, monkeypatch):
+        monkeypatch.setenv("ZK_VERSION", "3.6.4")
+        monkeypatch.setenv("ZK_AUTH", "tls")
+        monkeypatch.setenv("ZK_FEATURES", "capture")
+        version_value, auth, features = common._resolve_axis_options(
+            _FakeConfig()
+        )
+        assert version_value == "3.6.4"
+        assert auth is common.ZKAuthMode.TLS
+        assert features == (common.ZKFeature.CAPTURE,)
+        assert (
+            os.environ["ZK_AUTH_JVMFLAGS"]
+            == common.AUTH_JVM_FLAGS[common.ZKAuthMode.TLS]
+        )
+        assert os.environ["ZK_CAPTURE_JVMFLAGS"] != ""
+
+
+class TestMarkerEvaluation:
+    """Axis-marker evaluation (T024)."""
+
+    def _eval(self, item):
+        return common._evaluate_axis_markers(
+            item,
+            "3.9.5",
+            common.ZKAuthMode.DIGEST,
+            (common.ZKFeature.TTL,),
+        )
+
+    def test_no_markers_returns_none(self):
+        assert self._eval(_FakeItem()) is None
+
+    def test_version_marker_hit_and_miss(self):
+        item = _FakeItem({"zk_version": _FakeMarker(("<3.8",))})
+        assert self._eval(item) == "Requires ZK <3.8 (active: 3.9.5)"
+        item = _FakeItem({"zk_version": _FakeMarker(("<3.10",))})
+        assert self._eval(item) is None
+
+    def test_auth_allowed_and_skip(self):
+        ok = _FakeItem({"zk_auth": _FakeMarker(("digest",))})
+        assert self._eval(ok) is None
+        forbidden = _FakeItem({"zk_auth": _FakeMarker(("tls",))})
+        assert self._eval(forbidden) == (
+            "Requires auth in ['tls'] (active: digest)"
+        )
+        skip_digest = _FakeItem(
+            {"zk_auth": _FakeMarker(kwargs={"skip": ("digest",)})}
+        )
+        assert self._eval(skip_digest) == "Incompatible with auth digest"
+
+    def test_features_require_and_skip(self):
+        require_meta = {"require": ["ttl"]}
+        item = _FakeItem({"zk_features": _FakeMarker(kwargs=require_meta)})
+        assert self._eval(item) is None
+        missing = {"require": ["readonly"]}
+        item = _FakeItem({"zk_features": _FakeMarker(kwargs=missing)})
+        assert self._eval(item) == "Missing required feature(s): ['readonly']"
+        skip_meta = {"skip": ["ttl"]}
+        item = _FakeItem({"zk_features": _FakeMarker(kwargs=skip_meta)})
+        assert (
+            self._eval(item) == "Incompatible with active feature(s): ['ttl']"
+        )
+
+    def test_multiple_reasons_joined(self):
+        item = _FakeItem(
+            {
+                "zk_version": _FakeMarker((">=3.10",)),
+                "zk_auth": _FakeMarker(("tls",)),
+            }
+        )
+        assert self._eval(item) == (
+            "Requires ZK >=3.10 (active: 3.9.5); "
+            "Requires auth in ['tls'] (active: digest)"
+        )
+
+    @pytest.mark.parametrize(
+        "condition,active,expected",
+        [
+            ("<3.8", "3.7.2", True),
+            ("<3.8", "3.9.5", False),
+            (">=3.8,<3.9", "3.8.6", True),
+        ],
+    )
+    def test_evaluate_skip_version_marker(self, condition, active, expected):
+        assert (
+            common.evaluate_skip_version_marker(condition, active) is expected
+        )
+
+
+class TestDaemonMountPath:
+    """Bind-mount path translation for remote daemons (T025)."""
+
+    def test_posix_passthrough(self):
+        path = pathlib.Path("/tmp/kazoo/work")
+        assert (
+            common._daemon_mount_path(path, os_name="posix", docker_host="")
+            == "/tmp/kazoo/work"
+        )
+
+    def test_windows_tcp_drive_rewrite(self):
+        path = pathlib.Path("D:/kazoo/work")
+        out = common._daemon_mount_path(
+            path, os_name="nt", docker_host="tcp://localhost:2375"
+        )
+        assert out == "/mnt/d/kazoo/work"
+
+    def test_windows_http_drive_rewrite(self):
+        path = pathlib.Path("C:/work")
+        out = common._daemon_mount_path(
+            path, os_name="nt", docker_host="http://engine:2375"
+        )
+        assert out == "/mnt/c/work"
+
+    def test_windows_tcp_non_drive_passthrough(self):
+        path = pathlib.Path("/mnt/c/x")
+        out = common._daemon_mount_path(
+            path, os_name="nt", docker_host="tcp://localhost:2375"
+        )
+        assert out == "/mnt/c/x"
+
+    def test_windows_without_remote_host_passthrough(self):
+        path = pathlib.Path("D:/kazoo/work")
+        assert (
+            common._daemon_mount_path(path, os_name="nt", docker_host="")
+            == "D:/kazoo/work"
+        )
+
+    @pytest.mark.parametrize(
+        "name,expected",
+        [("zoo1", "zoo1-service"), ("zoo2", "zoo2-service")],
+    )
+    def test_process_service_members(self, name, expected):
+        assert common.ZkEnsemble._process_service(name) == expected
+
+    def test_process_service_passthrough(self):
+        assert (
+            common.ZkEnsemble._process_service("zoo1-service")
+            == "zoo1-service"
+        )
+
+
+class TestZkEnsemble:
+    """Ensemble client plumbing (T026)."""
+
+    def test_get_hosts(self):
+        ensemble = _make_ensemble()
+        assert (
+            ensemble.get_hosts()
+            == "127.0.0.1:2181,127.0.0.1:2182,127.0.0.1:2183"
+        )
+
+    def test_implied_options_plain(self):
+        assert (
+            _make_ensemble(common.ZKAuthMode.PLAIN)._client_implied_options()
+            == {}
+        )
+
+    def test_implied_options_digest(self):
+        opts = _make_ensemble(
+            common.ZKAuthMode.DIGEST
+        )._client_implied_options()
+        assert opts == {"auth_data": [("digest", "super:super_secret")]}
+
+    def test_implied_options_sasl_digest(self):
+        opts = _make_ensemble(
+            common.ZKAuthMode.SASL_DIGEST
+        )._client_implied_options()
+        assert opts["sasl_options"]["mechanism"] == "DIGEST-MD5"
+
+    def test_implied_options_tls(self, tmp_path):
+        opts = _make_ensemble(
+            common.ZKAuthMode.TLS, workdir=tmp_path
+        )._client_implied_options()
+        assert opts["use_ssl"] is True
+        assert (
+            str(tmp_path / "certs" / "client" / "client.pem") in opts.values()
+        )
+        assert "sasl_options" not in opts
+
+    def test_implied_options_sasl_gssapi(self, tmp_path):
+        opts = _make_ensemble(
+            common.ZKAuthMode.SASL_GSSAPI, workdir=tmp_path
+        )._client_implied_options()
+        assert opts["use_ssl"] is True
+        assert opts["sasl_options"] == {"mechanism": "GSSAPI"}
+
+    def test_superadmin_auth_added(self):
+        kwargs: dict = {}
+        _make_ensemble()._apply_superadmin_auth(kwargs)
+        assert kwargs == {"auth_data": [("digest", "super:super_secret")]}
+
+    def test_superadmin_auth_appended(self):
+        existing = [("digest", "other")]
+        kwargs: dict = {"auth_data": existing}
+        _make_ensemble()._apply_superadmin_auth(kwargs)
+        assert kwargs["auth_data"] == [
+            ("digest", "other"),
+            ("digest", "super:super_secret"),
+        ]
+
+    def test_superadmin_auth_rejects_non_list(self):
+        kwargs: dict = {"auth_data": "not-a-list"}
+        with pytest.raises(ValueError):
+            _make_ensemble()._apply_superadmin_auth(kwargs)
+
+    def test_get_client_hosts_kwarg_wins(self):
+        client = _make_ensemble().get_client(hosts="1.2.3.4:9999")
+        assert client.hosts == [("1.2.3.4", 9999)]
+
+    def test_get_client_default_hosts_and_implied_options(self):
+        client = _make_ensemble(common.ZKAuthMode.DIGEST).get_client()
+        assert client.hosts == [
+            ("127.0.0.1", 2181),
+            ("127.0.0.1", 2182),
+            ("127.0.0.1", 2183),
+        ]
+        assert client.auth_data == {("digest", "super:super_secret")}
+
+    def test_get_client_superadmin(self):
+        client = _make_ensemble().get_client(superadmin=True)
+        assert ("digest", "super:super_secret") in client.auth_data
+
+    def test_set_compose_handle_roundtrip(self):
+        common.set_compose_handle("fake")
+        assert common._COMPOSE_HANDLE == "fake"
+        common.set_compose_handle(None)
+        assert common._COMPOSE_HANDLE is None
+
+
+_SH_BYTES = b"\x0a\x0d\x0d\x0a"
+_SWAPPED_SH_BYTES = b"\x4d\x3c\xb2\xa1"
+
+
+class TestResolveComposeFiles:
+    """Compose overlay selection and mapping consistency (T027)."""
+
+    _BASE = "docker-compose.base.yml"
+    _CAPTURE = "docker-compose.features-capture.yml"
+
+    def test_plain(self):
+        assert common.resolve_compose_files(
+            common.ZKAuthMode.PLAIN, (common.ZKFeature.STANDARD,)
+        ) == [self._BASE]
+
+    @pytest.mark.parametrize(
+        "auth,overlay",
+        [
+            (common.ZKAuthMode.DIGEST, "docker-compose.auth-digest.yml"),
+            (
+                common.ZKAuthMode.SASL_DIGEST,
+                "docker-compose.auth-sasl-digest.yml",
+            ),
+            (
+                common.ZKAuthMode.SASL_GSSAPI,
+                "docker-compose.auth-sasl-gssapi.yml",
+            ),
+            (common.ZKAuthMode.TLS, "docker-compose.auth-tls.yml"),
+        ],
+    )
+    def test_auth_overlays(self, auth, overlay):
+        assert common.resolve_compose_files(
+            auth, (common.ZKFeature.STANDARD,)
+        ) == [self._BASE, overlay]
+
+    def test_capture_overlay(self):
+        assert common.resolve_compose_files(
+            common.ZKAuthMode.PLAIN, (common.ZKFeature.CAPTURE,)
+        ) == [self._BASE, self._CAPTURE]
+
+    def test_auth_and_capture_combo(self):
+        assert common.resolve_compose_files(
+            common.ZKAuthMode.TLS,
+            (common.ZKFeature.STANDARD, common.ZKFeature.CAPTURE),
+        ) == [self._BASE, "docker-compose.auth-tls.yml", self._CAPTURE]
+
+    def test_capture_not_in_feature_jvm_properties(self):
+        assert common.ZKFeature.CAPTURE not in common.FEATURE_JVM_PROPERTIES
+
+    def test_auth_jvm_flags_cover_all_modes(self):
+        assert set(common.AUTH_JVM_FLAGS) == set(common.ZKAuthMode)
+
+
+class TestTlsKeylogAssembly:
+    """Teardown keylog assembly (T028)."""
+
+    def test_no_capture_returns_none(self, tmp_path):
+        assert (
+            common._assemble_tls_keylog(
+                tmp_path,
+                common.ZKAuthMode.TLS,
+                (common.ZKFeature.STANDARD,),
+            )
+            is None
+        )
+
+    def test_capture_non_tls_returns_none(self, tmp_path):
+        assert (
+            common._assemble_tls_keylog(
+                tmp_path,
+                common.ZKAuthMode.PLAIN,
+                (common.ZKFeature.CAPTURE,),
+            )
+            is None
+        )
+
+    def test_assembles_keylog_and_certs(self, tmp_path):
+        workdir = tmp_path / "work"
+        (workdir / "logs" / "zk1").mkdir(parents=True)
+        (workdir / "logs" / "zk2").mkdir(parents=True)
+        (workdir / "logs" / "zk1" / "tls-secrets.log").write_bytes(
+            b"CLIENT_HANDSHAKE_TRAFFIC_SECRET 1\n"
+        )
+        (workdir / "logs" / "zk2" / "tls-secrets.log").write_bytes(b"")
+        certs = workdir / "certs"
+        (certs / "server").mkdir(parents=True)
+        (certs / "server" / "server.pem").write_bytes(b"SERVER")
+        (certs / "cacert.pem").write_bytes(b"CA")
+
+        emitted = common._assemble_tls_keylog(
+            workdir, common.ZKAuthMode.TLS, (common.ZKFeature.CAPTURE,)
+        )
+        assert emitted is not None
+        keylog = workdir / "captures" / "tls" / "zk-secrets.log"
+        assert keylog.exists()
+        assert b"CLIENT_HANDSHAKE_TRAFFIC_SECRET" in keylog.read_bytes()
+        assert (workdir / "captures" / "tls" / "server-cert.pem").is_file()
+        assert (workdir / "captures" / "tls" / "ca.pem").is_file()
+        assert emitted[0] == keylog
+        assert len(emitted) == 3
+
+    def test_empty_keylog_no_certs_returns_none(self, tmp_path):
+        workdir = tmp_path / "work"
+        workdir.mkdir()
+        assert (
+            common._assemble_tls_keylog(
+                workdir, common.ZKAuthMode.TLS, (common.ZKFeature.CAPTURE,)
+            )
+            is None
+        )
+
+
+class TestProbeReadableCaptures:
+    """Interrupted-session artifact probing (T028)."""
+
+    def test_missing_dir_empty(self, tmp_path):
+        assert common.probe_readable_captures(tmp_path) == []
+
+    def test_returns_readable_newest_per_member(self, tmp_path):
+        captures = tmp_path / "captures"
+        captures.mkdir()
+        (captures / "kazoo-client-zoo1-1.pcapng").write_bytes(
+            _SH_BYTES + b"xx"
+        )
+        (captures / "kazoo-client-zoo2-1.pcapng").write_bytes(
+            _SWAPPED_SH_BYTES + b"xx"
+        )
+        (captures / "kazoo-client-zoo3-1.pcapng").write_bytes(
+            b"\x00\x00\x00\x00"
+        )
+        readable = common.probe_readable_captures(tmp_path)
+        assert readable == [
+            "kazoo-client-zoo1-1.pcapng",
+            "kazoo-client-zoo2-1.pcapng",
+        ]
+
+    def test_unreadable_open_is_tolerated(self, tmp_path):
+        captures = tmp_path / "captures"
+        captures.mkdir()
+        (captures / "kazoo-client-zoo1-dir.pcapng").mkdir()
+        readable = common.probe_readable_captures(tmp_path)
+        assert readable == []
+
+
+class TestKrb5Conf:
+    """Host-view krb5.conf generation (T029)."""
+
+    def test_writes_kdc_line(self, tmp_path):
+        conf = common._write_host_krb5_conf(tmp_path, "127.0.0.1", 16888)
+        assert conf == tmp_path / "krb5.client.conf"
+        content = conf.read_text(encoding="utf-8")
+        assert "default_realm = EXAMPLE.ORG" in content
+        assert "kdc = 127.0.0.1:16888" in content

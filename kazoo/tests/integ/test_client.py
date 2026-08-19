@@ -1097,7 +1097,7 @@ class TestClient:
         finally:
             client.stop()
 
-    # Flaky under the docker-compose harness: the password-mangling approach
+    # Flaky under the compose harness: the password-mangling approach
     # assumes a server-side session won't survive the node restart, but ZK 3.9
     # persists sessions (closeSessionTxn, see server logs "Committing global
     # session ...") and its quorum peers reintroduce them on `compose start`.

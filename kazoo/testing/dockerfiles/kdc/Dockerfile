@@ -11,7 +11,7 @@
 #
 # /kdc-data is shared with the host via a ${ZK_WORK_DIR} bind mount so the
 # zoo servers can mount the keytabs and the host test process can read them
-# (FR-011, R-08).
+#
 
 FROM alpine:3.20
 
@@ -22,7 +22,7 @@ RUN apk add --no-cache krb5 krb5-server tini
 # The entrypoint runs as root: /kdc-data is a bind mount of the host-owned
 # ${ZK_WORK_DIR} (created by pytest with 0700 host perms), so an unprivileged
 # UID inside the container could not create the principal DB/keytabs there.
-# The KDC is a throwaway test sidecar (FR-013), and the entrypoint explicitly
+# The KDC is a throwaway test sidecar, and the entrypoint explicitly
 # chmods its outputs world-readable for the host-side test process.
 COPY --chown=daemon:daemon root/ /
 

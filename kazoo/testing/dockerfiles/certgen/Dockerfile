@@ -14,7 +14,7 @@
 #
 # The ZooKeeper servers mount keystore/truststore at /conf/keystore.p12 and
 # /conf/truststore.p12; the host-side test process reads client creds from
-# ${ZK_WORK_DIR}/certs (FR-011, R-05). Everything under /certs is chmod 755/644
+# ${ZK_WORK_DIR}/certs. Everything under /certs is chmod 755/644
 # so the host can read it regardless of UID.
 #
 # eclipse-temurin is used because it ships both `openssl` (via the base image)

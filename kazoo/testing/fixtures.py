@@ -105,7 +105,7 @@ def pytest_collection_modifyitems(
     """Apply collection-time skip evaluation for the axis markers.
 
     Incompatible tests are skipped before any client/ensemble is spun up, so
-    they never attempt connections (FR-008, SC-005). The legacy
+    they never attempt connections. The legacy
     ``skip_if_zk_version`` marker keeps its function-scoped evaluation via the
     ``check_skip_version_marker`` autouse fixture.
     """
@@ -119,16 +119,16 @@ def pytest_collection_modifyitems(
 def pytest_sessionfinish(
     session: pytest.Session, exitstatus: int | pytest.ExitCode
 ) -> None:
-    """Document the interrupted-session artifact guarantee (quickstart V9).
+    """Document interrupted-capture artifact survival.
 
     When a capture-enabled run is interrupted mid-suite (keyboard interrupt),
-    Docker's ``down`` teardown still runs the session fixture (R-05/R-07), so
-    the capture sidecars receive SIGTERM and flush their pcapng files before
-    exiting. The bind-mounted artifacts therefore survive the interruption as
-    readable *partial* files (FR-003 edge). This hook verifies that reality
-    post-hoc: on interruption it best-effort probes the newest per-member
-    pcapng for a readable Section Header Block and reports it. Best-effort
-    only — the run is already interrupted and must never turn into a failure.
+    Docker's ``down`` teardown still runs the session fixture, so the capture
+    sidecars receive SIGTERM and flush their pcapng files before exiting. The
+    bind-mounted artifacts therefore survive the interruption as readable
+    *partial* files. This hook verifies that reality post-hoc: on interruption
+    it best-effort probes the newest per-member pcapng for a readable Section
+    Header Block and reports it. Best-effort only — the run is already
+    interrupted and must never turn into a failure.
     """
     if exitstatus != getattr(pytest.ExitCode, "INTERRUPTED", 130):
         return
@@ -155,12 +155,12 @@ def docker_env(
     # Compose interpolates ${ZK_WORK_DIR} into bind-mount sources. Host-side
     # file ops below keep the native Path; the env var is what compose hands
     # to the daemon, so it may need translation to a daemon-visible mount
-    # path on Windows-remotes (see _daemon_mount_path) (FR-011).
+    # path on Windows-remotes (see _daemon_mount_path).
     os.environ["ZK_WORK_DIR"] = common._daemon_mount_path(tmp_path)
     # Unique per-session compose project name keeps parallel test runs (and
     # any stray stacks from other projects) isolated from each other.
     os.environ["COMPOSE_PROJECT_NAME"] = f"kazoo-{uuid.uuid4().hex[:8]}"
-    # Failure-injection tests (FR-009) stop and restart individual ensemble
+    # Failure-injection tests stop and restart individual ensemble
     # members via `docker compose stop`/`start`. Docker re-randomizes
     # ephemeral host port mappings (`0:2181`) every time a container is
     # restarted, which would silently break those tests: the client keeps
@@ -242,7 +242,7 @@ def docker_compose(
     # Relative bind-mount sources in the compose overlays (./jaas/...) are
     # interpolated through ${ZK_COMPOSE_DIR} so they can be translated to a
     # daemon-visible mount path on Windows-remote setups, exactly like
-    # ${ZK_WORK_DIR} above (FR-011).
+    # ${ZK_WORK_DIR} above.
     os.environ["ZK_COMPOSE_DIR"] = common._daemon_mount_path(context_path)
     common._ensure_docker_available(context)
 
@@ -251,9 +251,9 @@ def docker_compose(
         compose_file_name=docker_compose_config["compose_files"],
     )
 
-    # Capture preflight (R-07): when `capture` is active, build the in-repo
-    # image declared by the capture overlay (dockerfiles/capture) *before*
-    # `up`, so a build failure aborts the session with an actionable message
+    # Capture preflight: when `capture` is active, build the in-repo image
+    # declared by the capture overlay (dockerfiles/capture) *before* `up`,
+    # so a build failure aborts the session with an actionable message
     # instead of failing opaquely mid-`up` (a network/registry outage for
     # `apk` tshark is reported here).
     if common.ZKFeature.CAPTURE in docker_compose_config["features"]:
@@ -280,7 +280,7 @@ def docker_compose(
         # became healthy), so `down --volumes` always cleans up the stack.
         if request.session.testsfailed:
             common.dump_ensemble_logs()
-        # Assemble the TLS keylog + context certs (R-02/R-09) before the stack
+        # Assemble the TLS keylog + context certs before the stack
         # goes down, so the decryption material for the pcapng artifacts is
         # available after teardown. No-op on non-tls/non-capture runs.
         emitted = common._assemble_tls_keylog(
@@ -289,12 +289,11 @@ def docker_compose(
         if emitted:
             paths = ", ".join(map(str, emitted))
             print(f"[kazoo] capture keylog artifacts: {paths}")
-        # Teardown never deletes capture artifacts (FR-009, R-05): `down
-        # --volumes` removes only *named compose volumes* (the tmpfs zooN data
-        # volumes), never the bound directories under ${ZK_WORK_DIR}
-        # (captures/, logs/, certs/, agent/), so the pcapngs + decryption
-        # material survive unchanged and remain on disk after the session for
-        # analysis (quickstart V1/V2). See contracts/artifacts.md.
+        # Teardown never deletes capture artifacts: `down --volumes` removes
+        # only *named compose volumes* (the tmpfs zooN data volumes), never the
+        # bound directories under ${ZK_WORK_DIR} (captures/, logs/, certs/,
+        # agent/), so the pcapngs + decryption material survive unchanged and
+        # remain on disk after the session for analysis.
         common.set_compose_handle(None)
         compose.stop()
 

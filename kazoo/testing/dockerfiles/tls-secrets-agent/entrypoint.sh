@@ -11,7 +11,7 @@
 #
 # The ZooKeeper servers mount ${ZK_WORK_DIR}/agent read-only and depend on this
 # service becoming healthy, which guarantees the `-javaagent:` jar exists
-# before any JVM starts (R-10).
+# before any JVM starts.
 
 set -eu
 

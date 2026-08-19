@@ -1,11 +1,8 @@
-"""SASL authentication tests migrated from the legacy test_sasl.py module.
+"""SASL authentication integration tests for the compose harness.
 
-The legacy file exercised SASL against a ZK cluster started with
-``ZOOKEEPER_JAAS_AUTH`` and the ``KRB5_TEST_ENV``/``init_krb5.sh`` GSSAPI
-setup, both of which have been retired (T033/US5). The compose harness now
-provides the ``sasl_digest`` and ``sasl_gssapi`` auth axes (US3) with a KDC
-sidecar replacing the host keytab dance, so the groups below map onto those
-flavors:
+The harness provides the ``sasl_digest`` and ``sasl_gssapi`` auth axes with a
+KDC sidecar replacing the host keytab dance, and the groups below map onto
+those flavors:
 
 * ``TestLegacySASLDigestAuthentication`` -- the legacy
   ``auth_data=[("sasl", "user:pass")]`` string form (the deprecated but still
@@ -20,6 +17,7 @@ tested the same way as in ``test_auth.py``: give a znode a SASL ACL for one
 principal and assert a client authenticated under a *different* principal is
 denied with ``NoAuthError``.
 """
+
 from __future__ import annotations
 
 import time

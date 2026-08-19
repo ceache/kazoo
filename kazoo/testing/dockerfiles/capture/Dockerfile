@@ -1,4 +1,4 @@
-# In-repo capture image: tshark on Alpine (R-03, FR-009/FR-010).
+# In-repo capture image: tshark on Alpine.
 #
 # The host needs no capture tooling; everything runs here, inside a member's
 # network namespace, mirroring the KDC/certgen pattern.
@@ -13,7 +13,7 @@
 # participation at all. The network-namespace holder (zooN, see
 # docker-compose.base.yml) keeps the netns — and therefore this tap — alive
 # across `zooN-service` stop/start cycles, so failure-injection tests never
-# interrupt the capture (FR-009); a fresh unique-named output file per
+# interrupt the capture; a fresh unique-named output file per
 # invocation keeps the collection lossless if the sidecar container itself is
 # ever recreated (see capture-entrypoint.sh).
 #
