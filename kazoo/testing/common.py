@@ -19,7 +19,8 @@ import re
 import shutil
 import subprocess
 import sys
-from typing import TYPE_CHECKING
+from threading import Event
+from typing import TYPE_CHECKING, Any, Callable
 
 if sys.version_info >= (3, 11):
     from enum import StrEnum
@@ -41,14 +42,20 @@ from kazoo.protocol.connection import (
 from kazoo.protocol.states import KazooState
 
 if TYPE_CHECKING:
-    from typing import (
-        Any,
-        Callable,
-    )
-    from threading import Event
     from testcontainers.compose import DockerCompose
 
     from kazoo.client import KazooClient
+else:
+    # Runtime stand-ins so sphinx-autodoc can resolve the quoted forward
+    # references above when it evaluates annotations: kazoo.testing must not
+    # import kazoo.client at runtime, and the docs env ships no testcontainers.
+    # They are never used at runtime; type checkers only see the TYPE_CHECKING
+    # imports.
+    class DockerCompose:
+        pass
+
+    class KazooClient:
+        pass
 
 
 # The three testing axes. The "auth" axis selects the docker-compose flavor
