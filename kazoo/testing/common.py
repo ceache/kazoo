@@ -135,12 +135,7 @@ def resolve_axis_options(
     auth_opt: str | None,
     features_opt: str | None,
     environ: dict[str, str],
-) -> tuple[
-    str,
-    ZKAuthMode,
-    tuple[ZKFeature, ...],
-    dict[str, str],
-]:
+) -> tuple[str, ZKAuthMode, tuple[ZKFeature, ...], dict[str, str],]:
     """Resolve the three axes from CLI options and environment variables.
 
     Returns the resolved (version, auth, features) triple together with the
