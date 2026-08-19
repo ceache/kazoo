@@ -240,7 +240,7 @@ jobs:
           fi
 
       # Host Kerberos client for the sasl_gssapi axis: kinit must be on PATH
-      # (kazoo_ensemble.py invokes it for the KDC sidecar) and libkrb5-dev is
+      # (kazoo.testing invokes it for the KDC sidecar) and libkrb5-dev is
       # required to compile the `kerberos` python module from sdist.
       - name: Install Kerberos client tools
         if: matrix.axis == 'sasl_gssapi'

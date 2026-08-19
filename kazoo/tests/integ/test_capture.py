@@ -4,7 +4,7 @@ These tests validate the network-capture feature (see
 ``specs/002-network-capture/``) from inside a capture-enabled session. They
 are written to run **only** when ``--zk-features=capture`` is active and are
 skipped otherwise by the existing ``zk_features`` marker machinery
-(``kazoo.testing.kazoo_ensemble``), so the same file is safe in every matrix
+(``kazoo.testing.fixtures``), so the same file is safe in every matrix
 cell.
 
 * ``test_capture_feature_active`` -- the axis wiring (R-04): the capture
@@ -66,7 +66,7 @@ from pathlib import Path
 
 import pytest
 
-from kazoo.testing.kazoo_ensemble import (
+from kazoo.testing.common import (
     ZKFeature,
     _assemble_tls_keylog,
     _evaluate_axis_markers,

@@ -5,8 +5,14 @@
 
 .. automodule:: kazoo.testing
 
-The test harness module
-+++++++++++++++++++++++
+The harness business logic
+++++++++++++++++++++++++++
 
-.. automodule:: kazoo.testing.kazoo_ensemble
+.. automodule:: kazoo.testing.common
+    :members:
+
+The pytest fixtures
++++++++++++++++++++
+
+.. automodule:: kazoo.testing.fixtures
     :members:

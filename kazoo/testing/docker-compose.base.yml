@@ -18,7 +18,7 @@
 # overlay files, where docker-compose's wholesale environment-merge would
 # silently override the base value.
 #
-# The host side (see kazoo/testing/kazoo_ensemble.py) sets:
+# The host side (see kazoo.testing) sets:
 #   * ZK_VERSION            -> image tag (e.g. "3.9.5")
 #   * ZK_WORK_DIR           -> host directory mounted at /logs (per node)
 #   * ZK_FEATURES_JVMFLAGS  -> space-separated feature JVM flags ("" for plain)

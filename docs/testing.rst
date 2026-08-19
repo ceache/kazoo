@@ -24,7 +24,8 @@ Install the project with the test extras:
 
     pip install -e '.[test]'
 
-The harness is implemented in :mod:`kazoo.testing.kazoo_ensemble`. The
+The harness is implemented in :mod:`kazoo.testing.common` (business logic)
+and :mod:`kazoo.testing.fixtures` (pytest fixtures and plugin hooks). The
 `legacy <https://docs.python.org/3/library/unittest.html>`_ ``KazooTestHarness`` /
 ``KazooTestCase`` API was removed; use the pytest fixtures below instead
 (see `CHANGES.md <https://github.com/python-zk/kazoo/blob/main/CHANGES.md>`_
@@ -33,14 +34,14 @@ under BREAKING CHANGES).
 Entry point
 ===========
 
-The :class:`~kazoo.testing.kazoo_ensemble.ZkEnsemble` class and the fixtures
+The :class:`~kazoo.testing.common.ZkEnsemble` class and the fixtures
 it provides are registered as a pytest plugin. To use the harness in your own
-``pytest`` suite, import the fixtures from the ensemble module in your
-``conftest.py`` (fixtures are plain functions that receive the ensemble):
+``pytest`` suite, import the fixtures from :mod:`kazoo.testing.fixtures` in
+your ``conftest.py`` (fixtures are plain functions that receive the ensemble):
 
 .. code-block:: python
 
-    from kazoo.testing import kazoo_ensemble
+    from kazoo.testing.fixtures import zkensemble, zkclient, zkchroot
 
 Fixtures
 ========
@@ -48,7 +49,7 @@ Fixtures
 ``zkensemble``
     Session-scoped. Starts a three-node ZooKeeper ensemble via
     ``docker compose up --wait`` and tears it down (``down --volumes``) at
-    session end. Yields a :class:`~kazoo.testing.kazoo_ensemble.ZkEnsemble`
+    session end. Yields a :class:`~kazoo.testing.common.ZkEnsemble`
     that can create and manage clients, stop/start individual ensemble
     members (for failure-injection tests), and expose the resolved axis
     configuration.
@@ -103,7 +104,7 @@ honors an environment variable):
 Compose layout
 ==============
 
-The compose files live in ``kazoo/tests/integ/``:
+The compose files live in ``kazoo/testing/``:
 
 * ``docker-compose.base.yml`` — the base three-node ensemble (ephemeral
   ports, tmpfs data dirs, healthcheck).
@@ -116,8 +117,8 @@ The compose files live in ``kazoo/tests/integ/``:
   KDC for the GSSAPI axis, the capture ``tshark`` sidecars, and the
   ``tls-secrets-agent`` keylog provisioner.
 
-The active overlay set is resolved by ``docker_compose_config()`` in
-``kazoo/tests/integ/conftest.py`` and the ensemble is driven through
+The active overlay set is resolved by the ``docker_compose_config`` fixture
+in :mod:`kazoo.testing.fixtures` and the ensemble is driven through
 `testcontainers <https://testcontainers-python.readthedocs.io>`_
 (:class:`testcontainers.compose.DockerCompose`).
 
@@ -144,7 +145,7 @@ compose project assembled from a base file plus optional overlays:
 2. **JVM flags are interpolated host-side** — feature flags (``-Dzookeeper.ttl.enabled``,
    read-only ``true``, ``-Dzookeeper.dynamicConfigFile=...``) and auth flags
    (the digest ``superDigest``, TLS/GSSAPI quorum config) are computed in
-   ``kazoo/testing/kazoo_ensemble.py`` and injected into
+   ``kazoo/testing/common.py`` and injected into
    ``SERVER_JVMFLAGS`` **here in the base file** via ``${ZK_FEATURES_JVMFLAGS}``
    and ``${ZK_AUTH_JVMFLAGS}``. Deliberately not composed across overlay files:
    docker-compose merges an ``environment`` map wholesale by key, so a cross-file
@@ -156,7 +157,7 @@ compose project assembled from a base file plus optional overlays:
    base interpolation): ``sasl-digest`` binds ``jaas/sasl-digest.conf`` and set
    ``JVMFLAGS`` for the login module, ``tls`` spins up a certgen container that
    materializes the throwaway PKI, and ``sasl-gssapi`` adds the in-repo Alpine
-   KDC (_kazoo/tests/integ/dockerfiles/kdc_) plus a gssapi init sidecar that
+   KDC (_kazoo/testing/dockerfiles/kdc_) plus a gssapi init sidecar that
    provisions the realm, keytabs and the server JAAS. ``digest`` declares no
    services at all — it is configured purely by the host-side ``superDigest``
    interpolation.

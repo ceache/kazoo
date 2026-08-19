@@ -4,7 +4,8 @@
 #### BREAKING CHANGES
 
 * **testing:**
-  *  the legacy `kazoo.testing` public API (`KazooTestCase`, `KazooTestHarness`) is removed; integration tests now use the `kazoo.testing.kazoo_ensemble` pytest fixtures (`zkclient`, `zkensemble`, `zkchroot`, ...) that orchestrate a Docker-Compose ZooKeeper ensemble. The test harness now requires Python >= 3.9 with `testcontainers` and docker-compose (FR-010, constitution IV)
+  *  the legacy `kazoo.testing` public API (`KazooTestCase`, `KazooTestHarness`) is removed; integration tests now use the `kazoo.testing` pytest fixtures (`zkclient`, `zkensemble`, `zkchroot`, ...) that orchestrate a Docker-Compose ZooKeeper ensemble. The test harness now requires Python >= 3.9 with `testcontainers` and docker-compose (FR-010, constitution IV)
+  *  `kazoo.testing` is re-laid out: the `kazoo_ensemble` module is split into `kazoo.testing.common` (harness business logic) and `kazoo.testing.fixtures` (thin, documented pytest fixtures + plugin hooks delegating to `common`); the compose/JAAS/dockerfiles resources moved under `kazoo.testing/`
   *  drop Python 3.8 support from the test matrix; the test suite runs Python 3.9–3.14 + pypy
 
 <a name="2.11.0"></a>
