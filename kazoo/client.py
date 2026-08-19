@@ -762,7 +762,7 @@ class KazooClient(object):
             raise ConnectionLoss("No connection to server")
 
         peer = self._connection._socket.getpeername()[:2]
-        peer_host = self._connection._socket.getpeername()[1]
+        peer_host = peer[0]
         sock = self.handler.create_connection(
             peer,
             hostname=peer_host,

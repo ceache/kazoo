@@ -119,6 +119,7 @@ module = [
     'kazoo.security',
     'kazoo.testing.common',
     'kazoo.testing.fixtures',
+    'kazoo.tests.unit.test_client_command',
     'kazoo.tests.unit.test_testing',
     'kazoo.tests.integ.conftest',
     'kazoo.tests.integ.test_auth',

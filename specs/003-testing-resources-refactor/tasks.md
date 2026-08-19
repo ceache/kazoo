@@ -144,9 +144,9 @@ description: "Task list for testing resources rationalization"
 
 **Purpose**: End-to-end validation and quality gates across all stories.
 
-- [ ] T030 [P] Run `quickstart.md` V1–V8 end-to-end: import surface, removed-module greps, resource resolution, plan-reference grep, branch-coverage unit run, integration parity (plain/tls/capture), wheel+sdist inspection, `flake8`/`black -l 79 --check`/strict `mypy` on `kazoo/testing` + `kazoo/tests` (SC-007).
+- [ ] T030 [P] Run `quickstart.md` V1–V8 end-to-end: import surface, removed-module greps, resource resolution, plan-reference grep, branch-coverage unit run, integration parity (plain/tls/capture), wheel+sdist inspection, `flake8`/`black -l 79 --check`/strict `mypy` on `kazoo/testing` + `kazoo/tests` (SC-007). **V6 done**: plain 375/33, tls 377/31, capture 379/29 (all green); blocked on the tls axis was a pre-existing `KazooClient.command()` peer-host bug (fixed + regression-tested) — see `integ-baseline-notes.md` (local/uncommitted).
 - [ ] T031 [P] Confirm `docs/testing.rst`/`docs/api/testing.rst` doc build resolves the new module targets (`sphinx-build -b html docs docs/_build`, no new warnings).
-- [ ] T032 [P] Verify SC-001 parity by comparing post-refactor integ outcomes against the T002 baseline (plain/tls/capture) — counts must be identical.
+- [ ] T032 [P] Verify SC-001 parity by comparing post-refactor integ outcomes against the T002 baseline (plain/tls/capture) — counts must be identical. Baseline notes (T002) recorded in the local, uncommitted `integ-baseline-notes.md`; no pre-refactor counts exist to diff against (refactor work was already merged when the notes file was created), so T030-V6 green counts serve as the reference.
 - [ ] T033 Push the branch and confirm the `test_windows` CI job passes (quickstart V9): the WSL2 dockerd path resolves the compose context from the installed `kazoo.testing` package with `_daemon_mount_path` translation intact.
 
 ---
