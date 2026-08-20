@@ -1,316 +1,333 @@
+from __future__ import annotations
+
+import socket
 import threading
+import unittest
+
+from typing import Any, Type
 from unittest.mock import Mock
 
 import pytest
 
-from kazoo.handlers import threading as threading_handler
-from kazoo.handlers import utils
+from kazoo.handlers.threading import AsyncResult, SequentialThreadingHandler
+from kazoo.handlers.utils import create_tcp_socket
 
 
-def test_proper_threading():
-    """Test that the handler uses the correct threading event class."""
-    h = threading_handler.SequentialThreadingHandler()
-    h.start()
-    # In Python 3.3 _Event is gone, before Event is a function
-    event_class = getattr(threading, "_Event", threading.Event)
-    assert isinstance(h.event_object(), event_class)
-    h.stop()
+class TestThreadingHandler(unittest.TestCase):
+    def _makeOne(self, *args: Any) -> SequentialThreadingHandler:
+        return SequentialThreadingHandler(*args)
 
+    def _getAsync(self) -> Type[AsyncResult]:
+        return AsyncResult
 
-def test_matching_async():
-    """Test that the handler's async_result method returns an AsyncResult."""
-    h = threading_handler.SequentialThreadingHandler()
-    h.start()
-    assert isinstance(h.async_result(), threading_handler.AsyncResult)
-    h.stop()
-
-
-def test_exception_raising():
-    """Test that timeout exceptions can be raised correctly."""
-    h = threading_handler.SequentialThreadingHandler()
-    with pytest.raises(h.timeout_exception):
-        raise h.timeout_exception("This is a timeout")
-
-
-def test_double_start_stop():
-    """Test that starting/stopping the handler multiple times is safe."""
-    h = threading_handler.SequentialThreadingHandler()
-    h.start()
-    assert h._running is True
-    h.start()  # should be a no-op
-    h.stop()
-    assert not h._running
-    h.stop()  # should be a no-op
-
-
-def test_huge_file_descriptor():
-    """Test that the handler can select() on a large number of fds."""
-    try:
-        import resource
-    except ImportError:
-        pytest.skip("resource module unavailable on this platform")
-    import socket
-
-    try:
-        # Increase the max number of open file descriptors
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        resource.setrlimit(resource.RLIMIT_NOFILE, (4096, hard))
-    except (ValueError, resource.error):
-        pytest.skip("couldn't raise fd limit high enough")
-
-    socks = []
-    try:
-        # Create a large number of sockets
-        while len(socks) < 4000:
-            sock = utils.create_tcp_socket(socket)
-            if sock.fileno() >= 4000:
-                socks.append(sock)
-                break
-            socks.append(sock)
-
-        h = threading_handler.SequentialThreadingHandler()
+    def test_proper_threading(self) -> None:
+        h = self._makeOne()
         h.start()
-        # This should not raise an error
+        # In Python 3.3 _Event is gone, before Event is function
+        event_class = getattr(threading, "_Event", threading.Event)
+        assert isinstance(h.event_object(), event_class)
+
+    def test_matching_async(self) -> None:
+        h = self._makeOne()
+        h.start()
+        async_result = self._getAsync()
+        assert isinstance(h.async_result(), async_result)
+
+    def test_exception_raising(self) -> None:
+        h = self._makeOne()
+
+        with pytest.raises(h.timeout_exception):
+            raise h.timeout_exception("This is a timeout")
+
+    def test_double_start_stop(self) -> None:
+        h = self._makeOne()
+        h.start()
+        assert h._running is True
+        h.start()
+        h.stop()
+        h.stop()
+        assert h._running is False
+
+    def test_huge_file_descriptor(self) -> None:
+        try:
+            import resource
+        except ImportError:
+            self.skipTest("resource module unavailable on this platform")
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (4096, 4096))
+        except (ValueError, resource.error):
+            self.skipTest("couldn't raise fd limit high enough")
+        fd = 0
+        socks = []
+        while fd < 4000:
+            sock = create_tcp_socket(socket)
+            fd = sock.fileno()
+            socks.append(sock)
+        h = self._makeOne()
+        h.start()
         h.select(socks, [], [], 0)
         h.stop()
-    finally:
-        # Clean up all the created sockets
         for sock in socks:
             sock.close()
 
 
-@pytest.fixture
-def mock_handler():
-    """Fixture to provide a mocked handler with a completion_queue."""
-    handler = Mock()
-    handler.completion_queue = Mock()
-    return handler
+class TestThreadingAsync(unittest.TestCase):
+    def _makeOne(self, *args: Any) -> AsyncResult:
+        return AsyncResult(*args)
 
+    def _makeHandler(self) -> SequentialThreadingHandler:
+        return SequentialThreadingHandler()
 
-@pytest.fixture
-def async_result(mock_handler):
-    """Fixture to provide an AsyncResult instance."""
-    return threading_handler.AsyncResult(mock_handler)
+    def test_ready(self) -> None:
+        mock_handler = Mock()
+        async_result = self._makeOne(mock_handler)
 
-
-class TestAsyncResult:
-    def test_ready(self, async_result):
-        """Test the ready() and successful() states."""
-        assert not async_result.ready()
+        assert async_result.ready() is False
         async_result.set("val")
-        assert async_result.ready()
-        assert async_result.successful()
+        assert async_result.ready() is True
+        assert async_result.successful() is True
         assert async_result.exception is None
 
-    def test_callback_queued(self, async_result, mock_handler):
-        """Test that a callback is queued when the result is set."""
+    def test_callback_queued(self) -> None:
+        mock_handler = Mock()
+        mock_handler.completion_queue = Mock()
+        async_result = self._makeOne(mock_handler)
+
         async_result.rawlink(lambda a: a)
         async_result.set("val")
-        mock_handler.completion_queue.put.assert_called_once()
 
-    def test_set_exception(self, async_result, mock_handler):
-        """Test setting an exception on the result."""
+        assert mock_handler.completion_queue.put.called
+
+    def test_set_exception(self) -> None:
+        mock_handler = Mock()
+        mock_handler.completion_queue = Mock()
+        async_result = self._makeOne(mock_handler)
         async_result.rawlink(lambda a: a)
         async_result.set_exception(ImportError("Error occurred"))
+
         assert isinstance(async_result.exception, ImportError)
-        mock_handler.completion_queue.put.assert_called_once()
+        assert mock_handler.completion_queue.put.called
 
-    def test_get_wait_while_setting(self, mock_handler):
-        """Test that get() blocks until a value is set from another thread."""
-        async_result = threading_handler.AsyncResult(mock_handler)
-        result_list = []
-        before_get = threading.Event()
-        after_set = threading.Event()
+    def test_get_wait_while_setting(self) -> None:
+        mock_handler = Mock()
+        async_result = self._makeOne(mock_handler)
 
-        def wait_for_val():
-            before_get.set()
+        lst = []
+        bv = threading.Event()
+        cv = threading.Event()
+
+        def wait_for_val() -> None:
+            bv.set()
             val = async_result.get()
-            result_list.append(val)
-            after_set.set()
+            lst.append(val)
+            cv.set()
 
-        thread = threading.Thread(target=wait_for_val)
-        thread.start()
-        before_get.wait(timeout=5)  # Wait for thread to be ready
+        th = threading.Thread(target=wait_for_val)
+        th.start()
+        bv.wait()
 
         async_result.set("fred")
-        after_set.wait(timeout=5)  # Wait for thread to complete
-        assert result_list == ["fred"]
-        thread.join()
+        cv.wait()
+        assert lst == ["fred"]
+        th.join()
 
-    def test_get_with_nowait(self):
-        """Test non-blocking get() raises a timeout."""
-        handler = threading_handler.SequentialThreadingHandler()
-        async_result = threading_handler.AsyncResult(handler)
-        timeout_exc = handler.timeout_exception
+    def test_get_with_nowait(self) -> None:
+        mock_handler = Mock()
+        async_result = self._makeOne(mock_handler)
+        timeout = self._makeHandler().timeout_exception
 
-        with pytest.raises(timeout_exc):
+        with pytest.raises(timeout):
             async_result.get(block=False)
 
-        with pytest.raises(timeout_exc):
+        with pytest.raises(timeout):
             async_result.get_nowait()
 
-    def test_get_with_exception(self, mock_handler):
-        """Test that get() raises an exception if one was set."""
-        async_result = threading_handler.AsyncResult(mock_handler)
-        result_list = []
-        before_get = threading.Event()
-        after_set = threading.Event()
+    def test_get_with_exception(self) -> None:
+        mock_handler = Mock()
+        async_result = self._makeOne(mock_handler)
 
-        def wait_for_val():
-            before_get.set()
+        lst = []
+        bv = threading.Event()
+        cv = threading.Event()
+
+        def wait_for_val() -> None:
+            bv.set()
             try:
                 val = async_result.get()
-                result_list.append(val)
             except ImportError:
-                result_list.append("oops")
-            finally:
-                after_set.set()
+                lst.append("oops")
+            else:
+                lst.append(val)
+            cv.set()
 
-        thread = threading.Thread(target=wait_for_val)
-        thread.start()
-        before_get.wait(timeout=5)
+        th = threading.Thread(target=wait_for_val)
+        th.start()
+        bv.wait()
 
-        async_result.set_exception(ImportError)
-        after_set.wait(timeout=5)
-        assert result_list == ["oops"]
-        thread.join()
+        async_result.set_exception(ImportError())
+        cv.wait()
+        assert lst == ["oops"]
+        th.join()
 
-    def test_wait(self, mock_handler):
-        """Test that wait() blocks until the result is ready."""
-        async_result = threading_handler.AsyncResult(mock_handler)
-        result_list = []
-        before_wait = threading.Event()
-        after_wait = threading.Event()
+    def test_wait(self) -> None:
+        mock_handler = Mock()
+        async_result = self._makeOne(mock_handler)
 
-        def wait_for_val():
-            before_wait.set()
-            is_ready = async_result.wait(timeout=10)
-            result_list.append(is_ready)
-            after_wait.set()
+        lst: list[bool | str] = []
+        bv = threading.Event()
+        cv = threading.Event()
 
-        thread = threading.Thread(target=wait_for_val)
-        thread.start()
-        before_wait.wait(timeout=5)
+        def wait_for_val() -> None:
+            bv.set()
+            try:
+                val = async_result.wait(10)
+            except ImportError:
+                lst.append("oops")
+            else:
+                lst.append(val)
+            cv.set()
+
+        th = threading.Thread(target=wait_for_val)
+        th.start()
+        bv.wait(10)
 
         async_result.set("fred")
-        after_wait.wait(timeout=15)
-        assert result_list == [True]
-        thread.join()
+        cv.wait(15)
+        assert lst == [True]
+        th.join()
 
-    def test_wait_race(self, mock_handler):
-        """Test against race condition in IAsyncResult.wait()."""
-        # Guards against the reappearance of:
-        # https://github.com/python-zk/kazoo/issues/485
-        async_result = threading_handler.AsyncResult(mock_handler)
+    def test_wait_race(self) -> None:
+        """Test that there is no race condition in `IAsyncResult.wait()`.
+
+        Guards against the reappearance of:
+            https://github.com/python-zk/kazoo/issues/485
+        """
+        mock_handler = Mock()
+        async_result = self._makeOne(mock_handler)
+
         async_result.set("immediate")
-        wait_finished = threading.Event()
 
-        def wait_for_val():
-            # This should not block at all
-            async_result.wait(timeout=20)
-            wait_finished.set()
+        cv = threading.Event()
 
-        thread = threading.Thread(target=wait_for_val)
-        thread.daemon = True
-        thread.start()
+        def wait_for_val() -> None:
+            # NB: should not sleep
+            async_result.wait(20)
+            cv.set()
 
-        # If wait() didn't sleep, this will pass quickly.
-        # If it slept, this will time out.
-        wait_finished.wait(timeout=10)
-        assert wait_finished.is_set()
-        thread.join()
+        th = threading.Thread(target=wait_for_val)
+        th.daemon = True
+        th.start()
 
-    def test_set_before_wait(self, mock_handler):
-        """Test getting a value that was set before get() was called."""
-        async_result = threading_handler.AsyncResult(mock_handler)
-        result_list = []
-        after_get = threading.Event()
+        # if the wait() didn't sleep (correctly), cv will be set quickly
+        # if it did sleep, the cv will not be set yet and this will timeout
+        cv.wait(10)
+        assert cv.is_set() is True
+        th.join()
+
+    def test_set_before_wait(self) -> None:
+        mock_handler = Mock()
+        async_result = self._makeOne(mock_handler)
+
+        lst = []
+        cv = threading.Event()
         async_result.set("fred")
 
-        def wait_for_val():
+        def wait_for_val() -> None:
             val = async_result.get()
-            result_list.append(val)
-            after_get.set()
+            lst.append(val)
+            cv.set()
 
-        thread = threading.Thread(target=wait_for_val)
-        thread.start()
-        after_get.wait(timeout=5)
-        assert result_list == ["fred"]
-        thread.join()
+        th = threading.Thread(target=wait_for_val)
+        th.start()
+        cv.wait()
+        assert lst == ["fred"]
+        th.join()
 
-    def test_set_exc_before_wait(self, mock_handler):
-        """Test getting an exception that was set before get() was called."""
-        async_result = threading_handler.AsyncResult(mock_handler)
-        result_list = []
-        after_get = threading.Event()
-        async_result.set_exception(ImportError)
+    def test_set_exc_before_wait(self) -> None:
+        mock_handler = Mock()
+        async_result = self._makeOne(mock_handler)
 
-        def wait_for_val():
+        lst = []
+        cv = threading.Event()
+        async_result.set_exception(ImportError())
+
+        def wait_for_val() -> None:
             try:
                 val = async_result.get()
-                result_list.append(val)
             except ImportError:
-                result_list.append("oops")
-            finally:
-                after_get.set()
+                lst.append("ooops")
+            else:
+                lst.append(val)
+            cv.set()
 
-        thread = threading.Thread(target=wait_for_val)
-        thread.start()
-        after_get.wait(timeout=5)
-        assert result_list == ["oops"]
-        thread.join()
+        th = threading.Thread(target=wait_for_val)
+        th.start()
+        cv.wait()
+        assert lst == ["ooops"]
+        th.join()
 
-    def test_linkage(self, async_result, mock_handler):
-        """Test linking and unlinking callbacks."""
-        after_get = threading.Event()
+    def test_linkage(self) -> None:
+        mock_handler = Mock()
+        async_result = self._makeOne(mock_handler)
+        cv = threading.Event()
 
-        def add_on(res):
-            pass
+        lst = []
 
-        def wait_for_val():
+        def add_on() -> None:
+            lst.append(True)
+
+        def wait_for_val() -> None:
             async_result.get()
-            after_get.set()
+            cv.set()
 
-        thread = threading.Thread(target=wait_for_val)
-        thread.start()
+        th = threading.Thread(target=wait_for_val)
+        th.start()
 
         async_result.rawlink(add_on)
         async_result.set(b"fred")
-        mock_handler.completion_queue.put.assert_called_once()
-
+        assert mock_handler.completion_queue.put.called
         async_result.unlink(add_on)
-        after_get.wait(timeout=5)
+        cv.wait()
         assert async_result.value == b"fred"
-        thread.join()
+        th.join()
 
-    def test_linkage_not_ready(self, async_result, mock_handler):
-        """Test linking a callback after the result is already set."""
+    def test_linkage_not_ready(self) -> None:
+        mock_handler = Mock()
+        async_result = self._makeOne(mock_handler)
 
-        def add_on(res):
-            pass
+        lst = []
+
+        def add_on() -> None:
+            lst.append(True)
 
         async_result.set("fred")
-        mock_handler.completion_queue.put.assert_not_called()
+        assert not mock_handler.completion_queue.called
         async_result.rawlink(add_on)
-        mock_handler.completion_queue.put.assert_called_once()
+        assert mock_handler.completion_queue.put.called
 
-    def test_link_and_unlink(self, async_result, mock_handler):
-        """Test that unlinking a callback prevents it from being called."""
+    def test_link_and_unlink(self) -> None:
+        mock_handler = Mock()
+        async_result = self._makeOne(mock_handler)
 
-        def add_on(res):
-            pass
+        lst = []
+
+        def add_on() -> None:
+            lst.append(True)
 
         async_result.rawlink(add_on)
-        mock_handler.completion_queue.put.assert_not_called()
+        assert not mock_handler.completion_queue.put.called
         async_result.unlink(add_on)
         async_result.set("fred")
-        mock_handler.completion_queue.put.assert_not_called()
+        assert not mock_handler.completion_queue.put.called
 
-    def test_captured_exception(self, async_result):
-        """Test the capture_exceptions decorator."""
+    def test_captured_exception(self) -> None:
+        from kazoo.handlers.utils import capture_exceptions
 
-        @utils.capture_exceptions(async_result)
-        def exceptional_function():
+        mock_handler = Mock()
+        async_result = self._makeOne(mock_handler)
+
+        @capture_exceptions(async_result)
+        def exceptional_function() -> float:
             return 1 / 0
 
         exceptional_function()
@@ -318,53 +335,60 @@ class TestAsyncResult:
         with pytest.raises(ZeroDivisionError):
             async_result.get()
 
-    def test_no_capture_exceptions(self, async_result, mock_handler):
-        """Test capture_exceptions with a non-exceptional function."""
+    def test_no_capture_exceptions(self) -> None:
+        from kazoo.handlers.utils import capture_exceptions
 
-        def add_on(res):
-            pass
+        mock_handler = Mock()
+        async_result = self._makeOne(mock_handler)
+
+        lst = []
+
+        def add_on() -> None:
+            lst.append(True)
 
         async_result.rawlink(add_on)
 
-        @utils.capture_exceptions(async_result)
-        def regular_function():
+        @capture_exceptions(async_result)
+        def regular_function() -> bool:
             return True
 
         regular_function()
 
-        mock_handler.completion_queue.put.assert_not_called()
-        assert async_result.exception is None
-        assert not async_result.ready()
+        assert not mock_handler.completion_queue.put.called
 
-    def test_wraps(self, async_result, mock_handler):
-        """Test the wrap decorator."""
+    def test_wraps(self) -> None:
+        from kazoo.handlers.utils import wrap
 
-        def add_on(result):
-            pass
+        mock_handler = Mock()
+        async_result = self._makeOne(mock_handler)
+
+        lst = []
+
+        def add_on(result: AsyncResult) -> None:
+            lst.append(result.get())
 
         async_result.rawlink(add_on)
 
-        @utils.wrap(async_result)
-        def regular_function():
+        @wrap(async_result)
+        def regular_function() -> str:
             return "hello"
 
         assert regular_function() == "hello"
-        mock_handler.completion_queue.put.assert_called_once()
+        assert mock_handler.completion_queue.put.called
         assert async_result.get() == "hello"
 
-    def test_multiple_callbacks(self):
-        """Test that multiple callbacks are all called."""
+    def test_multiple_callbacks(self) -> None:
         mockback1 = Mock(name="mockback1")
         mockback2 = Mock(name="mockback2")
-        handler = threading_handler.SequentialThreadingHandler()
+        handler = self._makeHandler()
         handler.start()
 
-        async_result = threading_handler.AsyncResult(handler)
+        async_result = self._makeOne(handler)
         async_result.rawlink(mockback1)
         async_result.rawlink(mockback2)
         async_result.set("howdy")
         async_result.wait()
         handler.stop()
 
-        mockback1.assert_called_once_with(async_result)
         mockback2.assert_called_once_with(async_result)
+        mockback1.assert_called_once_with(async_result)

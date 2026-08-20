@@ -12,13 +12,11 @@ from threading import Thread
 import pytest
 
 from kazoo.exceptions import CancelledError
-from kazoo.exceptions import LockTimeout
-from kazoo.exceptions import NoNodeError
 from kazoo.recipe.lock import Lock, Semaphore
-from kazoo.testing import KazooTestCase
 from kazoo.tests import util as test_util
 
 if TYPE_CHECKING:
+    from kazoo.client import KazooClient
     from types import TracebackType
 
 
@@ -51,15 +49,34 @@ class SleepBarrier(object):
             self._sleep_func(0.001)
 
 
-class KazooLockTests(KazooTestCase):
+class TestKazooLock:
     thread_count = 20
 
-    def __init__(self, *args: None, **kw: None):
-        super(KazooLockTests, self).__init__(*args, **kw)
-        self.threads_made: list[threading.Thread] = []
+    client: KazooClient
+    threads_made: list[threading.Thread]
+    lockpath: str
+    condition: threading.Condition
+    released: threading.Event
+    active_thread: str | None
+    cancelled_threads: list[str]
 
-    def tearDown(self) -> None:
-        super(KazooLockTests, self).tearDown()
+    @pytest.fixture(autouse=True)
+    def _setup(
+        self, zkclient: KazooClient, zkensemble: Any
+    ) -> Generator[None, None, None]:
+        self.zkensemble = zkensemble
+        self.threads_made = []
+        self.lockpath = "/" + uuid.uuid4().hex
+        self.condition = self.make_condition()
+        self.released = self.make_event()
+        self.active_thread = None
+        self.cancelled_threads = []
+        # The primary client is chrooted (see the zkclient fixture);
+        # secondary clients share the same chroot so contenders line up on
+        # the same locks.
+        self.client = zkclient
+        self.chroot = zkclient.chroot
+        yield
         while self.threads_made:
             t = self.threads_made.pop()
             t.join()
@@ -82,13 +99,12 @@ class KazooLockTests(KazooTestCase):
     def make_wait() -> test_util.Wait:
         return test_util.Wait()
 
-    def setUp(self) -> None:
-        super(KazooLockTests, self).setUp()
-        self.lockpath = "/" + uuid.uuid4().hex
-        self.condition = self.make_condition()
-        self.released = self.make_event()
-        self.active_thread: str | None = None
-        self.cancelled_threads: list[str] = []
+    def _get_client(self, **opts: Any) -> KazooClient:
+        # An additional client connected to
+        # the same chrooted namespace as ``self.client``.
+        c: KazooClient = self.zkensemble.get_client(**opts)
+        c.chroot = self.chroot
+        return c
 
     def _thread_lock_acquire_til_event(
         self, name: str, lock: Lock, event: threading.Event
@@ -215,7 +231,7 @@ class KazooLockTests(KazooTestCase):
         wait(lambda: len(lock.contenders()) == 2)
         assert lock.contenders() == ["test", "contender"]
 
-        self.expire_session(self.make_event)
+        self.client.harness_expire_session()
 
         lock.release()
 
@@ -406,7 +422,7 @@ class KazooLockTests(KazooTestCase):
         try:
             self.client.get(znode)
         except NoNodeError:
-            self.fail("NoNodeError raised unexpectedly!")
+            pytest.fail("NoNodeError raised unexpectedly!")
 
     def test_lock_timeout(self) -> None:
         timeout = 3
@@ -425,7 +441,7 @@ class KazooLockTests(KazooTestCase):
                 event.wait(timeout)
                 if not event.is_set():
                     # Eventually fail to avoid hanging the tests
-                    self.fail("lock2 never timed out")
+                    pytest.fail("lock2 never timed out")
 
         t = self.make_thread(target=_thread, args=(lock1, e, timeout * 3))
         t.start()
@@ -444,7 +460,7 @@ class KazooLockTests(KazooTestCase):
             # thread should still be holding onto the lock
             pass
         else:
-            self.fail("Main thread unexpectedly acquired the lock")
+            pytest.fail("Main thread unexpectedly acquired the lock")
         finally:
             # Cleanup
             e.set()
@@ -554,16 +570,40 @@ class KazooLockTests(KazooTestCase):
         writer_thread.join()
 
 
-class TestSemaphore(KazooTestCase):
-    def __init__(self, *args: Any, **kw: Any):
-        super(TestSemaphore, self).__init__(*args, **kw)
-        self.threads_made: list[threading.Thread] = []
+class TestSemaphore:
+    client: KazooClient
+    threads_made: list[threading.Thread]
+    lockpath: str
+    condition: threading.Condition
+    released: threading.Event
+    active_thread: str | None
+    cancelled_threads: list[str]
 
-    def tearDown(self) -> None:
-        super(TestSemaphore, self).tearDown()
+    def _setup_shared(
+        self, zkclient: KazooClient, zkensemble: Any
+    ) -> None:
+        self.zkensemble = zkensemble
+        self.threads_made = []
+        self.lockpath = "/" + uuid.uuid4().hex
+        self.condition = self.make_condition()
+        self.released = self.make_event()
+        self.active_thread = None
+        self.cancelled_threads = []
+        self.client = zkclient
+        self.chroot = zkclient.chroot
+
+    def _teardown_threads(self) -> None:
         while self.threads_made:
             t = self.threads_made.pop()
             t.join()
+
+    @pytest.fixture(autouse=True)
+    def _setup(
+        self, zkclient: KazooClient, zkensemble: Any
+    ) -> Generator[None, None, None]:
+        self._setup_shared(zkclient, zkensemble)
+        yield
+        self._teardown_threads()
 
     @staticmethod
     def make_condition() -> threading.Condition:
@@ -579,13 +619,10 @@ class TestSemaphore(KazooTestCase):
         self.threads_made.append(t)
         return t
 
-    def setUp(self) -> None:
-        super(TestSemaphore, self).setUp()
-        self.lockpath = "/" + uuid.uuid4().hex
-        self.condition = self.make_condition()
-        self.released = self.make_event()
-        self.active_thread = None
-        self.cancelled_threads: list[str] = []
+    def _get_client(self, **opts: Any) -> KazooClient:
+        c: KazooClient = self.zkensemble.get_client(**opts)
+        c.chroot = self.chroot
+        return c
 
     def test_basic(self) -> None:
         sem1 = self.client.Semaphore(self.lockpath)
@@ -733,7 +770,7 @@ class TestSemaphore(KazooTestCase):
         expired = self.make_event()
 
         def expire() -> None:
-            self.expire_session(self.make_event)
+            self.client.harness_expire_session()
             expired.set()
 
         thread2 = self.make_thread(target=expire, args=())
@@ -802,7 +839,7 @@ class TestSemaphore(KazooTestCase):
                 event.wait(timeout)
                 if not event.is_set():
                     # Eventually fail to avoid hanging the tests
-                    self.fail("sem2 never timed out")
+                    pytest.fail("sem2 never timed out")
 
         t = self.make_thread(target=_thread, args=(sem1, e, timeout * 3))
         t.start()

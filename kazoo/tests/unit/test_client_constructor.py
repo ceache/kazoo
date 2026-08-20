@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import pytest
 
 from kazoo.client import KazooClient
@@ -5,7 +7,7 @@ from kazoo.exceptions import ConfigurationError
 from kazoo.retry import KazooRetry
 
 
-def test_invalid_handler():
+def test_invalid_handler() -> None:
     from kazoo.handlers.threading import (
         SequentialThreadingHandler,
     )
@@ -14,7 +16,7 @@ def test_invalid_handler():
         KazooClient(handler=SequentialThreadingHandler)
 
 
-def test_chroot():
+def test_chroot() -> None:
     assert KazooClient(hosts="127.0.0.1:2181/").chroot == ""
     assert KazooClient(hosts="127.0.0.1:2181/a").chroot == "/a"
     assert KazooClient(hosts="127.0.0.1/a").chroot == "/a"
@@ -24,7 +26,7 @@ def test_chroot():
     )
 
 
-def test_connection_timeout():
+def test_connection_timeout() -> None:
     from kazoo.handlers.threading import (
         KazooTimeoutError,
     )
@@ -36,7 +38,7 @@ def test_connection_timeout():
         client.start(0.1)
 
 
-def test_ordered_host_selection():
+def test_ordered_host_selection() -> None:
     client = KazooClient(
         hosts="127.0.0.1:9,127.0.0.2:9/a", randomize_hosts=False
     )
@@ -44,19 +46,19 @@ def test_ordered_host_selection():
     assert hosts == [("127.0.0.1", 9), ("127.0.0.2", 9)]
 
 
-def test_invalid_hostname():
+def test_invalid_hostname() -> None:
     client = KazooClient(hosts="nosuchhost/a")
     timeout = client.handler.timeout_exception
     with pytest.raises(timeout):
         client.start(0.1)
 
 
-def test_another_invalid_hostname():
+def test_another_invalid_hostname() -> None:
     with pytest.raises(ValueError):
         KazooClient(hosts="/nosuchhost/a")
 
 
-def test_retry_options_dict():
+def test_retry_options_dict() -> None:
     client = KazooClient(
         command_retry=dict(max_tries=99), connection_retry=dict(delay=99)
     )
@@ -64,3 +66,4 @@ def test_retry_options_dict():
     assert isinstance(client._retry, KazooRetry)
     assert client._retry.max_tries == 99
     assert client._conn_retry.delay == 99
+

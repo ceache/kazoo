@@ -3,16 +3,17 @@ from __future__ import annotations
 import uuid
 import threading
 import time
+from typing import Any, TYPE_CHECKING
 from unittest.mock import patch
 
+import pytest
+
 from kazoo.exceptions import LockTimeout
-from kazoo.testing import KazooTestCase
 from kazoo.recipe.partitioner import PartitionState, SetPartitioner
-from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from kazoo.interfaces import Lockable
     from kazoo.client import KazooClient
+    from kazoo.interfaces import Lockable
 
 
 class SlowLockMock:
@@ -57,15 +58,22 @@ PartitionData = int
 Partitioner = SetPartitioner[PartitionData]
 
 
-class KazooPartitionerTests(KazooTestCase):
+class TestKazooPartitioner:
+    client: KazooClient
+    zkensemble: Any
+    path: str
+    __partitioners: list[Partitioner]
+
     @staticmethod
     def make_event() -> threading.Event:
         return threading.Event()
 
-    def setUp(self) -> None:
-        super(KazooPartitionerTests, self).setUp()
+    @pytest.fixture(autouse=True)
+    def _setup(self, zkclient: KazooClient, zkensemble: Any) -> None:
+        self.client = zkclient
+        self.zkensemble = zkensemble
         self.path = "/" + uuid.uuid4().hex
-        self.__partitioners: list[Partitioner] = []
+        self.__partitioners = []
 
     def test_party_of_one(self) -> None:
         self.__create_partitioner(size=3)
@@ -141,7 +149,7 @@ class KazooPartitionerTests(KazooTestCase):
         self.__assert_partitions([0, 2], [1])
 
         # Emulate connection loss
-        self.lose_connection(self.make_event)
+        self.zkensemble.lose_connection(self.client, self.make_event)
         self.__assert_state(PartitionState.RELEASE)
         self.__release()
 
@@ -277,3 +285,4 @@ class KazooPartitionerTests(KazooTestCase):
     def __finish(self) -> None:
         for partitioner in self.__partitioners:
             partitioner.finish()
+

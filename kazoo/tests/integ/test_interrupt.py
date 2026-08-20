@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import os
 from sys import platform
+from typing import TYPE_CHECKING
 
 import pytest
 
-from kazoo.testing import KazooTestCase
+if TYPE_CHECKING:
+    from kazoo.client import KazooClient
 
 
-class KazooInterruptTests(KazooTestCase):
-    def test_interrupted_systemcall(self) -> None:
+class TestKazooInterrupt:
+    def test_interrupted_systemcall(self, zkclient: KazooClient) -> None:
         """
         Make sure interrupted system calls don't break the world, since we
         can't control what all signals our connection thread will get
@@ -21,7 +23,7 @@ class KazooInterruptTests(KazooTestCase):
 
         path = "interrupt_test"
         value = b"1"
-        self.client.create(path, value)
+        zkclient.create(path, value)
 
         # set the euid to the current process' euid.
         # glibc sends SIGRT to all children, which will interrupt the
@@ -29,4 +31,5 @@ class KazooInterruptTests(KazooTestCase):
         os.seteuid(os.geteuid())
 
         # basic sanity test that it worked alright
-        assert self.client.get(path)[0] == value
+        assert zkclient.get(path)[0] == value
+

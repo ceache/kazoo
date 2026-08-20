@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from unittest import TestCase
+
 import pytest
 
 from kazoo.protocol import paths
 
 
-class TestNormPath:
+class NormPathTestCase(TestCase):
     def test_normpath(self) -> None:
         assert paths.normpath("/a/b") == "/a/b"
 
@@ -37,7 +39,7 @@ class TestNormPath:
         assert paths.normpath("/", trailing=True) == "/"
 
 
-class TestJoin:
+class JoinTestCase(TestCase):
     def test_join(self) -> None:
         assert paths.join("/a") == "/a"
         assert paths.join("/a", "b/") == "/a/b/"
@@ -52,7 +54,7 @@ class TestJoin:
         assert paths.join("/a/b", "/c") == "/c"
 
 
-class TestIsAbs:
+class IsAbsTestCase(TestCase):
     def test_isabs(self) -> None:
         assert paths.isabs("/") is True
         assert paths.isabs("/a") is True
@@ -65,7 +67,7 @@ class TestIsAbs:
         assert paths.isabs("a/../") is False
 
 
-class TestBaseName:
+class BaseNameTestCase(TestCase):
     def test_basename(self) -> None:
         assert paths.basename("") == ""
         assert paths.basename("/") == ""
@@ -74,7 +76,7 @@ class TestBaseName:
         assert paths.basename("/a/b.//c..") == "c.."
 
 
-class TestPrefixRoot:
+class PrefixRootTestCase(TestCase):
     def test_prefix_root(self) -> None:
         assert paths._prefix_root("/a/", "b/c") == "/a/b/c"
         assert paths._prefix_root("/a/b", "c/d") == "/a/b/c/d"
@@ -82,7 +84,7 @@ class TestPrefixRoot:
         assert paths._prefix_root("/a", "//b/c.") == "/a/b/c."
 
 
-class TestNormRoot:
+class NormRootTestCase(TestCase):
     def test_norm_root(self) -> None:
         assert paths._norm_root("") == "/"
         assert paths._norm_root("/") == "/"

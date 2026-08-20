@@ -1,28 +1,38 @@
+from __future__ import annotations
+
+from unittest import TestCase
+
+
 import pytest
+from typing import TYPE_CHECKING
 
-from kazoo import exceptions
-
-
-def test_backwards_alias():
-    """Verify that the old exception name alias exists."""
-    assert hasattr(exceptions, "NoNodeException")
-    assert exceptions.NoNodeException is exceptions.NoNodeError
+if TYPE_CHECKING:
+    from types import ModuleType
 
 
-def test_exceptions_code():
-    """Verify that an exception can be retrieved by its code."""
-    exc_cls = exceptions.EXCEPTIONS[-8]
-    assert isinstance(exc_cls(), exceptions.BadArgumentsError)
+class ExceptionsTestCase(TestCase):
+    def _get(self) -> ModuleType:
+        from kazoo import exceptions
 
+        return exceptions
 
-def test_invalid_code():
-    """Verify that retrieving an invalid code raises an error."""
-    with pytest.raises(RuntimeError):
-        exceptions.EXCEPTIONS.__getitem__(666)
+    def test_backwards_alias(self) -> None:
+        module = self._get()
+        assert hasattr(module, "NoNodeException")
+        assert module.NoNodeException is module.NoNodeError
 
+    def test_exceptions_code(self) -> None:
+        module = self._get()
+        exc_8 = module.EXCEPTIONS[-8]
+        assert isinstance(exc_8(), module.BadArgumentsError)
 
-def test_exceptions_construction():
-    """Verify that an exception can be constructed correctly."""
-    exc = exceptions.EXCEPTIONS[-101]()
-    assert type(exc) is exceptions.NoNodeError
-    assert exc.args == ()
+    def test_invalid_code(self) -> None:
+        module = self._get()
+        with pytest.raises(RuntimeError):
+            module.EXCEPTIONS.__getitem__(666)
+
+    def test_exceptions_construction(self) -> None:
+        module = self._get()
+        exc = module.EXCEPTIONS[-101]()
+        assert type(exc) is module.NoNodeError
+        assert exc.args == ()

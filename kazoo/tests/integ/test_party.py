@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import uuid
+from typing import TYPE_CHECKING
 
-from kazoo.testing import KazooTestCase
+import pytest
+
+if TYPE_CHECKING:
+    from kazoo.client import KazooClient
 
 
-class KazooPartyTests(KazooTestCase):
-    def setUp(self) -> None:
-        super(KazooPartyTests, self).setUp()
+class TestKazooParty:
+    client: KazooClient
+    path: str
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, zkclient: KazooClient) -> None:
+        self.client = zkclient
         self.path = "/" + uuid.uuid4().hex
 
     def test_party(self) -> None:
@@ -55,9 +63,13 @@ class KazooPartyTests(KazooTestCase):
         assert len(party) == 0  # type: ignore[unreachable]
 
 
-class KazooShallowPartyTests(KazooTestCase):
-    def setUp(self) -> None:
-        super(KazooShallowPartyTests, self).setUp()
+class TestKazooShallowParty:
+    client: KazooClient
+    path: str
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, zkclient: KazooClient) -> None:
+        self.client = zkclient
         self.path = "/" + uuid.uuid4().hex
 
     def test_party(self) -> None:
@@ -84,3 +96,4 @@ class KazooShallowPartyTests(KazooTestCase):
 
             assert set(party) == participants
             assert len(party) == len(participants)
+

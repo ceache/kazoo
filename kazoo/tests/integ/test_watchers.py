@@ -1,23 +1,28 @@
 from __future__ import annotations
 
-import time
 import threading
+import time
 import uuid
-
-from typing import Any, List, Literal
+from typing import Any, List, Literal, TYPE_CHECKING
 
 import pytest
 
+from kazoo.client import KazooClient
 from kazoo.exceptions import KazooException
 from kazoo.protocol.states import EventType, WatchedEvent, ZnodeStat
 from kazoo.recipe.watchers import PatientChildrenWatch
 
-from kazoo.testing import KazooTestCase
+if TYPE_CHECKING:
+    pass
 
 
-class KazooDataWatcherTests(KazooTestCase):
-    def setUp(self) -> None:
-        super(KazooDataWatcherTests, self).setUp()
+class KazooDataWatcherTests:
+    client: KazooClient
+    path: str
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, zkclient: KazooClient) -> None:
+        self.client = zkclient
         self.path = "/" + uuid.uuid4().hex
         self.client.ensure_path(self.path)
 
@@ -136,7 +141,7 @@ class KazooDataWatcherTests(KazooTestCase):
         assert data == [b""]
         update.clear()
 
-        self.expire_session(threading.Event)
+        self.client.harness_expire_session()
         self.client.retry(self.client.set, self.path, b"fred")
         update.wait(25)
         assert data[0] == b"fred"
@@ -293,9 +298,13 @@ class KazooDataWatcherTests(KazooTestCase):
         assert b is False
 
 
-class KazooChildrenWatcherTests(KazooTestCase):
-    def setUp(self) -> None:
-        super(KazooChildrenWatcherTests, self).setUp()
+class KazooChildrenWatcherTests:
+    client: KazooClient
+    path: str
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, zkclient: KazooClient) -> None:
+        self.client = zkclient
         self.path = "/" + uuid.uuid4().hex
         self.client.ensure_path(self.path)
 
@@ -485,7 +494,7 @@ class KazooChildrenWatcherTests(KazooTestCase):
         update.wait(10)
         assert all_children == ["smith"]
         update.clear()
-        self.expire_session(threading.Event)
+        self.client.harness_expire_session()
 
         self.client.retry(self.client.create, self.path + "/" + "george")
         update.wait(20)
@@ -511,7 +520,7 @@ class KazooChildrenWatcherTests(KazooTestCase):
         update.wait(10)
         assert all_children == ["smith"]
         update.clear()
-        self.expire_session(threading.Event)
+        self.client.harness_expire_session()
 
         self.client.retry(self.client.create, self.path + "/" + "george")
         update.wait(4)
@@ -522,12 +531,18 @@ class KazooChildrenWatcherTests(KazooTestCase):
         assert sorted(children) == ["george", "smith"]
 
 
-class KazooPatientChildrenWatcherTests(KazooTestCase):
-    def setUp(self) -> None:
-        super(KazooPatientChildrenWatcherTests, self).setUp()
+class KazooPatientChildrenWatcherTests:
+    client: KazooClient
+    path: str
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, zkclient: KazooClient) -> None:
+        self.client = zkclient
         self.path = "/" + uuid.uuid4().hex
 
     def _makeOne(self, *args: Any, **kwargs: Any) -> PatientChildrenWatch:
+        from kazoo.recipe.watchers import PatientChildrenWatch
+
         return PatientChildrenWatch(*args, **kwargs)
 
     def test_watch(self) -> None:
