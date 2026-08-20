@@ -1092,6 +1092,12 @@ class TestDockerEnvFixture:
     def test_fixed_per_member_ports(self, tmp_path):
         snapshot = _env_snapshot(self._KEYS)
         try:
+            # A full-suite session may have already exported the axes into
+            # os.environ (the integration docker_env session fixture does, for
+            # compose interpolation); this test exercises the pure defaults,
+            # so drop any strays.
+            for key in ("ZK_VERSION", "ZK_AUTH", "ZK_FEATURES"):
+                os.environ.pop(key, None)
             env = _call_fixture(
                 fixtures.docker_env, _FakeConfig(), _TmpPathFactory(tmp_path)
             )
