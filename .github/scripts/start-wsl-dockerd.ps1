@@ -15,7 +15,7 @@
 # tcp://localhost:2375 even though dockerd is up), so we fall back to the WSL
 # VM's NAT IP, which the Windows host can always route to via the WSL vSwitch.
 # Bind-mount sources are translated to the daemon's /mnt/<drive> layout by
-# kazoo_ensemble.py, so /mnt/d:/... is handled there, not here.
+# kazoo.testing.common, so /mnt/d:/... is handled there, not here.
 
 $ErrorActionPreference = 'Stop'
 $Distro = 'Ubuntu'

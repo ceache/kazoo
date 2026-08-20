@@ -76,9 +76,9 @@ class TestImportSurface:
         module = importlib.import_module("kazoo.testing.common")
         assert hasattr(module, name)
 
-    def test_kazoo_ensemble_module_removed(self) -> None:
+    def test_harness_module_removed(self) -> None:
         with pytest.raises(ModuleNotFoundError):
-            importlib.import_module("kazoo.testing.kazoo_ensemble")
+            importlib.import_module("kazoo.testing.harness")
 
     def test_kazoo_tests_conftest_removed(self) -> None:
         with pytest.raises(ModuleNotFoundError):
