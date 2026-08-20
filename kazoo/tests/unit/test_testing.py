@@ -17,6 +17,7 @@ The pure-function groups aim for 100% branch coverage of
 
 from __future__ import annotations
 
+import argparse
 import importlib
 import os
 import pathlib
@@ -970,12 +971,38 @@ class TestFixtureHooks:
     def test_addoption_registers_axes(self):
         parser = pytest.Parser()
         fixtures.pytest_addoption(parser)
-        options = {o.dest: o.attrs() for o in parser._groups[0].options}
-        assert set(options) == {"zk_version", "zk_auth", "zk_features"}
-        assert options["zk_version"]["default"] is None
-        assert options["zk_auth"]["choices"] == [
-            mode.value for mode in common.ZKAuthMode
-        ]
+        namespace = argparse.Namespace()
+        parser.parse_known_args(
+            [
+                "--zk-version",
+                "3.6.4",
+                "--zk-auth",
+                "digest",
+                "--zk-features",
+                "ttl,reconfig",
+            ],
+            namespace,
+        )
+        assert namespace.zk_version == "3.6.4"
+        assert namespace.zk_auth == "digest"
+        assert namespace.zk_features == "ttl,reconfig"
+
+    def test_auth_option_restricts_choices(self):
+        parser = pytest.Parser()
+        fixtures.pytest_addoption(parser)
+        with pytest.raises((pytest.UsageError, SystemExit)):
+            parser.parse_known_args(
+                ["--zk-auth", "bogus"], argparse.Namespace()
+            )
+
+    def test_axis_options_absent_by_default(self):
+        parser = pytest.Parser()
+        fixtures.pytest_addoption(parser)
+        namespace = argparse.Namespace()
+        parser.parse_known_args([], namespace)
+        assert namespace.zk_version is None
+        assert namespace.zk_auth is None
+        assert namespace.zk_features is None
 
     def test_configure_registers_markers(self):
         config = _MarkerConfig()
