@@ -13,13 +13,13 @@ pytest-facing wrappers and fixtures live in :mod:`kazoo.testing.fixtures`.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 import pathlib
 import re
 import shutil
 import subprocess
 import sys
-from threading import Event
 from typing import TYPE_CHECKING, Any, Callable
 
 if sys.version_info >= (3, 11):
@@ -27,7 +27,6 @@ if sys.version_info >= (3, 11):
 else:
     from backports.strenum import StrEnum
 
-import attrs
 import pytest
 from packaging import (
     specifiers,
@@ -35,6 +34,7 @@ from packaging import (
 )
 
 import kazoo.client
+from kazoo.interfaces import Event
 from kazoo.protocol.connection import (
     _CONNECTION_DROP,
     _SESSION_EXPIRED,
@@ -87,8 +87,8 @@ ZK_DEFAULT_VERSION = "3.9.5"
 FEATURE_JVM_PROPERTIES: dict[ZKFeature, tuple[str, ...]] = {
     ZKFeature.STANDARD: (),
     ZKFeature.TTL: ("-Dzookeeper.extendedTypesEnabled=true",),
-    # Note: readonlymode.enabled is a JVM system property (-Dreadonlymode.enabled=true),
-    # not a zoo.cfg property.
+    # Note: readonlymode.enabled is a JVM system property
+    # (-Dreadonlymode.enabled=true), not a zoo.cfg property.
     ZKFeature.READONLY: ("-Dreadonlymode.enabled=true",),
     ZKFeature.RECONFIG: ("-Dzookeeper.reconfigEnabled=true",),
 }
@@ -134,7 +134,12 @@ def resolve_axis_options(
     auth_opt: str | None,
     features_opt: str | None,
     environ: dict[str, str],
-) -> tuple[str, ZKAuthMode, tuple[ZKFeature, ...], dict[str, str],]:
+) -> tuple[
+    str,
+    ZKAuthMode,
+    tuple[ZKFeature, ...],
+    dict[str, str],
+]:
     """Resolve the three axes from CLI options and environment variables.
 
     Returns the resolved (version, auth, features) triple together with the
@@ -164,9 +169,9 @@ def resolve_axis_options(
         # Read-only mode (-Dreadonlymode.enabled=true) allows a partitioned ZK
         # node to accept read connections. However, a partitioned node cannot
         # issue or validate global sessions without a leader/quorum.
-        # Enabling localSessionsEnabled and localSessionsUpgradingEnabled in zoo.cfg
-        # allows partitioned nodes to issue node-local sessions so clients
-        # requesting read_only=True can establish a CONNECTED_RO state.
+        # Enabling localSessionsEnabled and localSessionsUpgradingEnabled
+        # in zoo.cfg allows partitioned nodes to issue node-local sessions so
+        # clients requesting read_only=True can establish a CONNECTED_RO state.
         cfg_extra.append("localSessionsEnabled=true")
         cfg_extra.append("localSessionsUpgradingEnabled=true")
     if ZKFeature.TTL in features:
@@ -177,13 +182,18 @@ def resolve_axis_options(
         "ZK_AUTH": auth.value,
         "ZK_FEATURES": ",".join(f.value for f in features),
         "ZK_AUTH_JVMFLAGS": AUTH_JVM_FLAGS.get(auth, ""),
-        "ZK_CAPTURE_JVMFLAGS": (
-            "-javaagent:/agent/extract-tls-secrets.jar=/logs/tls-secrets.log"
-            if ZKFeature.CAPTURE in features and auth is ZKAuthMode.TLS
-            else ""
-        ),
-        "ZOO_CFG_EXTRA": " ".join(cfg_extra),
+        "ZK_CONFIG_EXTRA": "\n".join(cfg_extra),
     }
+
+    if ZKFeature.CAPTURE in features and auth in (
+        ZKAuthMode.TLS,
+        ZKAuthMode.SASL_GSSAPI,
+    ):
+        env_updates["ZK_CAPTURE_JVMFLAGS"] = (
+            "-javaagent:/opt/lib/jsslkeylog.jar="
+            "/var/log/zookeeper/sslkeylog.txt"
+        )
+
     return version_value, auth, features, env_updates
 
 
@@ -195,7 +205,7 @@ def _resolve_axis_options(
         pytestconfig.getoption("--zk-version"),
         pytestconfig.getoption("--zk-auth"),
         pytestconfig.getoption("--zk-features"),
-        os.environ,
+        dict(os.environ),
     )
     os.environ.update(env_updates)
     return version, auth, features
@@ -260,7 +270,7 @@ def _evaluate_axis_markers(
     return "; ".join(reasons) if reasons else None
 
 
-@attrs.frozen(kw_only=True, auto_attribs=True)
+@dataclass(frozen=True, kw_only=True)
 class KazooZkEnv:
     """Resolved session configuration: version, work dir, auth, features."""
 
@@ -270,7 +280,7 @@ class KazooZkEnv:
     features: tuple[ZKFeature, ...] = (ZKFeature.STANDARD,)
 
 
-@attrs.frozen(kw_only=True, auto_attribs=True)
+@dataclass(frozen=True, kw_only=True)
 class ZkEnsemble:
     """A running compose-backed ZooKeeper ensemble.
 
@@ -380,25 +390,31 @@ class ZkEnsemble:
     def lose_connection(
         self,
         client: "KazooClient",
-        event_factory: Callable[[], "Event"] | None = None,
+        event_factory: Callable[[], Event] | None = None,
     ) -> None:
         """Force client to lose connection with server."""
-        if event_factory is None:
-            event_factory = client.handler.event_object
+        factory: Callable[[], Event] = (
+            client.handler.event_object
+            if event_factory is None
+            else event_factory
+        )
         self.__break_connection(
-            client, _CONNECTION_DROP, KazooState.SUSPENDED, event_factory
+            client, _CONNECTION_DROP, KazooState.SUSPENDED, factory
         )
 
     def expire_session(
         self,
         client: "KazooClient",
-        event_factory: Callable[[], "Event"] | None = None,
+        event_factory: Callable[[], Event] | None = None,
     ) -> None:
         """Force ZK to expire a client session."""
-        if event_factory is None:
-            event_factory = client.handler.event_object
+        factory: Callable[[], Event] = (
+            client.handler.event_object
+            if event_factory is None
+            else event_factory
+        )
         self.__break_connection(
-            client, _SESSION_EXPIRED, KazooState.LOST, event_factory
+            client, _SESSION_EXPIRED, KazooState.LOST, factory
         )
 
     def __break_connection(
@@ -406,7 +422,7 @@ class ZkEnsemble:
         client: "KazooClient",
         break_event: object,
         expected_state: KazooState,
-        event_factory: Callable[[], "Event"],
+        event_factory: Callable[[], Event],
     ) -> None:
         """Break ZooKeeper connection using the specified event."""
 
@@ -424,7 +440,7 @@ class ZkEnsemble:
             return None
 
         client.add_listener(watch_loss)
-        client._call(break_event, None)
+        client._call(break_event, None)  # type: ignore[arg-type]
 
         lost.wait(5)
         if not lost.is_set():
@@ -772,7 +788,9 @@ def _export_krb5_client_env(
     from testcontainers.compose import PublishedPortModel
 
     container = docker_compose.get_container("kdc")
-    publishers: list[PublishedPortModel] = container.Publishers
+    publishers: list[PublishedPortModel] = (
+        container.Publishers  # type: ignore[assignment]
+    )
     tcp = [p for p in publishers if (p.Protocol or "").lower() == "tcp"]
     if not tcp:
         raise RuntimeError(

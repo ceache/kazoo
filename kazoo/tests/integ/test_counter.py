@@ -56,8 +56,9 @@ class TestKazooCounters:
         with pytest.raises(TypeError):
             counter.__add__(b"a")  # type: ignore[operator]
         with pytest.raises(TypeError):
+            # type: ignore[arg-type]
             counter = self._makeOne(
-                zkclient, default=0.0, support_curator=True  # type: ignore[arg-type]
+                zkclient, default=0.0, support_curator=True
             )
 
     def test_pre_post_values(self, zkclient: KazooClient) -> None:
@@ -71,4 +72,3 @@ class TestKazooCounters:
         counter -= 3
         assert counter.pre_value == 2
         assert counter.post_value == -1
-

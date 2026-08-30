@@ -579,9 +579,7 @@ class TestSemaphore:
     active_thread: str | None
     cancelled_threads: list[str]
 
-    def _setup_shared(
-        self, zkclient: KazooClient, zkensemble: Any
-    ) -> None:
+    def _setup_shared(self, zkclient: KazooClient, zkensemble: Any) -> None:
         self.zkensemble = zkensemble
         self.threads_made = []
         self.lockpath = "/" + uuid.uuid4().hex

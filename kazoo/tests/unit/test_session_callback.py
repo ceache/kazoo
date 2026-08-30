@@ -28,11 +28,8 @@ def test_session_callback_states() -> None:
     assert client.state == KazooState.CONNECTED
 
     client._session_callback(KeeperState.AUTH_FAILED)
-    assert (
-        client.state == KazooState.LOST  # type: ignore[comparison-overlap]
-    )
+    assert client.state == KazooState.LOST  # type: ignore[comparison-overlap]
 
     client._handle = 1  # type: ignore[assignment]
     client._session_callback(-250)  # type: ignore[unreachable]
     assert client.state == KazooState.SUSPENDED
-

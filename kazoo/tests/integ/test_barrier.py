@@ -139,9 +139,7 @@ class TestKazooDoubleBarrierTests:
         t1.join()
         t2.join()
 
-    def test_barrier_existing_parent_node(
-        self, zkclient: KazooClient
-    ) -> None:
+    def test_barrier_existing_parent_node(self, zkclient: KazooClient) -> None:
         b = zkclient.DoubleBarrier("/some/path", 1)
         assert b.participating is False
         zkclient.create("/some", ephemeral=True)
@@ -158,4 +156,3 @@ class TestKazooDoubleBarrierTests:
         b.enter()
         assert b.participating is True
         b.leave()  # type: ignore[unreachable]
-

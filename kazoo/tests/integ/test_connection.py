@@ -253,13 +253,15 @@ def test_read_only(zkensemble):
     Verifies:
     1. Healthy ensemble accepts connections in standard CONNECTED state.
     2. Partitioned ensemble (quorum lost) rejects `read_only=False` clients.
-       When a Read-Only server receives a Connect request with `read_only=False`,
-       it immediately closes the socket. The client connection retry loop
-       fails to establish a read-write session, raising `KazooTimeoutError`.
-    3. Partitioned ensemble accepts `read_only=True` clients in `CONNECTED_RO`
-       state using node-local sessions.
+       When a Read-Only server receives a Connect request with
+       `read_only=False`, it immediately closes the socket. The client
+       connection retry loop fails to establish a read-write session,
+       raising `KazooTimeoutError`.
+    3. Partitioned ensemble accepts `read_only=True` clients in
+       `CONNECTED_RO` state using node-local sessions.
     4. Read operations (e.g. `get_children`) succeed in `CONNECTED_RO` state.
-    5. Write operations (e.g. `create`) fail and raise `NotReadOnlyCallError`.
+    5. Write operations (e.g. `create`) fail and raise
+       `NotReadOnlyCallError`.
     """
     from kazoo.exceptions import NotReadOnlyCallError
     from kazoo.handlers.threading import KazooTimeoutError
@@ -274,12 +276,8 @@ def test_read_only(zkensemble):
 
     # 2. Stop 2 of 3 nodes to break quorum and force zoo1 into Read-Only mode
     zk_stop_threads = [
-        threading.Thread(
-            target=zkensemble.stop, args=("zoo2",), daemon=True
-        ),
-        threading.Thread(
-            target=zkensemble.stop, args=("zoo3",), daemon=True
-        ),
+        threading.Thread(target=zkensemble.stop, args=("zoo2",), daemon=True),
+        threading.Thread(target=zkensemble.stop, args=("zoo3",), daemon=True),
     ]
     for thread in zk_stop_threads:
         thread.start()
@@ -293,15 +291,18 @@ def test_read_only(zkensemble):
         hosts=f"{zkensemble.zk_ip}:{zkensemble.zk1_port}", read_only=False
     )
     try:
-        # Sleep to allow zoo1's leader election rounds to time out and start ReadOnlyZooKeeperServer
+        # Sleep to allow zoo1's leader election rounds to time out and
+        # start ReadOnlyZooKeeperServer
         time.sleep(12)
 
-        # 3. Negative test: connecting with read_only=False to a Read-Only server fails.
-        # The server drops non-RO connect packets, causing client.start() to time out.
+        # 3. Negative test: connecting with read_only=False to a Read-Only
+        # server fails. The server drops non-RO connect packets, causing
+        # client.start() to time out.
         with pytest.raises(KazooTimeoutError):
             rw_client.start(timeout=5)
 
-        # 4. Positive test: connecting with read_only=True succeeds in CONNECTED_RO mode
+        # 4. Positive test: connecting with read_only=True succeeds in
+        # CONNECTED_RO mode
         ro_client.start(timeout=15)
         assert ro_client.client_state == KeeperState.CONNECTED_RO
 

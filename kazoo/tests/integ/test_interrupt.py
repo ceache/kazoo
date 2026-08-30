@@ -32,4 +32,3 @@ class TestKazooInterrupt:
 
         # basic sanity test that it worked alright
         assert zkclient.get(path)[0] == value
-

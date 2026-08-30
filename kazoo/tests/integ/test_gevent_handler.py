@@ -182,4 +182,3 @@ class TestGeventClient(test_client.TestClient):
 
     def _makeOne(self, *args: Any) -> Any:
         return _make_gevent_handler()
-

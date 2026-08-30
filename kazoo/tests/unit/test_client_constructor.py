@@ -66,4 +66,3 @@ def test_retry_options_dict() -> None:
     assert isinstance(client._retry, KazooRetry)
     assert client._retry.max_tries == 99
     assert client._conn_retry.delay == 99
-

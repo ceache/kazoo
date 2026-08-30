@@ -210,4 +210,3 @@ class TestKazooLockingQueue:
         result = value1 + value2 + value3
         assert result.count(b"one") == 1
         assert result.count(None) == 2
-

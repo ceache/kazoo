@@ -96,4 +96,3 @@ class TestKazooShallowParty:
 
             assert set(party) == participants
             assert len(party) == len(participants)
-

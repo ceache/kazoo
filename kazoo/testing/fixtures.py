@@ -237,7 +237,7 @@ def docker_compose(
     # live in the kazoo.testing package. Locate the directory via
     # importlib.resources so discovery does not depend on __file__ (it
     # resolves to the real on-disk dir for any filesystem-backed install).
-    context_path = pathlib.Path(resources.files("kazoo.testing"))
+    context_path = pathlib.Path(str(resources.files("kazoo.testing")))
     context = str(context_path)
     # Relative bind-mount sources in the compose overlays (./jaas/...) are
     # interpolated through ${ZK_COMPOSE_DIR} so they can be translated to a
@@ -368,10 +368,14 @@ def zkclient(
 ) -> "Iterator[KazooClient]":
     """Create a KazooClient instance connected to the ensemble."""
     client = zkensemble.get_client()
-    client.harness_expire_session = functools.partial(
-        zkensemble.expire_session,
-        client=client,
-        event_factory=client.handler.event_object,
+    setattr(
+        client,
+        "harness_expire_session",
+        functools.partial(
+            zkensemble.expire_session,
+            client=client,
+            event_factory=client.handler.event_object,
+        ),
     )
     client.start()
     client.ensure_path(zkchroot)

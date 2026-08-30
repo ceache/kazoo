@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 """
 The official python select function test case copied from python source
  to test the selector_select function.
@@ -17,8 +18,7 @@ select = selector_select
 
 
 class HasFileNo(Protocol):
-    def fileno(self) -> int:
-        ...
+    def fileno(self) -> int: ...
 
 
 pytestmark = pytest.mark.skipif(

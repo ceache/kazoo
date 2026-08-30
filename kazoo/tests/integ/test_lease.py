@@ -361,4 +361,3 @@ class TestMultiNonBlockingLease(TestKazooLease):
             utcnow=self.clock,
         )
         assert ls4
-

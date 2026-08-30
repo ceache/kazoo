@@ -285,4 +285,3 @@ class TestKazooPartitioner:
     def __finish(self) -> None:
         for partitioner in self.__partitioners:
             partitioner.finish()
-

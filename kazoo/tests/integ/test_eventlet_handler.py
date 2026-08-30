@@ -283,4 +283,3 @@ class TestEventletLock(test_lock.TestKazooLock):
     )
     def test_lock_cancel(self, *args: Any, **kwargs: Any) -> Any:
         return super().test_lock_cancel(*args, **kwargs)
-
