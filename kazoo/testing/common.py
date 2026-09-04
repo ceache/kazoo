@@ -182,16 +182,13 @@ def resolve_axis_options(
         "ZK_AUTH": auth.value,
         "ZK_FEATURES": ",".join(f.value for f in features),
         "ZK_AUTH_JVMFLAGS": AUTH_JVM_FLAGS.get(auth, ""),
+        "ZK_CAPTURE_JVMFLAGS": "",
         "ZK_CONFIG_EXTRA": "\n".join(cfg_extra),
     }
 
-    if ZKFeature.CAPTURE in features and auth in (
-        ZKAuthMode.TLS,
-        ZKAuthMode.SASL_GSSAPI,
-    ):
+    if ZKFeature.CAPTURE in features and auth is ZKAuthMode.TLS:
         env_updates["ZK_CAPTURE_JVMFLAGS"] = (
-            "-javaagent:/opt/lib/jsslkeylog.jar="
-            "/var/log/zookeeper/sslkeylog.txt"
+            "-javaagent:/agent/extract-tls-secrets.jar=/logs/tls-secrets.log"
         )
 
     return version_value, auth, features, env_updates
@@ -270,7 +267,7 @@ def _evaluate_axis_markers(
     return "; ".join(reasons) if reasons else None
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(frozen=True)
 class KazooZkEnv:
     """Resolved session configuration: version, work dir, auth, features."""
 
@@ -280,7 +277,7 @@ class KazooZkEnv:
     features: tuple[ZKFeature, ...] = (ZKFeature.STANDARD,)
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(frozen=True)
 class ZkEnsemble:
     """A running compose-backed ZooKeeper ensemble.
 
