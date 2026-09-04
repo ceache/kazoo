@@ -13,6 +13,7 @@ pytest-facing wrappers and fixtures live in :mod:`kazoo.testing.fixtures`.
 
 from __future__ import annotations
 
+import concurrent.futures
 from dataclasses import dataclass
 import os
 import pathlib
@@ -20,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from typing import TYPE_CHECKING, Any, Callable
 
 if sys.version_info >= (3, 11):
@@ -315,9 +317,7 @@ class ZkEnsemble:
         ``sasl_options``/``use_ssl`` implied by a SASL or TLS axis.
         """
         opts: dict[str, Any] = {}
-        if self.auth is ZKAuthMode.DIGEST:
-            opts["auth_data"] = [("digest", "super:super_secret")]
-        elif self.auth is ZKAuthMode.SASL_DIGEST:
+        if self.auth is ZKAuthMode.SASL_DIGEST:
             opts["sasl_options"] = {
                 "mechanism": "DIGEST-MD5",
                 # DigestServerCallback in the server JAAS config only accepts
@@ -451,7 +451,7 @@ class ZkEnsemble:
 
     def _run_compose(self, *args: str) -> None:
         """Run a ``docker compose`` command against this ensemble's stack."""
-        subprocess.run(
+        _cooperative_run_subprocess(
             [*self.compose.compose_command_property, *args],
             cwd=self.compose.context,
             check=True,
@@ -480,6 +480,58 @@ class ZkEnsemble:
     def start(self, name: str) -> None:
         """Start the specified ZK node's ZooKeeper process."""
         self._run_compose("start", self._process_service(name))
+
+
+def _cooperative_run_subprocess(
+    cmd: list[str] | tuple[str, ...],
+    cwd: str | os.PathLike[str] | None = None,
+    check: bool = True,
+    **kwargs: Any,
+) -> subprocess.CompletedProcess[Any]:
+    """Run a subprocess command cooperatively so cooperative multitasking
+    handlers (gevent / eventlet) continue running their event loops during
+    synchronous execution."""
+    target_cwd = str(cwd) if cwd is not None else None
+
+    def _execute() -> subprocess.CompletedProcess[Any]:
+        return subprocess.run(
+            cmd,
+            cwd=target_cwd,
+            check=check,
+            **kwargs,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_execute)
+        while not future.done():
+            yielded = False
+            if "gevent" in sys.modules:
+                try:
+                    import gevent.hub  # type: ignore[import]
+
+                    get_hub = getattr(
+                        gevent.hub,
+                        "_get_hub",
+                        getattr(gevent.hub, "get_hub", None),
+                    )
+                    if get_hub is not None and get_hub() is not None:
+                        import gevent  # type: ignore[import]
+
+                        gevent.sleep(0.01)
+                        yielded = True
+                except Exception:
+                    pass
+            if not yielded and "eventlet" in sys.modules:
+                try:
+                    import eventlet  # type: ignore[import]
+
+                    eventlet.sleep(0.01)  # type: ignore[no-untyped-call]
+                    yielded = True
+                except Exception:
+                    pass
+            if not yielded:
+                time.sleep(0.01)
+        return future.result()
 
 
 #: Module-global handle on the running compose stack, set by

@@ -417,7 +417,7 @@ class TestZkEnsemble:
         opts = _make_ensemble(
             common.ZKAuthMode.DIGEST
         )._client_implied_options()
-        assert opts == {"auth_data": [("digest", "super:super_secret")]}
+        assert opts == {}
 
     def test_implied_options_sasl_digest(self):
         opts = _make_ensemble(
@@ -472,7 +472,7 @@ class TestZkEnsemble:
             ("127.0.0.1", 2182),
             ("127.0.0.1", 2183),
         ]
-        assert client.auth_data == {("digest", "super:super_secret")}
+        assert client.auth_data == set()
 
     def test_get_client_superadmin(self):
         client = _make_ensemble().get_client(superadmin=True)
@@ -787,6 +787,23 @@ class TestRunCompose:
             (["docker", "compose", "stop", "zoo1-service"], "/tmp/compose"),
             (["docker", "compose", "start", "zoo2-service"], "/tmp/compose"),
         ]
+
+    def test_cooperative_run_subprocess_success(self):
+        res = common._cooperative_run_subprocess(
+            ["python3", "-c", "print('hello')"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert res.returncode == 0
+        assert res.stdout.strip() == "hello"
+
+    def test_cooperative_run_subprocess_called_process_error(self):
+        with pytest.raises(common.subprocess.CalledProcessError):
+            common._cooperative_run_subprocess(
+                ["python3", "-c", "import sys; sys.exit(2)"],
+                check=True,
+            )
 
 
 class _Proc:
