@@ -30,6 +30,7 @@ x-sasl-digest-environment: &sasl_digest_environment
     authProvider.1=org.apache.zookeeper.server.auth.SASLAuthenticationProvider
     enforce.auth.enabled=true
     enforce.auth.schemes=sasl
+    ${ZOO_CFG_EXTRA:-}
 
 services:
   zoo1-service:

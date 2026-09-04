@@ -356,5 +356,7 @@ jobs:
           export DOCKER_HOST="$(cat "$GITHUB_WORKSPACE/.start-wsl-dockerd.host" 2>/dev/null || echo tcp://localhost:2375)"
           pytest kazoo/tests/integ -q
         env:
+          ZK_VERSION: "3.9.5"
+          ZOOKEEPER_VERSION: "3.9.5"
           ZK_AUTH: plain
           ZK_FEATURES: standard

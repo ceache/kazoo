@@ -183,7 +183,7 @@ def resolve_axis_options(
         "ZK_FEATURES": ",".join(f.value for f in features),
         "ZK_AUTH_JVMFLAGS": AUTH_JVM_FLAGS.get(auth, ""),
         "ZK_CAPTURE_JVMFLAGS": "",
-        "ZK_CONFIG_EXTRA": "\n".join(cfg_extra),
+        "ZOO_CFG_EXTRA": "\n".join(cfg_extra),
     }
 
     if ZKFeature.CAPTURE in features and auth is ZKAuthMode.TLS:

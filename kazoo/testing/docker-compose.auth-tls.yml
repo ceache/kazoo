@@ -34,6 +34,7 @@ x-tls-environment: &tls_environment
     ssl.trustStore.password=changeit
     ssl.clientAuth=need
     authProvider.1=X509AuthenticationProvider
+    ${ZOO_CFG_EXTRA:-}
 
 services:
   certgen:
