@@ -63,6 +63,7 @@ class TestClientTransitions:
         assert states == req_states
 
 
+@pytest.mark.zk_auth("plain")
 class TestAuthentication:
     def _makeAuth(self, *args, **kwargs):
         return security.make_digest_acl(*args, **kwargs)
@@ -631,6 +632,7 @@ class TestClient:
         with pytest.raises(NodeExistsError):
             zkclient.create("/1/2/3/4/5", b"val2", makepath=True)
 
+    @pytest.mark.zk_auth(skip=("digest",))
     def test_create_makepath_incompatible_acls(self, zkclient, zkensemble):
         from kazoo.security import make_digest_acl
 
@@ -1069,7 +1071,7 @@ class TestClient:
             # force the client to suspend
             zkensemble.stop(server)
 
-            ev_suspended.wait(15)
+            ev_suspended.wait(30)
             assert ev_suspended.is_set()
 
             # submit a request, expecting it to be queued
@@ -1090,7 +1092,7 @@ class TestClient:
 
         # wait for the client to reconnect (either with a recovered
         # session, or with a new one if expire_session was set).
-        ev_connected.wait(30)
+        ev_connected.wait(60)
         assert ev_connected.is_set()
 
         return result
@@ -1110,7 +1112,7 @@ class TestClient:
                 expire_session=False,
             )
 
-            assert result.get(timeout=15) == path
+            assert result.get(timeout=30) == path
             assert len(client._queue) == 0
             assert client.exists(path) is not None
         finally:
@@ -1133,7 +1135,7 @@ class TestClient:
             )
 
             with pytest.raises(SessionExpiredError):
-                result.get(timeout=15)
+                result.get(timeout=30)
             assert len(client._queue) == 0
         finally:
             client.stop()

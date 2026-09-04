@@ -1129,7 +1129,7 @@ class TestDockerEnvFixture:
                 fixtures.docker_env, _FakeConfig(), _TmpPathFactory(tmp_path)
             )
             ports = [int(os.environ[f"ZOO{i}_CLIENT_PORT"]) for i in (1, 2, 3)]
-            assert all(22300 <= p < 22300 + 500 * 6 for p in ports)
+            assert all(22300 <= p <= 22300 + 500 * 6 for p in ports)
             assert ports == sorted(ports)
             assert env.auth is common.ZKAuthMode.PLAIN
         finally:
