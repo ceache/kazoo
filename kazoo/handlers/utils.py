@@ -346,7 +346,7 @@ def capture_exceptions(
     """
 
     def capture(
-        function: Callable[GenericArgs, CapturedResult]
+        function: Callable[GenericArgs, CapturedResult],
     ) -> Callable[GenericArgs, CapturedResult | None]:
         @functools.wraps(function)
         def captured_function(
@@ -378,7 +378,7 @@ def wrap(
     """
 
     def capture(
-        function: Callable[GenericArgs, CapturedResult]
+        function: Callable[GenericArgs, CapturedResult],
     ) -> Callable[GenericArgs, CapturedResult | None]:
         @capture_exceptions(async_result)
         def captured_function(

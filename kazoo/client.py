@@ -8,7 +8,6 @@ import inspect
 import logging
 from os.path import split
 import re
-import warnings
 from typing import (
     cast,
     overload,
@@ -23,6 +22,8 @@ from typing import (
     TypedDict,
     TYPE_CHECKING,
 )
+import warnings
+
 from typing_extensions import ParamSpec, Unpack, deprecated
 
 from kazoo.exceptions import (
@@ -31,8 +32,8 @@ from kazoo.exceptions import (
     ConnectionClosedError,
     ConnectionLoss,
     KazooException,
-    NoNodeError,
     NodeExistsError,
+    NoNodeError,
     SessionExpiredError,
     WriterNotClosedException,
 )
@@ -50,12 +51,12 @@ from kazoo.protocol.serialization import (
     Create2,
     Delete,
     Exists,
+    GetACL,
     GetChildren,
     GetChildren2,
-    GetACL,
-    SetACL,
     GetData,
     Reconfig,
+    SetACL,
     SetData,
     Sync,
     Transaction,
@@ -67,26 +68,25 @@ from kazoo.protocol.states import (
     KeeperState,
     WatchedEvent,
 )
-from kazoo.retry import KazooRetry
-from kazoo.security import ACL, OPEN_ACL_UNSAFE
 
 # convenience API
 from kazoo.recipe.barrier import Barrier, DoubleBarrier
 from kazoo.recipe.counter import Counter
 from kazoo.recipe.election import Election
-from kazoo.recipe.lease import NonBlockingLease, MultiNonBlockingLease
-from kazoo.recipe.lock import Lock, ReadLock, WriteLock, Semaphore
+from kazoo.recipe.lease import MultiNonBlockingLease, NonBlockingLease
+from kazoo.recipe.lock import Lock, ReadLock, Semaphore, WriteLock
 from kazoo.recipe.partitioner import SetPartitioner
 from kazoo.recipe.party import Party, ShallowParty
-from kazoo.recipe.queue import Queue, LockingQueue
+from kazoo.recipe.queue import LockingQueue, Queue
 from kazoo.recipe.watchers import ChildrenWatch, DataWatch
+from kazoo.retry import KazooRetry
+from kazoo.security import ACL, OPEN_ACL_UNSAFE
 
 if TYPE_CHECKING:
     from types import TracebackType
     from kazoo.interfaces import Event, IAsyncResult, IHandler
     from kazoo.protocol.states import ZnodeStat
     from kazoo.handlers.gevent import SequentialGeventHandler
-
 
 CLOSED_STATES = (
     KeeperState.EXPIRED_SESSION,
@@ -175,8 +175,7 @@ class KazooClient(object):
         use_ssl: bool = False,
         verify_certs: bool = True,
         check_hostname: bool = False,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     # FIXME This should be deprecated then killed
     @overload
@@ -207,8 +206,7 @@ class KazooClient(object):
         verify_certs: bool = True,
         check_hostname: bool = False,
         **kwargs: Unpack[LegacyRetryParams],
-    ) -> None:
-        ...
+    ) -> None: ...
 
     def __init__(
         self,
@@ -419,8 +417,8 @@ class KazooClient(object):
         if type(self._conn_retry) is KazooRetry:
             if self.handler.sleep_func != self._conn_retry.sleep_func:
                 raise ConfigurationError(
-                    "Retry handler and event handler "
-                    " must use the same sleep func"
+                    "Retry handler and event handler must use the "
+                    "same sleep func"
                 )
 
         if type(self.retry) is KazooRetry:
@@ -652,7 +650,7 @@ class KazooClient(object):
 
         if self.chroot is not None and new_chroot != self.chroot:
             raise ConfigurationError(
-                "Changing chroot at runtime is not " "currently supported"
+                "Changing chroot at runtime is not currently supported"
             )
 
         self.chroot = new_chroot
@@ -721,7 +719,7 @@ class KazooClient(object):
 
         if state in (KeeperState.CONNECTED, KeeperState.CONNECTED_RO):
             self.logger.info(
-                "Zookeeper connection established, " "state: %s", state
+                "Zookeeper connection established, state: %s", state
             )
             self._live.set()
             self._make_state_change(KazooState.CONNECTED)
@@ -930,16 +928,10 @@ class KazooClient(object):
 
         # Need a way of persauding mypy that the connection is live and thus
         # the socket is not None
-        peer = (
-            self._connection._socket.getpeername()[  # type: ignore[union-attr]
-                :2
-            ]
-        )
-        peer_host = (
-            self._connection._socket.getpeername()[  # type: ignore[union-attr]
-                1
-            ]
-        )
+        sock_obj = self._connection._socket
+        assert sock_obj is not None
+        peer = sock_obj.getpeername()[:2]
+        peer_host = peer[0]
         sock = self.handler.create_connection(
             peer,
             hostname=peer_host,
@@ -1116,8 +1108,7 @@ class KazooClient(object):
         sequence: bool = False,
         makepath: bool = False,
         include_data: Literal[False] = False,
-    ) -> str:
-        ...
+    ) -> str: ...
 
     @overload
     def create(
@@ -1129,8 +1120,7 @@ class KazooClient(object):
         sequence: bool = False,
         makepath: bool = False,
         include_data: Literal[True] = True,
-    ) -> tuple[str, ZnodeStat]:
-        ...
+    ) -> tuple[str, ZnodeStat]: ...
 
     def create(
         self,
@@ -1262,7 +1252,7 @@ class KazooClient(object):
             isinstance(acl, ACL) or not isinstance(acl, (tuple, list))
         ):
             raise TypeError(
-                "Invalid type for 'acl' (acl must be a tuple/list" " of ACL's"
+                "Invalid type for 'acl' (acl must be a tuple/list of ACL's"
             )
         if value is not None and not isinstance(value, bytes):
             raise TypeError("Invalid type for 'value' (must be a byte string)")
@@ -1518,8 +1508,7 @@ class KazooClient(object):
         path: str,
         watch: WatchFunc | None = None,
         include_data: Literal[False] = False,
-    ) -> list[str]:
-        ...
+    ) -> list[str]: ...
 
     @overload
     def get_children(
@@ -1527,8 +1516,7 @@ class KazooClient(object):
         path: str,
         watch: WatchFunc | None = None,
         include_data: Literal[True] = True,
-    ) -> tuple[list[str], ZnodeStat]:
-        ...
+    ) -> tuple[list[str], ZnodeStat]: ...
 
     def get_children(
         self,
@@ -1687,7 +1675,7 @@ class KazooClient(object):
             raise TypeError("Invalid type for 'path' (string expected)")
         if isinstance(acls, ACL) or not isinstance(acls, (tuple, list)):
             raise TypeError(
-                "Invalid type for 'acl' (acl must be a tuple/list" " of ACL's)"
+                "Invalid type for 'acl' (acl must be a tuple/list of ACL's)"
             )
         if not isinstance(version, int):
             raise TypeError("Invalid type for 'version' (int expected)")
@@ -1953,9 +1941,7 @@ class KazooClient(object):
         if leaving and not isinstance(leaving, str):
             raise TypeError("Invalid type for 'leaving' (string expected)")
         if new_members and not isinstance(new_members, str):
-            raise TypeError(
-                "Invalid type for 'new_members' (string " "expected)"
-            )
+            raise TypeError("Invalid type for 'new_members' (string expected)")
         if not isinstance(from_config, int):
             raise TypeError("Invalid type for 'from_config' (int expected)")
 
@@ -2015,7 +2001,7 @@ class TransactionRequest(object):
             raise TypeError("Invalid type for 'path' (string expected)")
         if acl and not isinstance(acl, (tuple, list)):
             raise TypeError(
-                "Invalid type for 'acl' (acl must be a tuple/list" " of ACL's"
+                "Invalid type for 'acl' (acl must be a tuple/list of ACL's"
             )
         if not isinstance(value, bytes):
             raise TypeError("Invalid type for 'value' (must be a byte string)")
