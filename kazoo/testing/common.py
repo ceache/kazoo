@@ -642,11 +642,7 @@ def dump_ensemble_logs() -> None:
             print(f"\n[kazoo] failed to fetch logs for {service}: {exc!r}")
             return
         for label, stream in (("stdout", stdout), ("stderr", stderr)):
-            text = (
-                stream.decode("utf-8", "replace")
-                if isinstance(stream, bytes)
-                else stream
-            )
+            text = stream if isinstance(stream, str) else str(stream)
             print(f"\n===== {service} {label} =====")
             print(text)
 
@@ -798,11 +794,17 @@ def _export_krb5_client_env(
             "is docker-compose.auth-sasl-gssapi.yml being used?"
         )
     kdc_port = tcp[0].PublishedPort
+    if kdc_port is None:
+        raise RuntimeError(
+            "sasl_gssapi: KDC published port was not found on TCP endpoint"
+        )
     kdc_host = tcp[0].normalize().URL
     if not kdc_host or kdc_host in ("0.0.0.0", "::", "::1", "localhost"):
         kdc_host = "127.0.0.1"
 
-    host_krb5 = _write_host_krb5_conf(docker_env.workdir, kdc_host, kdc_port)
+    host_krb5 = _write_host_krb5_conf(
+        docker_env.workdir, kdc_host, int(kdc_port)
+    )
     os.environ["KRB5_CONFIG"] = str(host_krb5)
     os.environ["KRB5_CLIENT_KTNAME"] = str(
         docker_env.workdir / "keytabs" / "client.keytab"

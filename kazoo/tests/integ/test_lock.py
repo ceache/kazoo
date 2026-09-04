@@ -11,7 +11,7 @@ from threading import Thread
 
 import pytest
 
-from kazoo.exceptions import CancelledError
+from kazoo.exceptions import CancelledError, LockTimeout
 from kazoo.recipe.lock import Lock, Semaphore
 from kazoo.tests import util as test_util
 

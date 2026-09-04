@@ -325,9 +325,16 @@ def zkensemble(
 
     # The ensemble exposes its client ports on ephemeral host ports; resolve
     # the actual host address/ports via the running compose stack.
-    zk1_port = docker_compose.get_service_port("zoo1", client_port)
-    zk2_port = docker_compose.get_service_port("zoo2", client_port)
-    zk3_port = docker_compose.get_service_port("zoo3", client_port)
+    p1 = docker_compose.get_service_port("zoo1", client_port)
+    p2 = docker_compose.get_service_port("zoo2", client_port)
+    p3 = docker_compose.get_service_port("zoo3", client_port)
+    if p1 is None or p2 is None or p3 is None:
+        raise RuntimeError(
+            "Failed to resolve ZooKeeper ensemble service ports"
+        )
+    zk1_port = int(p1)
+    zk2_port = int(p2)
+    zk3_port = int(p3)
 
     if docker_env.auth is common.ZKAuthMode.SASL_GSSAPI:
         common._export_krb5_client_env(docker_env, docker_compose)
@@ -338,8 +345,8 @@ def zkensemble(
     # published ports actually listen, and the GSSAPI service principal for
     # sasl_gssapi is derived from the connect host (``zookeeper@<host>``), so a
     # wildcard host there yields ``zookeeper@0.0.0.0`` and a PROCESS_TGS error.
-    zk_ip = docker_compose.get_service_host("zoo1", client_port)
-    if zk_ip in ("0.0.0.0", "::", "::1", "localhost"):
+    zk_ip = str(docker_compose.get_service_host("zoo1", client_port))
+    if not zk_ip or zk_ip in ("0.0.0.0", "::", "::1", "localhost"):
         zk_ip = "127.0.0.1"
 
     return common.ZkEnsemble(
