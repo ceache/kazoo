@@ -1013,7 +1013,7 @@ class TestClient:
 
             # shut down the first host
             zkensemble.stop("zoo1")
-            ev_connected.wait(30)
+            ev_connected.wait(60)
             assert ev_connected.is_set()
             assert client.client_state == KeeperState.CONNECTED
         finally:

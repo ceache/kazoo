@@ -782,6 +782,9 @@ class TestRunCompose:
             calls.append((cmd, kwargs.get("cwd")))
 
         monkeypatch.setattr(common.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            common.ZkEnsemble, "_wait_service_healthy", lambda *a, **kw: None
+        )
         ensemble = self._ensemble()
         ensemble.stop("zoo1")
         ensemble.start("zoo2")
@@ -917,6 +920,48 @@ class TestRunCompose:
         ensemble._wait_service_healthy("zoo1-service", handler=_FakeHandler())
         assert compose.container.polls == 2
         assert sleep_calls == [0.2]
+
+    def test_probe_node_healthy_success(self, monkeypatch):
+        class _FakeSocket:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def settimeout(self, timeout):
+                pass
+
+            def connect(self, addr):
+                pass
+
+            def sendall(self, data):
+                pass
+
+            def recv(self, n):
+                return b"imok"
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(common.socket, "socket", _FakeSocket)
+        ensemble = self._ensemble()
+        assert ensemble._probe_node_healthy("zoo1-service") is True
+
+    def test_probe_node_healthy_failure(self, monkeypatch):
+        class _FailingSocket:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def settimeout(self, timeout):
+                pass
+
+            def connect(self, addr):
+                raise ConnectionRefusedError
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(common.socket, "socket", _FailingSocket)
+        ensemble = self._ensemble()
+        assert ensemble._probe_node_healthy("zoo1-service") is False
 
 
 class _Proc:
