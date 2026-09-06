@@ -799,7 +799,7 @@ class ConnectionHandler(object):
             if client._state != KeeperState.CONNECTING:
                 self.logger.warning("Transition to CONNECTING")
                 client._session_callback(KeeperState.CONNECTING)
-        except AuthFailedError as err:
+        except (AuthFailedError, SASLException) as err:
             retry.reset()
             self.logger.warning("AUTH_FAILED closing: %s", err)
             client._session_callback(KeeperState.AUTH_FAILED)
@@ -914,13 +914,6 @@ class ConnectionHandler(object):
             read_timeout,
         )
 
-        if connect_result.read_only:
-            client._session_callback(KeeperState.CONNECTED_RO)
-            self._ro_mode = iter(self._server_pinger())
-        else:
-            client._session_callback(KeeperState.CONNECTED)
-            self._ro_mode = None
-
         if self.sasl_options is not None:
             self._authenticate_with_sasl(host, connect_timeout / 1000.0)
 
@@ -933,6 +926,13 @@ class ConnectionHandler(object):
             zxid = self._invoke(connect_timeout / 1000.0, ap, xid=AUTH_XID)
             if zxid:
                 client.last_zxid = zxid
+
+        if connect_result.read_only:
+            client._session_callback(KeeperState.CONNECTED_RO)
+            self._ro_mode = iter(self._server_pinger())
+        else:
+            client._session_callback(KeeperState.CONNECTED)
+            self._ro_mode = None
 
         return read_timeout, connect_timeout
 
@@ -998,8 +998,10 @@ class ConnectionHandler(object):
             try:
                 header, buffer, offset = self._read_header(timeout)
             except ConnectionDropped as exc:
-                # Zookeeper simply drops connections with failed authentication
-                raise AuthFailedError("Connection dropped in SASL") from exc
+                # If connection dropped during SASL handshake (e.g. server
+                # node died or restart in progress), raise ConnectionDropped
+                # so the connect loop retries other hosts.
+                raise ConnectionDropped("Connection dropped in SASL") from exc
 
             if header.xid != xid:
                 raise RuntimeError(
