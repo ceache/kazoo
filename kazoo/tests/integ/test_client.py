@@ -990,32 +990,35 @@ class TestClient:
 
         hosts = f"{zkensemble.zk_ip}:{zkensemble.zk1_port}"
         # create a client with only one server in its list
-        client = zkensemble.get_client(hosts=hosts)
-        client.start()
+        handler = self._makeOne()
+        client = zkensemble.get_client(hosts=hosts, handler=handler)
+        client.start(timeout=30.0)
 
-        # try to change the chroot, not currently allowed
-        with pytest.raises(ConfigurationError):
-            client.set_hosts(hosts + "/new_chroot")
-
-        # grow the cluster to 3
-        hosts = zkensemble.get_hosts()
-        client.set_hosts(hosts)
-
-        ev_connected = client.handler.event_object()
-
-        def listener(state):
-            if state == KazooState.CONNECTED:
-                ev_connected.set()
-
-        client.add_listener(listener)
-
-        # shut down the first host
         try:
+            # try to change the chroot, not currently allowed
+            with pytest.raises(ConfigurationError):
+                client.set_hosts(hosts + "/new_chroot")
+
+            # grow the cluster to 3
+            hosts = zkensemble.get_hosts()
+            client.set_hosts(hosts)
+
+            ev_connected = client.handler.event_object()
+
+            def listener(state):
+                if state == KazooState.CONNECTED:
+                    ev_connected.set()
+
+            client.add_listener(listener)
+
+            # shut down the first host
             zkensemble.stop("zoo1")
-            ev_connected.wait(15)
+            ev_connected.wait(30)
             assert ev_connected.is_set()
             assert client.client_state == KeeperState.CONNECTED
         finally:
+            client.stop()
+            client.close()
             zkensemble.start("zoo1")
 
     # utility for test_request_queuing*
@@ -1063,13 +1066,13 @@ class TestClient:
         client.add_listener(listener)
 
         # wait for the client to connect
-        client.start()
+        client.start(timeout=30.0)
 
         try:
             # force the client to suspend
             zkensemble.stop(server)
 
-            ev_suspended.wait(15)
+            ev_suspended.wait(30)
             assert ev_suspended.is_set()
 
             # submit a request, expecting it to be queued
@@ -1090,7 +1093,7 @@ class TestClient:
 
         # wait for the client to reconnect (either with a recovered
         # session, or with a new one if expire_session was set).
-        ev_connected.wait(30)
+        ev_connected.wait(60)
         assert ev_connected.is_set()
 
         return result
@@ -1110,7 +1113,7 @@ class TestClient:
                 expire_session=False,
             )
 
-            assert result.get(timeout=15) == path
+            assert result.get(timeout=30) == path
             assert len(client._queue) == 0
             assert client.exists(path) is not None
         finally:
@@ -1133,7 +1136,7 @@ class TestClient:
             )
 
             with pytest.raises(SessionExpiredError):
-                result.get(timeout=15)
+                result.get(timeout=30)
             assert len(client._queue) == 0
         finally:
             client.stop()

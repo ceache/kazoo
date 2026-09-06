@@ -13,7 +13,6 @@ pytest-facing wrappers and fixtures live in :mod:`kazoo.testing.fixtures`.
 
 from __future__ import annotations
 
-import concurrent.futures
 from dataclasses import dataclass
 import os
 import pathlib
@@ -22,7 +21,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 if sys.version_info >= (3, 11):
     from enum import StrEnum
@@ -297,6 +296,7 @@ class ZkEnsemble:
     workdir: pathlib.Path
     auth: ZKAuthMode = ZKAuthMode.PLAIN
     features: tuple[ZKFeature, ...] = (ZKFeature.STANDARD,)
+    handler: Any = None
 
     def get_hosts(self) -> str:
         """Return the comma-joined client host:port list for all members."""
@@ -382,6 +382,7 @@ class ZkEnsemble:
             hosts=client_hosts,
             **kwargs,
         )
+        object.__setattr__(self, "handler", client.handler)
         return client
 
     def lose_connection(
@@ -449,13 +450,37 @@ class ZkEnsemble:
 
         client.retry(client.get_async, "/")
 
-    def _run_compose(self, *args: str) -> None:
+    def _run_compose(self, *args: str, handler: Any = None) -> None:
         """Run a ``docker compose`` command against this ensemble's stack."""
-        _cooperative_run_subprocess(
+        h = handler if handler is not None else self.handler
+        _run_cooperative_subprocess(
             [*self.compose.compose_command_property, *args],
             cwd=self.compose.context,
             check=True,
+            handler=h,
         )
+
+    def _wait_service_healthy(
+        self, service: str, timeout: float = 30.0, handler: Any = None
+    ) -> None:
+        """Wait until the specified compose service reaches 'healthy' state."""
+        if self.compose is None or not hasattr(self.compose, "get_container"):
+            return
+        h = handler if handler is not None else self.handler
+        sleep_fn = (
+            h.sleep_func
+            if h is not None and hasattr(h, "sleep_func")
+            else time.sleep
+        )
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                container = self.compose.get_container(service)
+                if getattr(container, "Health", "") == "healthy":
+                    return
+            except Exception:
+                pass
+            sleep_fn(0.2)
 
     @staticmethod
     def _process_service(name: str) -> str:
@@ -473,65 +498,49 @@ class ZkEnsemble:
             return f"{name}-service"
         return name
 
-    def stop(self, name: str) -> None:
+    def stop(self, name: str, handler: Any = None) -> None:
         """Stop the specified ZK node's ZooKeeper process."""
-        self._run_compose("stop", self._process_service(name))
+        self._run_compose("stop", self._process_service(name), handler=handler)
 
-    def start(self, name: str) -> None:
-        """Start the specified ZK node's ZooKeeper process."""
-        self._run_compose("start", self._process_service(name))
+    def start(self, name: str, handler: Any = None) -> None:
+        """Start the specified ZK node's ZooKeeper process and wait until
+        healthy."""
+        service = self._process_service(name)
+        self._run_compose("start", service, handler=handler)
+        self._wait_service_healthy(service, handler=handler)
 
 
-def _cooperative_run_subprocess(
+def _run_cooperative_subprocess(
     cmd: list[str] | tuple[str, ...],
     cwd: str | os.PathLike[str] | None = None,
     check: bool = True,
+    handler: Any = None,
     **kwargs: Any,
 ) -> subprocess.CompletedProcess[Any]:
-    """Run a subprocess command cooperatively so cooperative multitasking
-    handlers (gevent / eventlet) continue running their event loops during
-    synchronous execution."""
+    """Run a subprocess command cooperatively, selecting the subprocess
+    implementation based on the active KazooClient handler."""
     target_cwd = str(cwd) if cwd is not None else None
+    handler_name = getattr(handler, "name", None)
 
-    def _execute() -> subprocess.CompletedProcess[Any]:
-        return subprocess.run(
-            cmd,
-            cwd=target_cwd,
-            check=check,
-            **kwargs,
+    if handler_name == "sequential_gevent_handler":
+        import gevent.subprocess as gevent_subprocess  # type: ignore[import]
+
+        return gevent_subprocess.run(
+            cmd, cwd=target_cwd, check=check, **kwargs
+        )
+    elif handler_name == "sequential_eventlet_handler":
+        from eventlet.green import (  # type: ignore[import]
+            subprocess as eventlet_subprocess,
         )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_execute)
-        while not future.done():
-            yielded = False
-            if "gevent" in sys.modules:
-                try:
-                    import gevent.hub  # type: ignore[import]
+        return cast(
+            subprocess.CompletedProcess[Any],
+            eventlet_subprocess.run(  # type: ignore[attr-defined]
+                cmd, cwd=target_cwd, check=check, **kwargs
+            ),
+        )
 
-                    get_hub = getattr(
-                        gevent.hub,
-                        "_get_hub",
-                        getattr(gevent.hub, "get_hub", None),
-                    )
-                    if get_hub is not None and get_hub() is not None:
-                        import gevent  # type: ignore[import]
-
-                        gevent.sleep(0.01)
-                        yielded = True
-                except Exception:
-                    pass
-            if not yielded and "eventlet" in sys.modules:
-                try:
-                    import eventlet  # type: ignore[import]
-
-                    eventlet.sleep(0.01)  # type: ignore[no-untyped-call]
-                    yielded = True
-                except Exception:
-                    pass
-            if not yielded:
-                time.sleep(0.01)
-        return future.result()
+    return subprocess.run(cmd, cwd=target_cwd, check=check, **kwargs)
 
 
 #: Module-global handle on the running compose stack, set by

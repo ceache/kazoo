@@ -22,7 +22,9 @@ import importlib
 import os
 import pathlib
 import subprocess
+import sys
 import threading
+import types
 
 import pytest
 
@@ -760,14 +762,14 @@ class _ComposeCommand:
 class TestRunCompose:
     """_run_compose / stop / start subprocess plumbing (T031)."""
 
-    def _ensemble(self):
+    def _ensemble(self, compose=None):
         return common.ZkEnsemble(
             zk_ip="127.0.0.1",
             zk1_port=2181,
             zk2_port=2182,
             zk3_port=2183,
             version="3.9.5",
-            compose=_ComposeCommand(),
+            compose=compose if compose is not None else _ComposeCommand(),
             workdir=pathlib.Path("/tmp"),
             auth=common.ZKAuthMode.PLAIN,
             features=(common.ZKFeature.STANDARD,),
@@ -788,8 +790,8 @@ class TestRunCompose:
             (["docker", "compose", "start", "zoo2-service"], "/tmp/compose"),
         ]
 
-    def test_cooperative_run_subprocess_success(self):
-        res = common._cooperative_run_subprocess(
+    def test_run_cooperative_subprocess_success(self):
+        res = common._run_cooperative_subprocess(
             ["python3", "-c", "print('hello')"],
             capture_output=True,
             text=True,
@@ -798,12 +800,98 @@ class TestRunCompose:
         assert res.returncode == 0
         assert res.stdout.strip() == "hello"
 
-    def test_cooperative_run_subprocess_called_process_error(self):
+    def test_run_cooperative_subprocess_called_process_error(self):
         with pytest.raises(common.subprocess.CalledProcessError):
-            common._cooperative_run_subprocess(
+            common._run_cooperative_subprocess(
                 ["python3", "-c", "import sys; sys.exit(2)"],
                 check=True,
             )
+
+    def test_run_cooperative_subprocess_gevent_handler(self, monkeypatch):
+        class _FakeGeventHandler:
+            name = "sequential_gevent_handler"
+
+        called = []
+        fake_gevent_subprocess = types.ModuleType("gevent.subprocess")
+
+        def fake_run(cmd, cwd=None, check=True, **kwargs):
+            called.append((cmd, cwd, check))
+            return "gevent_result"
+
+        fake_gevent_subprocess.run = fake_run  # type: ignore[attr-defined]
+        monkeypatch.setitem(
+            sys.modules, "gevent.subprocess", fake_gevent_subprocess
+        )
+
+        res = common._run_cooperative_subprocess(
+            ["echo", "hi"],
+            cwd="/tmp",
+            check=True,
+            handler=_FakeGeventHandler(),
+        )
+        assert res == "gevent_result"
+        assert called == [(["echo", "hi"], "/tmp", True)]
+
+    def test_run_cooperative_subprocess_eventlet_handler(self, monkeypatch):
+        class _FakeEventletHandler:
+            name = "sequential_eventlet_handler"
+
+        called = []
+        fake_eventlet_subprocess = types.ModuleType(
+            "eventlet.green.subprocess"
+        )
+
+        def fake_run(cmd, cwd=None, check=True, **kwargs):
+            called.append((cmd, cwd, check))
+            return "eventlet_result"
+
+        fake_eventlet_subprocess.run = fake_run  # type: ignore[attr-defined]
+        monkeypatch.setitem(
+            sys.modules,
+            "eventlet.green.subprocess",
+            fake_eventlet_subprocess,
+        )
+
+        res = common._run_cooperative_subprocess(
+            ["echo", "hi"],
+            cwd="/tmp",
+            check=True,
+            handler=_FakeEventletHandler(),
+        )
+        assert res == "eventlet_result"
+        assert called == [(["echo", "hi"], "/tmp", True)]
+
+    def test_wait_service_healthy(self):
+        class _FakeContainer:
+            def __init__(self):
+                self.polls = 0
+
+            @property
+            def Health(self):
+                self.polls += 1
+                return "healthy" if self.polls >= 2 else "starting"
+
+        class _FakeCompose:
+            def __init__(self):
+                self.container = _FakeContainer()
+
+            def get_container(self, service):
+                return self.container
+
+        compose = _FakeCompose()
+        ensemble = self._ensemble(compose=compose)
+        sleep_calls = []
+
+        class _FakeHandler:
+            name = "fake"
+
+            @staticmethod
+            def sleep_func(duration):
+                sleep_calls.append(duration)
+
+        ensemble._wait_service_healthy("zoo1-service", handler=_FakeHandler())
+        assert compose.container.polls == 2
+        assert sleep_calls == [0.2]
 
 
 class _Proc:
