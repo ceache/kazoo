@@ -991,7 +991,17 @@ class TestClient:
         hosts = f"{zkensemble.zk_ip}:{zkensemble.zk1_port}"
         # create a client with only one server in its list
         handler = self._makeOne()
-        client = zkensemble.get_client(hosts=hosts, handler=handler)
+        client = zkensemble.get_client(
+            hosts=hosts,
+            handler=handler,
+            connection_retry={
+                "max_tries": -1,
+                "delay": 0.1,
+                "backoff": 1,
+                "max_jitter": 0.0,
+                "sleep_func": handler.sleep_func,
+            },
+        )
         client.start(timeout=30.0)
 
         try:
@@ -1012,14 +1022,14 @@ class TestClient:
             client.add_listener(listener)
 
             # shut down the first host
-            zkensemble.stop("zoo1")
+            zkensemble.stop("zoo1", handler=handler)
             ev_connected.wait(60)
             assert ev_connected.is_set()
             assert client.client_state == KeeperState.CONNECTED
         finally:
             client.stop()
             client.close()
-            zkensemble.start("zoo1")
+            zkensemble.start("zoo1", handler=handler)
 
     # utility for test_request_queuing*
     def _make_request_queuing_client(

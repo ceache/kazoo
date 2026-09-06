@@ -798,7 +798,7 @@ class TestRunCompose:
                     "zoo2-service",
                     "--wait",
                     "--wait-timeout",
-                    "30",
+                    "60",
                 ],
                 "/tmp/compose",
             ),

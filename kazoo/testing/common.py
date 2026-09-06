@@ -512,7 +512,7 @@ class ZkEnsemble:
         healthy."""
         service = self._process_service(name)
         self._run_compose(
-            "start", service, "--wait", "--wait-timeout", "30", handler=handler
+            "start", service, "--wait", "--wait-timeout", "60", handler=handler
         )
 
 
