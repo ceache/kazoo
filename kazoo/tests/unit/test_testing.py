@@ -819,6 +819,14 @@ class TestRunCompose:
             return "gevent_result"
 
         fake_gevent_subprocess.run = fake_run  # type: ignore[attr-defined]
+        fake_gevent_pkg = sys.modules.get("gevent", types.ModuleType("gevent"))
+        monkeypatch.setattr(
+            fake_gevent_pkg,
+            "subprocess",
+            fake_gevent_subprocess,
+            raising=False,
+        )
+        monkeypatch.setitem(sys.modules, "gevent", fake_gevent_pkg)
         monkeypatch.setitem(
             sys.modules, "gevent.subprocess", fake_gevent_subprocess
         )
@@ -846,6 +854,23 @@ class TestRunCompose:
             return "eventlet_result"
 
         fake_eventlet_subprocess.run = fake_run  # type: ignore[attr-defined]
+        fake_eventlet_pkg = sys.modules.get(
+            "eventlet", types.ModuleType("eventlet")
+        )
+        fake_green_pkg = sys.modules.get(
+            "eventlet.green", types.ModuleType("eventlet.green")
+        )
+        monkeypatch.setattr(
+            fake_green_pkg,
+            "subprocess",
+            fake_eventlet_subprocess,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            fake_eventlet_pkg, "green", fake_green_pkg, raising=False
+        )
+        monkeypatch.setitem(sys.modules, "eventlet", fake_eventlet_pkg)
+        monkeypatch.setitem(sys.modules, "eventlet.green", fake_green_pkg)
         monkeypatch.setitem(
             sys.modules,
             "eventlet.green.subprocess",
