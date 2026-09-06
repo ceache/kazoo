@@ -484,28 +484,6 @@ class ZkEnsemble:
                 pass
             sleep_fn(0.2)
 
-    def _wait_service_healthy(
-        self, service: str, timeout: float = 30.0, handler: Any = None
-    ) -> None:
-        """Wait until the specified compose service reaches 'healthy' state."""
-        if self.compose is None or not hasattr(self.compose, "get_container"):
-            return
-        h = handler if handler is not None else self.handler
-        sleep_fn = (
-            h.sleep_func
-            if h is not None and hasattr(h, "sleep_func")
-            else time.sleep
-        )
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                container = self.compose.get_container(service)
-                if getattr(container, "Health", "") == "healthy":
-                    return
-            except Exception:
-                pass
-            sleep_fn(0.2)
-
     @staticmethod
     def _process_service(name: str) -> str:
         """Map a member name to the compose service running its ZK JVM.
@@ -533,8 +511,9 @@ class ZkEnsemble:
         """Start the specified ZK node's ZooKeeper process and wait until
         healthy."""
         service = self._process_service(name)
-        self._run_compose("start", service, handler=handler)
-        self._wait_service_healthy(service, handler=handler)
+        self._run_compose(
+            "start", service, "--wait", "--wait-timeout", "30", handler=handler
+        )
 
 
 def _run_cooperative_subprocess(

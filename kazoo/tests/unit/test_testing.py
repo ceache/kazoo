@@ -785,15 +785,23 @@ class TestRunCompose:
         monkeypatch.setattr(
             common.ZkEnsemble, "_wait_service_exited", lambda *a, **kw: None
         )
-        monkeypatch.setattr(
-            common.ZkEnsemble, "_wait_service_healthy", lambda *a, **kw: None
-        )
         ensemble = self._ensemble()
         ensemble.stop("zoo1")
         ensemble.start("zoo2")
         assert calls == [
             (["docker", "compose", "stop", "zoo1-service"], "/tmp/compose"),
-            (["docker", "compose", "start", "zoo2-service"], "/tmp/compose"),
+            (
+                [
+                    "docker",
+                    "compose",
+                    "start",
+                    "zoo2-service",
+                    "--wait",
+                    "--wait-timeout",
+                    "30",
+                ],
+                "/tmp/compose",
+            ),
         ]
 
     def test_run_cooperative_subprocess_success(self):
@@ -891,38 +899,6 @@ class TestRunCompose:
         )
         assert res == "eventlet_result"
         assert called == [(["echo", "hi"], "/tmp", True)]
-
-    def test_wait_service_healthy(self):
-        class _FakeContainer:
-            def __init__(self):
-                self.polls = 0
-
-            @property
-            def Health(self):
-                self.polls += 1
-                return "healthy" if self.polls >= 2 else "starting"
-
-        class _FakeCompose:
-            def __init__(self):
-                self.container = _FakeContainer()
-
-            def get_container(self, service):
-                return self.container
-
-        compose = _FakeCompose()
-        ensemble = self._ensemble(compose=compose)
-        sleep_calls = []
-
-        class _FakeHandler:
-            name = "fake"
-
-            @staticmethod
-            def sleep_func(duration):
-                sleep_calls.append(duration)
-
-        ensemble._wait_service_healthy("zoo1-service", handler=_FakeHandler())
-        assert compose.container.polls == 2
-        assert sleep_calls == [0.2]
 
     def test_wait_service_exited(self):
         class _FakeContainer:
