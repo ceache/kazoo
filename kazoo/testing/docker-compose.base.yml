@@ -102,6 +102,7 @@ x-zoo-healthcheck: &zoo_healthcheck
   interval: 3s
   timeout: 3s
   retries: 20
+  start_period: 15s
 
 services:
   # --- Member 1: network holder + ZooKeeper process ---

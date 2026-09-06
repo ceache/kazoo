@@ -18,8 +18,6 @@ import os
 import pathlib
 import re
 import shutil
-import socket
-import ssl
 import subprocess
 import sys
 import time
@@ -462,50 +460,12 @@ class ZkEnsemble:
             handler=h,
         )
 
-    def _probe_node_healthy(self, service: str) -> bool:
-        """Directly probe whether the ZooKeeper service is accepting
-        commands."""
-        port = self.zk1_port
-        if "2" in service:
-            port = self.zk2_port
-        elif "3" in service:
-            port = self.zk3_port
-
-        use_ssl = self.auth in (ZKAuthMode.TLS, ZKAuthMode.SASL_GSSAPI)
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1.0)
-            if use_ssl:
-                ca_cert = self.workdir / "certs" / "cacert.pem"
-                client_cert = self.workdir / "certs" / "client" / "client.pem"
-                client_key = self.workdir / "certs" / "client" / "client.key"
-                if (
-                    ca_cert.exists()
-                    and client_cert.exists()
-                    and client_key.exists()
-                ):
-                    ctx = ssl.create_default_context(cafile=str(ca_cert))
-                    ctx.load_cert_chain(
-                        certfile=str(client_cert),
-                        keyfile=str(client_key),
-                    )
-                    ctx.check_hostname = False
-                    ctx.verify_mode = ssl.CERT_REQUIRED
-                else:
-                    ctx = ssl._create_unverified_context()
-                sock = ctx.wrap_socket(sock)
-            sock.connect((self.zk_ip, port))
-            sock.sendall(b"ruok\n")
-            data = sock.recv(16)
-            sock.close()
-            return b"imok" in data
-        except Exception:
-            return False
-
-    def _wait_service_healthy(
+    def _wait_service_exited(
         self, service: str, timeout: float = 30.0, handler: Any = None
     ) -> None:
-        """Wait until the specified compose service reaches 'healthy' state."""
+        """Wait until the specified compose service reaches 'exited' state."""
+        if self.compose is None or not hasattr(self.compose, "get_container"):
+            return
         h = handler if handler is not None else self.handler
         sleep_fn = (
             h.sleep_func
@@ -514,17 +474,36 @@ class ZkEnsemble:
         )
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self._probe_node_healthy(service):
-                return
-            if self.compose is not None and hasattr(
-                self.compose, "get_container"
-            ):
-                try:
-                    container = self.compose.get_container(service)
-                    if getattr(container, "Health", "") == "healthy":
-                        return
-                except Exception:
-                    pass
+            try:
+                container = self.compose.get_container(
+                    service, include_all=True
+                )
+                if getattr(container, "State", "").lower() == "exited":
+                    return
+            except Exception:
+                pass
+            sleep_fn(0.2)
+
+    def _wait_service_healthy(
+        self, service: str, timeout: float = 30.0, handler: Any = None
+    ) -> None:
+        """Wait until the specified compose service reaches 'healthy' state."""
+        if self.compose is None or not hasattr(self.compose, "get_container"):
+            return
+        h = handler if handler is not None else self.handler
+        sleep_fn = (
+            h.sleep_func
+            if h is not None and hasattr(h, "sleep_func")
+            else time.sleep
+        )
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                container = self.compose.get_container(service)
+                if getattr(container, "Health", "") == "healthy":
+                    return
+            except Exception:
+                pass
             sleep_fn(0.2)
 
     @staticmethod
@@ -544,8 +523,11 @@ class ZkEnsemble:
         return name
 
     def stop(self, name: str, handler: Any = None) -> None:
-        """Stop the specified ZK node's ZooKeeper process."""
-        self._run_compose("stop", self._process_service(name), handler=handler)
+        """Stop the specified ZK node's ZooKeeper process and wait until
+        exited."""
+        service = self._process_service(name)
+        self._run_compose("stop", service, handler=handler)
+        self._wait_service_exited(service, handler=handler)
 
     def start(self, name: str, handler: Any = None) -> None:
         """Start the specified ZK node's ZooKeeper process and wait until

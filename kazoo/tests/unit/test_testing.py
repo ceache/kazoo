@@ -783,6 +783,9 @@ class TestRunCompose:
 
         monkeypatch.setattr(common.subprocess, "run", fake_run)
         monkeypatch.setattr(
+            common.ZkEnsemble, "_wait_service_exited", lambda *a, **kw: None
+        )
+        monkeypatch.setattr(
             common.ZkEnsemble, "_wait_service_healthy", lambda *a, **kw: None
         )
         ensemble = self._ensemble()
@@ -921,47 +924,37 @@ class TestRunCompose:
         assert compose.container.polls == 2
         assert sleep_calls == [0.2]
 
-    def test_probe_node_healthy_success(self, monkeypatch):
-        class _FakeSocket:
-            def __init__(self, *args, **kwargs):
-                pass
+    def test_wait_service_exited(self):
+        class _FakeContainer:
+            def __init__(self):
+                self.polls = 0
 
-            def settimeout(self, timeout):
-                pass
+            @property
+            def State(self):
+                self.polls += 1
+                return "exited" if self.polls >= 2 else "running"
 
-            def connect(self, addr):
-                pass
+        class _FakeCompose:
+            def __init__(self):
+                self.container = _FakeContainer()
 
-            def sendall(self, data):
-                pass
+            def get_container(self, service, include_all=False):
+                return self.container
 
-            def recv(self, n):
-                return b"imok"
+        compose = _FakeCompose()
+        ensemble = self._ensemble(compose=compose)
+        sleep_calls = []
 
-            def close(self):
-                pass
+        class _FakeHandler:
+            name = "fake"
 
-        monkeypatch.setattr(common.socket, "socket", _FakeSocket)
-        ensemble = self._ensemble()
-        assert ensemble._probe_node_healthy("zoo1-service") is True
+            @staticmethod
+            def sleep_func(duration):
+                sleep_calls.append(duration)
 
-    def test_probe_node_healthy_failure(self, monkeypatch):
-        class _FailingSocket:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def settimeout(self, timeout):
-                pass
-
-            def connect(self, addr):
-                raise ConnectionRefusedError
-
-            def close(self):
-                pass
-
-        monkeypatch.setattr(common.socket, "socket", _FailingSocket)
-        ensemble = self._ensemble()
-        assert ensemble._probe_node_healthy("zoo1-service") is False
+        ensemble._wait_service_exited("zoo1-service", handler=_FakeHandler())
+        assert compose.container.polls == 2
+        assert sleep_calls == [0.2]
 
 
 class _Proc:
