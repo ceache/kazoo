@@ -483,6 +483,9 @@ class ZkEnsemble:
             except Exception:
                 pass
             sleep_fn(0.2)
+        raise RuntimeError(
+            f"Service '{service}' did not exit within {timeout} seconds."
+        )
 
     def _wait_service_healthy(
         self, service: str, timeout: float = 60.0, handler: Any = None
@@ -513,6 +516,10 @@ class ZkEnsemble:
             except Exception:
                 pass
             sleep_fn(0.2)
+        raise RuntimeError(
+            f"Service '{service}' did not reach 'healthy' state within "
+            f"{timeout} seconds."
+        )
 
     @staticmethod
     def _process_service(name: str) -> str:

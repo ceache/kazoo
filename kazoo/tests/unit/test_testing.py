@@ -924,6 +924,23 @@ class TestRunCompose:
         assert compose.container.polls == 2
         assert sleep_calls == [0.2]
 
+    def test_wait_service_healthy_timeout(self):
+        class _FakeContainer:
+            @property
+            def Health(self):
+                return "starting"
+
+        class _FakeCompose:
+            def get_container(self, service):
+                return _FakeContainer()
+
+        compose = _FakeCompose()
+        ensemble = self._ensemble(compose=compose)
+        with pytest.raises(
+            RuntimeError, match="did not reach 'healthy' state"
+        ):
+            ensemble._wait_service_healthy("zoo1-service", timeout=0.01)
+
     def test_wait_service_exited(self):
         class _FakeContainer:
             def __init__(self):
@@ -955,6 +972,21 @@ class TestRunCompose:
         ensemble._wait_service_exited("zoo1-service", handler=_FakeHandler())
         assert compose.container.polls == 2
         assert sleep_calls == [0.2]
+
+    def test_wait_service_exited_timeout(self):
+        class _FakeContainer:
+            @property
+            def State(self):
+                return "running"
+
+        class _FakeCompose:
+            def get_container(self, service, include_all=False):
+                return _FakeContainer()
+
+        compose = _FakeCompose()
+        ensemble = self._ensemble(compose=compose)
+        with pytest.raises(RuntimeError, match="did not exit"):
+            ensemble._wait_service_exited("zoo1-service", timeout=0.01)
 
 
 class _Proc:

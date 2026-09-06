@@ -994,6 +994,7 @@ class TestClient:
         client = zkensemble.get_client(
             hosts=hosts,
             handler=handler,
+            timeout=30.0,
             connection_retry={
                 "max_tries": -1,
                 "delay": 0.1,
@@ -1043,6 +1044,7 @@ class TestClient:
             # connect to the first server in the ensemble
             hosts=f"{zkensemble.zk_ip}:{zkensemble.zk1_port}",
             handler=handler,
+            timeout=30.0,
             connection_retry={
                 "max_tries": -1,
                 "delay": 0.1,
