@@ -123,18 +123,7 @@ class TestAuthentication:
             client1.sync("/1")
 
             with pytest.raises(NoAuthError):
-                # If client1 is connected to a follower that hasn't applied
-                # the commit yet, it may transiently raise NoNodeError before
-                # the node appears and raises NoAuthError.
-                deadline = time.monotonic() + 5.0
-                while True:
-                    try:
-                        client1.get("/1")
-                        break
-                    except NoNodeError:
-                        if time.monotonic() >= deadline:
-                            raise
-                        time.sleep(0.05)
+                client1.get("/1")
 
         finally:
             client2.delete("/1")
