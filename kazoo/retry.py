@@ -87,9 +87,9 @@ class KazooRetry:
         self.deadline = deadline
         self._cur_stoptime: float | None = None
         self.sleep_func = sleep_func
-        self.retry_exceptions: tuple[
-            type[Exception], ...
-        ] = self.RETRY_EXCEPTIONS
+        self.retry_exceptions: tuple[type[Exception], ...] = (
+            self.RETRY_EXCEPTIONS
+        )
         self.interrupt = interrupt
         if ignore_expire:
             self.retry_exceptions += self.EXPIRED_EXCEPTIONS
@@ -114,6 +114,11 @@ class KazooRetry:
         )
         obj.retry_exceptions = self.retry_exceptions
         return obj
+
+    @property
+    def cur_delay(self) -> float:
+        """The current delay duration in seconds for the next retry attempt."""
+        return self._cur_delay
 
     def __call__(
         self,
