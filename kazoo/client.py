@@ -2106,3 +2106,8 @@ class TransactionRequest:
         self._check_tx_state()
         self.client.logger.log(BLATHER, "Added %r to %r", request, self)
         self.operations.append(request)
+
+
+# Temporary syntax issue to validate Ruff CI end-to-end
+def _ci_test_syntax_issue(:
+    pass
