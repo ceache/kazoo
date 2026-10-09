@@ -43,11 +43,14 @@ from kazoo.loggingsupport import BLATHER
 from kazoo.protocol.connection import ConnectionHandler
 from kazoo.protocol.paths import _prefix_root, normpath
 from kazoo.protocol.serialization import (
+    AddWatch,
     Auth,
     CheckVersion,
     CloseInstance,
     Create,
     Create2,
+    CreateContainer,
+    CreateTTL,
     Delete,
     Exists,
     GetChildren,
@@ -56,16 +59,20 @@ from kazoo.protocol.serialization import (
     SetACL,
     GetData,
     Reconfig,
+    RemoveWatches,
     SetData,
     Sync,
     Transaction,
 )
 from kazoo.protocol.states import (
     Callback,
+    CLOSED_STATES,
     EventType,
     KazooState,
     KeeperState,
     WatchedEvent,
+    AddWatchMode,
+    WatcherType,
 )
 from kazoo.retry import KazooRetry
 from kazoo.security import ACL, OPEN_ACL_UNSAFE
@@ -79,20 +86,22 @@ from kazoo.recipe.lock import Lock, ReadLock, WriteLock, Semaphore
 from kazoo.recipe.partitioner import SetPartitioner
 from kazoo.recipe.party import Party, ShallowParty
 from kazoo.recipe.queue import Queue, LockingQueue
-from kazoo.recipe.watchers import ChildrenWatch, DataWatch
+from kazoo.recipe.watchers import ChildrenWatch, DataWatch, ExistingDataWatch
 
 if TYPE_CHECKING:
     from types import TracebackType
+    from typing_extensions import Annotated
     from kazoo.interfaces import Event, IAsyncResult, IHandler
     from kazoo.protocol.states import ZnodeStat
     from kazoo.handlers.gevent import SequentialGeventHandler
 
+    class _Gt:
+        def __init__(self, gt: int) -> None:
+            self.gt = gt
 
-CLOSED_STATES = (
-    KeeperState.EXPIRED_SESSION,
-    KeeperState.AUTH_FAILED,
-    KeeperState.CLOSED,
-)
+    PositiveInt = Annotated[int, _Gt(0)]
+
+
 ENVI_VERSION = re.compile(r"([\d\.]*).*", re.DOTALL)
 ENVI_VERSION_KEY = "zookeeper.version"
 log = logging.getLogger(__name__)
@@ -175,6 +184,7 @@ class KazooClient:
         use_ssl: bool = False,
         verify_certs: bool = True,
         check_hostname: bool = False,
+        concurrent_request_limit: PositiveInt | None = None,
     ) -> None: ...
 
     # FIXME This should be deprecated then killed
@@ -205,6 +215,7 @@ class KazooClient:
         use_ssl: bool = False,
         verify_certs: bool = True,
         check_hostname: bool = False,
+        concurrent_request_limit: PositiveInt | None = None,
         **kwargs: Unpack[LegacyRetryParams],
     ) -> None: ...
 
@@ -229,6 +240,7 @@ class KazooClient:
         use_ssl: bool = False,
         verify_certs: bool = True,
         check_hostname: bool = False,
+        concurrent_request_limit: PositiveInt | None = None,
         **kwargs: Unpack[LegacyRetryParams],
     ) -> None:
         """Create a :class:`KazooClient` instance. All time arguments
@@ -293,6 +305,10 @@ class KazooClient:
             certs verification
         :param check_hostname: when using SSL, check the hostname
             against the hostname in the cert
+        :param concurrent_request_limit:
+            Maximum number of concurrent in-flight requests permitted on the
+            connection to the ZooKeeper server. If None (the default) or
+            non-positive, rate limiting is disabled.
 
         Basic Example:
 
@@ -364,6 +380,20 @@ class KazooClient:
         self.keyfile = keyfile
         self.keyfile_password = keyfile_password
         self.ca = ca
+        if (
+            concurrent_request_limit is not None
+            and concurrent_request_limit <= 0
+        ):
+            raise ConfigurationError(
+                "concurrent_request_limit must be greater than 0"
+            )
+        self.concurrent_request_limit = concurrent_request_limit
+        if concurrent_request_limit is not None:
+            self.logger.debug(
+                "Zookeeper client rate-limited to %d concurrent requests",
+                concurrent_request_limit,
+            )
+
         # Curator like simplified state tracking, and listeners for
         # state transitions
         self._state: KeeperState = KeeperState.CLOSED
@@ -375,6 +405,12 @@ class KazooClient:
         self._data_watchers: defaultdict[str, Set[WatchFunc]] = defaultdict(
             set
         )
+        self._persistent_watchers: defaultdict[str, Set[WatchFunc]] = (
+            defaultdict(set)
+        )
+        self._persistent_recursive_watchers: defaultdict[
+            str, Set[WatchFunc]
+        ] = defaultdict(set)
         self._reset()
         self.read_only = read_only
 
@@ -394,6 +430,8 @@ class KazooClient:
         self._stopped = self.handler.event_object()
         self._stopped.set()
         self._writer_stopped.set()
+        self._conn_result: IAsyncResult | None = None
+        self._auth_error: Exception | None = None
 
         # FIXME This is kind of gross but we need to set these to something so
         # that the type checker will understand that they are set by the time
@@ -529,6 +567,7 @@ class KazooClient:
         self.DoubleBarrier = partial(DoubleBarrier, self)
         self.ChildrenWatch = partial(ChildrenWatch, self)
         self.DataWatch = partial(DataWatch, self)
+        self.ExistingDataWatch = partial(ExistingDataWatch, self)
         self.Election = partial(Election, self)
         self.NonBlockingLease = partial(NonBlockingLease, self)
         self.MultiNonBlockingLease = partial(MultiNonBlockingLease, self)
@@ -567,8 +606,16 @@ class KazooClient:
         for data_watchers in self._data_watchers.values():
             watchers.extend(data_watchers)
 
+        for persistent_watchers in self._persistent_watchers.values():
+            watchers.extend(persistent_watchers)
+
+        for pr_watchers in self._persistent_recursive_watchers.values():
+            watchers.extend(pr_watchers)
+
         self._child_watchers = defaultdict(set)
         self._data_watchers = defaultdict(set)
+        self._persistent_watchers = defaultdict(set)
+        self._persistent_recursive_watchers = defaultdict(set)
 
         ev = WatchedEvent(EventType.NONE, self._state, None)
         for watch in watchers:
@@ -722,10 +769,26 @@ class KazooClient:
                 "Zookeeper connection established, state: %s", state
             )
             self._live.set()
+            if self._conn_result is not None and not self._conn_result.ready():
+                self._conn_result.set(True)
             self._make_state_change(KazooState.CONNECTED)
         elif state in CLOSED_STATES:
             self.logger.info("Zookeeper session closed, state: %s", state)
             self._live.clear()
+            if self._conn_result is not None and not self._conn_result.ready():
+                if state == KeeperState.AUTH_FAILED:
+                    if isinstance(self._auth_error, AuthFailedError):
+                        err: Exception = self._auth_error
+                    elif self._auth_error is not None:
+                        err = AuthFailedError("Authentication failed")
+                        err.__cause__ = self._auth_error
+                    else:
+                        err = AuthFailedError("Authentication failed")
+                    self._conn_result.set_exception(err)
+                elif state == KeeperState.CLOSED:
+                    self._conn_result.set_exception(
+                        ConnectionClosedError("Connection closed")
+                    )
             self._make_state_change(KazooState.LOST)
             self._notify_pending(state)
             self._reset()
@@ -766,6 +829,10 @@ class KazooClient:
 
     def _safe_close(self) -> None:
         self.handler.stop()
+        if self._conn_result is not None and not self._conn_result.ready():
+            self._conn_result.set_exception(
+                ConnectionClosedError("Connection closed")
+            )
         timeout = self._session_timeout // 1000
         if timeout < 10:
             timeout = 10
@@ -823,15 +890,20 @@ class KazooClient:
         :raises: :attr:`~kazoo.interfaces.IHandler.timeout_exception`
                  if the connection wasn't established within `timeout`
                  seconds.
+        :raises: :exc:`~kazoo.exceptions.AuthFailedError` if authentication
+                 failed during connection establishment.
 
         """
-        event = self.start_async()
-        event.wait(timeout=timeout)
-        if not self.connected:
-            # We time-out, ensure we are disconnected
+        if self._live.is_set():
+            return
+
+        async_result = self.start_async()
+        try:
+            async_result.get(timeout=timeout)
+        except Exception:
             self.stop()
             self.close()
-            raise self.handler.timeout_exception("Connection time-out")
+            raise
 
         if self.chroot and not self.exists("/"):
             warnings.warn(
@@ -839,17 +911,28 @@ class KazooClient:
                 "should be created before normal use."
             )
 
-    def start_async(self) -> Event:
+    def start_async(self) -> IAsyncResult:
         """Asynchronously initiate connection to ZK.
 
-        :returns: An event object that can be checked to see if the
-                  connection is alive.
-        :rtype: :class:`~threading.Event` compatible object.
+        :returns: An :class:`~kazoo.interfaces.IAsyncResult` instance that
+                  resolves to `True` when connected or fails with an
+                  exception on terminal failure.
 
         """
-        # If we're already connected, ignore
+        # If we're already connected, return an already-completed result
         if self._live.is_set():
-            return self._live
+            if self._conn_result is None:
+                # Defensive fallback to catch poor mocking in KazooClient
+                # internals (tests or mocks that manually set self._live.set()
+                # without going through start_async()). In production,
+                # self._conn_result is always initialized during start_async()
+                # and should *never* be None while self._live is set.
+                self._conn_result = self.handler.async_result()
+                self._conn_result.set(True)
+            return self._conn_result
+
+        if self._conn_result is not None and not self._conn_result.ready():
+            return self._conn_result
 
         # Make sure we're safely closed
         self._safe_close()
@@ -858,13 +941,14 @@ class KazooClient:
         # thread indicator
         self._stopped.clear()
         self._writer_stopped.clear()
+        self._conn_result = self.handler.async_result()
 
         # Start the handler
         self.handler.start()
 
         # Start the connection
         self._connection.start()
-        return self._live
+        return self._conn_result
 
     def stop(self) -> None:
         """Gracefully stop this Zookeeper session.
@@ -884,11 +968,8 @@ class KazooClient:
         self._stopped.set()
         self._queue.append((CloseInstance, cast("IAsyncResult", None)))
         try:
-            # This assert should never fail since the connection should
-            # have been started but I'm not sure how to persaude mypy of that
-            self._connection._write_sock.send(  # type: ignore[union-attr]
-                b"\0"
-            )
+            if self._connection._write_sock is not None:
+                self._connection._write_sock.send(b"\0")
         finally:
             self._safe_close()
 
@@ -1102,6 +1183,8 @@ class KazooClient:
         sequence: bool = False,
         makepath: bool = False,
         include_data: Literal[False] = False,
+        container: bool = False,
+        ttl: int = 0,
     ) -> str: ...
 
     @overload
@@ -1114,6 +1197,8 @@ class KazooClient:
         sequence: bool = False,
         makepath: bool = False,
         include_data: Literal[True] = True,
+        container: bool = False,
+        ttl: int = 0,
     ) -> tuple[str, ZnodeStat]: ...
 
     def create(
@@ -1125,6 +1210,8 @@ class KazooClient:
         sequence: bool = False,
         makepath: bool = False,
         include_data: bool = False,
+        container: bool = False,
+        ttl: int = 0,
     ) -> str | tuple[str, ZnodeStat]:
         """Create a node with the given value as its data. Optionally
         set an ACL on the node.
@@ -1202,6 +1289,9 @@ class KazooClient:
             The `makepath` option.
         .. versionadded:: 2.7
             The `include_data` option.
+        .. versionadded:: 2.9
+            The `container` and `ttl` options.
+
         """
         acl = acl or self.default_acl
         return cast(
@@ -1214,6 +1304,8 @@ class KazooClient:
                 sequence=sequence,
                 makepath=makepath,
                 include_data=include_data,
+                container=container,
+                ttl=ttl,
             ).get(),
         )
 
@@ -1226,6 +1318,8 @@ class KazooClient:
         sequence: bool = False,
         makepath: bool = False,
         include_data: bool = False,
+        container: bool = False,
+        ttl: int = 0,
     ) -> IAsyncResult:
         """Asynchronously create a ZNode. Takes the same arguments as
         :meth:`create`.
@@ -1236,55 +1330,42 @@ class KazooClient:
             The makepath option.
         .. versionadded:: 2.7
             The `include_data` option.
+        .. versionadded:: 2.9
+            The `container` and `ttl` options.
         """
+        if not isinstance(makepath, bool):
+            raise TypeError("Invalid type for 'makepath' (bool expected)")
+
         if acl is None and self.default_acl:
             acl = self.default_acl
 
-        if not isinstance(path, str):
-            raise TypeError("Invalid type for 'path' (string expected)")
-        if acl and (
-            isinstance(acl, ACL) or not isinstance(acl, (tuple, list))
-        ):
-            raise TypeError(
-                "Invalid type for 'acl' (acl must be a tuple/list of ACL's"
-            )
-        if value is not None and not isinstance(value, bytes):
-            raise TypeError("Invalid type for 'value' (must be a byte string)")
-        if not isinstance(ephemeral, bool):
-            raise TypeError("Invalid type for 'ephemeral' (bool expected)")
-        if not isinstance(sequence, bool):
-            raise TypeError("Invalid type for 'sequence' (bool expected)")
-        if not isinstance(makepath, bool):
-            raise TypeError("Invalid type for 'makepath' (bool expected)")
-        if not isinstance(include_data, bool):
-            raise TypeError("Invalid type for 'include_data' (bool expected)")
-
-        flags = 0
-        if ephemeral:
-            flags |= 1
-        if sequence:
-            flags |= 2
-        if acl is None:
-            acl = OPEN_ACL_UNSAFE
-
+        opcode = _create_opcode(
+            path,
+            value,
+            acl,
+            self.chroot,
+            ephemeral,
+            sequence,
+            include_data,
+            container,
+            ttl,
+        )
         async_result = self.handler.async_result()
 
         @capture_exceptions(async_result)
         def do_create() -> None:
-            result = self._create_async_inner(
-                path,
-                value,
-                # The way acl is constructed ends up confusing mypy, which
-                # thinks that acl can be None here, even though the code
-                # above ensures that if acl is None, it gets set to
-                # OPEN_ACL_UNSAFE, so we ignore the type error here.
-                # behaves differently in python3.8 and python3.14, sigh.
-                acl,  # type: ignore[arg-type]
-                flags,
-                trailing=sequence,
-                include_data=include_data,
-            )
-            result.rawlink(create_completion)
+            inner_async_result = self.handler.async_result()
+
+            call_result = self._call(opcode, inner_async_result)
+            if call_result is False:
+                # We hit a short-circuit exit on the _call. Because we are
+                # not using the original async_result here, we bubble the
+                # exception upwards to the do_create function in
+                # KazooClient.create so that it gets set on the correct
+                # async_result object
+                raise cast(Exception, inner_async_result.exception)
+
+            inner_async_result.rawlink(create_completion)
 
         @capture_exceptions(async_result)
         def retry_completion(result: IAsyncResult) -> None:
@@ -1296,11 +1377,11 @@ class KazooClient:
             result: IAsyncResult,
         ) -> str | tuple[str, ZnodeStat] | None:
             try:
-                if include_data:
+                if opcode.type == Create.type:
+                    return self.unchroot(result.get())
+                else:
                     new_path, stat = result.get()
                     return self.unchroot(new_path), stat
-                else:
-                    return self.unchroot(result.get())
             except NoNodeError:
                 if not makepath:
                     raise
@@ -1312,39 +1393,6 @@ class KazooClient:
                 return None
 
         do_create()
-        return async_result
-
-    def _create_async_inner(
-        self,
-        path: str,
-        value: bytes | None,
-        acl: Sequence[ACL],
-        flags: int,
-        trailing: bool = False,
-        include_data: bool = False,
-    ) -> IAsyncResult:
-        async_result = self.handler.async_result()
-        opcode = Create2 if include_data else Create
-
-        call_result = self._call(
-            opcode(
-                _prefix_root(self.chroot, path, trailing=trailing),
-                value,
-                acl,
-                flags,
-            ),
-            async_result,
-        )
-        if call_result is False:
-            # We hit a short-circuit exit on the _call. Because we are
-            # not using the original async_result here, we bubble the
-            # exception upwards to the do_create function in
-            # KazooClient.create so that it gets set on the correct
-            # async_result object
-            # Note: Do we actually need call_result? It seems like we could
-            # just check the state of the exception, and avoid the typing
-            # stuff.
-            raise async_result.exception  # type: ignore[misc]
         return async_result
 
     def ensure_path(self, path: str, acl: Sequence[ACL] | None = None) -> bool:
@@ -1945,6 +1993,153 @@ class KazooClient:
 
         return async_result
 
+    def add_watch(
+        self,
+        path: str,
+        watch: WatchFunc,
+        mode: AddWatchMode | int,
+    ) -> None:
+        """Add a watch.
+
+        This method adds persistent watches.  Unlike the data and
+        child watches which may be set by calls to
+        :meth:`KazooClient.exists`, :meth:`KazooClient.get`, and
+        :meth:`KazooClient.get_children`, persistent watches are not
+        removed after being triggered.
+
+        To remove a persistent watch, use
+        :meth:`KazooClient.remove_all_watches` with an argument of
+        :attr:`~kazoo.protocol.states.WatcherType.ANY`.
+
+        The `mode` argument determines whether or not the watch is
+        recursive.  To set a persistent watch, use
+        :class:`~kazoo.protocol.states.AddWatchMode.PERSISTENT`.  To set a
+        persistent recursive watch, use
+        :class:`~kazoo.protocol.states.AddWatchMode.PERSISTENT_RECURSIVE`.
+
+        :param path: Path of node to watch.
+        :param watch: Watch callback to set for future changes
+        :param mode: The mode to use
+                      (:class:`~kazoo.protocol.states.AddWatchMode.PERSISTENT`
+                      or
+                      :class:`~kazoo.protocol.states.AddWatchMode.PERSISTENT_RECURSIVE`).
+        :type mode: :class:`~kazoo.protocol.states.AddWatchMode` | int
+
+        :raises:
+            :exc:`TypeError` if arguments have invalid types.
+
+            :exc:`ValueError` if mode is not a valid
+            :class:`~kazoo.protocol.states.AddWatchMode`.
+
+            :exc:`~kazoo.exceptions.UnimplementedError` if the connected
+            ZooKeeper server does not support persistent watches
+            (requires ZooKeeper 3.6.0+).
+
+            :exc:`~kazoo.exceptions.ZookeeperError` if the server
+            returns a non-zero error code.
+        """
+        self.add_watch_async(path, watch, mode).get()
+
+    def add_watch_async(
+        self,
+        path: str,
+        watch: WatchFunc,
+        mode: AddWatchMode | int,
+    ) -> IAsyncResult:
+        """Asynchronously add a watch. Takes the same arguments as
+        :meth:`add_watch`.
+
+        :rtype: :class:`~kazoo.interfaces.IAsyncResult`
+        """
+        if not isinstance(path, str):
+            raise TypeError("Invalid type for 'path' (string expected)")
+        if not callable(watch):
+            raise TypeError("Invalid type for 'watch' (must be a callable)")
+        if not isinstance(mode, int):
+            raise TypeError("Invalid type for 'mode' (int expected)")
+        if mode not in (
+            AddWatchMode.PERSISTENT,
+            AddWatchMode.PERSISTENT_RECURSIVE,
+        ):
+            raise ValueError("Invalid value for 'mode'")
+
+        async_result = self.handler.async_result()
+        self._call(
+            AddWatch(_prefix_root(self.chroot, path), watch, mode),
+            async_result,
+        )
+        return async_result
+
+    def remove_all_watches(
+        self,
+        path: str,
+        watcher_type: WatcherType | int,
+    ) -> None:
+        """Remove watches from a path.
+
+        This removes all watches of a specified type (data, child,
+        any) from a given path.
+
+        The `watcher_type` argument specifies which type to use.  It
+        may be one of:
+
+        * :attr:`~kazoo.protocol.states.WatcherType.DATA`
+        * :attr:`~kazoo.protocol.states.WatcherType.CHILDREN`
+        * :attr:`~kazoo.protocol.states.WatcherType.ANY`
+
+        To remove persistent watches, specify a watcher type of
+        :attr:`~kazoo.protocol.states.WatcherType.ANY`.
+
+        :param path: Path of watch to remove.
+        :param watcher_type: The type of watch to remove.
+        :type watcher_type: :class:`~kazoo.protocol.states.WatcherType` | int
+
+        :raises:
+            :exc:`TypeError` if arguments have invalid types.
+
+            :exc:`ValueError` if watcher_type is not a valid
+            :class:`~kazoo.protocol.states.WatcherType`.
+
+            :exc:`~kazoo.exceptions.NoWatcherError` if no watcher exists
+            matching the criteria.
+
+            :exc:`~kazoo.exceptions.UnimplementedError` if the connected
+            ZooKeeper server does not support removing watches
+            (requires ZooKeeper 3.5.0+).
+
+            :exc:`~kazoo.exceptions.ZookeeperError` if the server
+            returns a non-zero error code.
+        """
+        self.remove_all_watches_async(path, watcher_type).get()
+
+    def remove_all_watches_async(
+        self,
+        path: str,
+        watcher_type: WatcherType | int,
+    ) -> IAsyncResult:
+        """Asynchronously remove watches. Takes the same arguments as
+        :meth:`remove_all_watches`.
+
+        :rtype: :class:`~kazoo.interfaces.IAsyncResult`
+        """
+        if not isinstance(path, str):
+            raise TypeError("Invalid type for 'path' (string expected)")
+        if not isinstance(watcher_type, int):
+            raise TypeError("Invalid type for 'watcher_type' (int expected)")
+        if watcher_type not in (
+            WatcherType.ANY,
+            WatcherType.CHILDREN,
+            WatcherType.DATA,
+        ):
+            raise ValueError("Invalid value for 'watcher_type'")
+
+        async_result = self.handler.async_result()
+        self._call(
+            RemoveWatches(_prefix_root(self.chroot, path), watcher_type),
+            async_result,
+        )
+        return async_result
+
 
 class TransactionRequest:
     """A Zookeeper Transaction Request
@@ -1980,6 +2175,9 @@ class TransactionRequest:
         acl: Sequence[ACL] | None = None,
         ephemeral: bool = False,
         sequence: bool = False,
+        include_data: bool = False,
+        container: bool = False,
+        ttl: int = 0,
     ) -> None:
         """Add a create ZNode to the transaction. Takes the same
         arguments as :meth:`KazooClient.create`, with the exception
@@ -1987,35 +2185,24 @@ class TransactionRequest:
 
         :returns: None
 
+        .. versionadded:: 2.9
+            The `include_data`, `container` and `ttl` options.
         """
         if acl is None and self.client.default_acl:
             acl = self.client.default_acl
 
-        if not isinstance(path, str):
-            raise TypeError("Invalid type for 'path' (string expected)")
-        if acl and not isinstance(acl, (tuple, list)):
-            raise TypeError(
-                "Invalid type for 'acl' (acl must be a tuple/list of ACL's"
-            )
-        if not isinstance(value, bytes):
-            raise TypeError("Invalid type for 'value' (must be a byte string)")
-        if not isinstance(ephemeral, bool):
-            raise TypeError("Invalid type for 'ephemeral' (bool expected)")
-        if not isinstance(sequence, bool):
-            raise TypeError("Invalid type for 'sequence' (bool expected)")
-
-        flags = 0
-        if ephemeral:
-            flags |= 1
-        if sequence:
-            flags |= 2
-        if acl is None:
-            acl = OPEN_ACL_UNSAFE
-
-        self._add(
-            Create(_prefix_root(self.client.chroot, path), value, acl, flags),
-            None,
+        opcode = _create_opcode(
+            path,
+            value,
+            acl,
+            self.client.chroot,
+            ephemeral,
+            sequence,
+            include_data,
+            container,
+            ttl,
         )
+        self._add(opcode, None)
 
     def delete(self, path: str, version: int = -1) -> None:
         """Add a delete ZNode to the transaction. Takes the same
@@ -2106,3 +2293,86 @@ class TransactionRequest:
         self._check_tx_state()
         self.client.logger.log(BLATHER, "Added %r to %r", request, self)
         self.operations.append(request)
+
+
+def _create_opcode(
+    path: str,
+    value: bytes | None,
+    acl: Sequence[ACL] | None,
+    chroot: str | None,
+    ephemeral: bool,
+    sequence: bool,
+    include_data: bool,
+    container: bool,
+    ttl: int,
+) -> Create | Create2 | CreateContainer | CreateTTL:
+    """Helper function.
+    Creates the create OpCode for regular `client.create()` operations as
+    well as in a `client.transaction()` context.
+    """
+    if not isinstance(path, str):
+        raise TypeError("Invalid type for 'path' (string expected)")
+    if acl and (isinstance(acl, ACL) or not isinstance(acl, (tuple, list))):
+        raise TypeError(
+            "Invalid type for 'acl' (acl must be a tuple/list of ACL's"
+        )
+    if value is not None and not isinstance(value, bytes):
+        raise TypeError("Invalid type for 'value' (must be a byte string)")
+    if not isinstance(ephemeral, bool):
+        raise TypeError("Invalid type for 'ephemeral' (bool expected)")
+    if not isinstance(sequence, bool):
+        raise TypeError("Invalid type for 'sequence' (bool expected)")
+    if not isinstance(include_data, bool):
+        raise TypeError("Invalid type for 'include_data' (bool expected)")
+    if not isinstance(container, bool):
+        raise TypeError("Invalid type for 'container' (bool expected)")
+    if not isinstance(ttl, int) or ttl < 0:
+        raise TypeError("Invalid 'ttl' (integer >= 0 expected)")
+    if ttl and ephemeral:
+        raise TypeError("Invalid node creation: ephemeral & ttl")
+    if container and (ephemeral or sequence or ttl):
+        raise TypeError(
+            "Invalid node creation: container & ephemeral/sequence/ttl"
+        )
+
+    # Should match Zookeeper's CreateMode fromFlag
+    # https://github.com/apache/zookeeper/blob/master/zookeeper-server/
+    # src/main/java/org/apache/zookeeper/CreateMode.java#L112
+    flags = 0
+    if ephemeral:
+        flags |= 1
+    if sequence:
+        flags |= 2
+    if container:
+        flags = 4
+    if ttl:
+        if sequence:
+            flags = 6
+        else:
+            flags = 5
+
+    if acl is None:
+        acl = OPEN_ACL_UNSAFE
+
+    # Figure out the OpCode we are going to send
+    root = chroot or ""
+    if include_data:
+        return Create2(
+            _prefix_root(root, path, trailing=sequence), value, acl, flags
+        )
+    elif container:
+        return CreateContainer(
+            _prefix_root(root, path, trailing=False), value, acl, flags
+        )
+    elif ttl:
+        return CreateTTL(
+            _prefix_root(root, path, trailing=sequence),
+            value,
+            acl,
+            flags,
+            ttl,
+        )
+    else:
+        return Create(
+            _prefix_root(root, path, trailing=sequence), value, acl, flags
+        )
