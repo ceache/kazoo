@@ -53,6 +53,11 @@ jobs:
         # the plain auth/feature axis. The auth and feature axes run separately
         # (test_axes) on the latest Python target to keep the combinatorial
         # cost bounded.
+        #
+        # NOTE: If you add or remove Python versions or ZooKeeper versions from this
+        # matrix, you MUST update `codecov.after_n_builds` in .codecov.yml to match
+        # len(python-version) * len(zk-version) so Codecov waits for all matrix builds
+        # before evaluating coverage status checks.
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "pypy-3.11-v7.3.21"]
         zk-version: ["3.7.2", "3.8.6", "3.9.5"]
     steps:
