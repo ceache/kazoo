@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 import atexit
 import logging
-
-from typing import Any, Callable, Iterable, TYPE_CHECKING, cast
+from typing import Any, TYPE_CHECKING, cast
 
 
 from kazoo.handlers.utils import selector_select
@@ -157,6 +157,9 @@ class SequentialGeventHandler:
             selectors_module=gevent.selectors,
             **kwargs,  # type: ignore[misc]
         )
+
+    def create_selector(self) -> Any:
+        return gevent.selectors.DefaultSelector()
 
     def socket(self) -> Socket:
         return utils.create_tcp_socket(socket)

@@ -11,18 +11,18 @@
 from __future__ import annotations
 
 
+from collections.abc import Callable, Iterable
 from typing import (
     Any,
-    Callable,
-    Iterable,
     Protocol,
-    Union,
     TYPE_CHECKING,
+    TypeAlias,
 )
 
 if TYPE_CHECKING:
     from types import TracebackType
     import queue
+    import selectors
     from kazoo.protocol.states import Callback
 
 # public API
@@ -34,7 +34,7 @@ class HasFileNo(Protocol):
     def fileno(self) -> int: ...
 
 
-FdLike = Union[int, HasFileNo]
+FdLike: TypeAlias = int | HasFileNo
 
 
 class Socket(HasFileNo, Protocol):
@@ -190,6 +190,9 @@ class IHandler(Protocol):
     ) -> tuple[Iterable[FdLike], Iterable[FdLike], Iterable[FdLike]]:
         """A select method that implements Python's select.select
         API"""
+
+    def create_selector(self) -> selectors.BaseSelector:
+        """Return a new selector instance appropriate for this handler."""
 
     def socket(self) -> Socket:
         """A socket method that implements Python's socket.socket API"""
