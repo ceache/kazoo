@@ -876,26 +876,35 @@ def _export_krb5_client_env(
     # FILE cache for a kinit -c target; do not inherit a stale API: cache
     # location or the default macOS shared cache.
     ccache = docker_env.workdir / f"krb5cc-{os.getpid()}"
-    ccache.unlink(missing_ok=True)
     kinit_env = dict(os.environ)
     kinit_env.pop("KRB5CCNAME", None)
-    kinit_rc = subprocess.run(
-        [
-            "kinit",
-            "-c",
-            str(ccache),
-            "-kt",
-            os.environ["KRB5_CLIENT_KTNAME"],
-            "client@EXAMPLE.ORG",
-        ],
-        capture_output=True,
-        text=True,
-        env=kinit_env,
-    ).returncode
+    kinit_rc = 1
+    kinit_err = ""
+    for _ in range(3):
+        kinit_proc = subprocess.run(
+            [
+                "kinit",
+                "-c",
+                str(ccache),
+                "-kt",
+                os.environ["KRB5_CLIENT_KTNAME"],
+                "client@EXAMPLE.ORG",
+            ],
+            capture_output=True,
+            text=True,
+            env=kinit_env,
+        )
+        kinit_rc = kinit_proc.returncode
+        if kinit_rc == 0:
+            break
+        kinit_err = getattr(kinit_proc, "stderr", None) or ""
+        time.sleep(0.1)
+
     if kinit_rc != 0:
+        err_msg = f": {kinit_err.strip()}" if kinit_err.strip() else ""
         raise RuntimeError(
             "sasl_gssapi: host-side kinit failed; KDC unreachable from "
-            f"client context (rc={kinit_rc}). See {host_krb5} and the "
-            "transport-format note in the common module docstring."
+            f"client context (rc={kinit_rc}{err_msg}). See {host_krb5} "
+            "and the transport-format note in the common module docstring."
         )
     os.environ["KRB5CCNAME"] = f"FILE:{ccache}"
