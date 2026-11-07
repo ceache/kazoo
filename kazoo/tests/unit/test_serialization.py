@@ -668,3 +668,71 @@ class TestAddWatch:
 
     def test_deserialize(self) -> None:
         assert serialization.AddWatch.deserialize(b"", 0) is None
+
+
+class TestDataclassPacketsAndFrameDecoder:
+    def test_all_packets_are_slotted_dataclasses(self) -> None:
+        from dataclasses import FrozenInstanceError, is_dataclass
+
+        packets = [
+            serialization.CloseInstance,
+            serialization.PingInstance,
+            serialization.Connect(0, 0, 10000, 0, b"", False),
+            serialization.Create("/p", b"", _make_acl_list(), 0),
+            serialization.Delete("/p", -1),
+            serialization.Exists("/p", None),
+            serialization.GetData("/p", None),
+            serialization.SetData("/p", b"", -1),
+            serialization.GetACL("/p"),
+            serialization.SetACL("/p", _make_acl_list(), -1),
+            serialization.GetChildren("/p", None),
+            serialization.Sync("/p"),
+            serialization.GetChildren2("/p", None),
+            serialization.CheckVersion("/p", 0),
+            serialization.Create2("/p", b"", _make_acl_list(), 0),
+            serialization.CreateContainer("/p", b"", _make_acl_list(), 4),
+            serialization.CreateTTL("/p", b"", _make_acl_list(), 5, 1000),
+            serialization.Transaction([]),
+            serialization.Reconfig(None, None, "m", -1),
+            serialization.RemoveWatches("/p", 1),
+            serialization.Auth(0, "digest", "u:p"),
+            serialization.SASL(b"tok"),
+            serialization.AddWatch("/p", lambda ev: None, 0),
+            serialization.Watch(1, 3, "/p"),
+            serialization.ReplyHeader(1, 2, 0),
+            serialization.MultiHeader(1, False, -1),
+            serialization.PingResponse(10),
+            serialization.AuthResponse(10),
+            serialization.WatchPacket(10, serialization.Watch(1, 3, "/p")),
+            serialization.SASLResponse(1, 10, 0, b"tok"),
+            serialization.ReplyPacket(
+                serialization.ReplyHeader(1, 2, 0), b"", 0
+            ),
+        ]
+        for pkt in packets:
+            assert is_dataclass(pkt)
+            assert not hasattr(pkt, "__dict__")
+            with pytest.raises((FrozenInstanceError, TypeError)):
+                pkt.path = "/mutated"  # type: ignore[misc, union-attr]
+
+    def test_frame_decoder_encode_and_pop_watch_packet(self) -> None:
+        decoder = serialization.FrameDecoder()
+        encoded_ping = serialization.FrameDecoder.encode_request(
+            serialization.PingInstance, xid=serialization.PING_XID
+        )
+        assert encoded_ping == _int_struct.pack(8) + _int_int_struct.pack(
+            -2, 11
+        )
+
+        # Build a WATCH_XID (-1) server frame
+        watch_payload = (
+            _reply_header_struct.pack(-1, 555, 0)
+            + _int_int_struct.pack(3, 3)
+            + _write_string("/watched")
+        )
+        decoder.feed(_int_struct.pack(len(watch_payload)) + watch_payload)
+        pkt = decoder.pop_packet()
+        assert pkt == serialization.WatchPacket(
+            zxid=555,
+            watch=serialization.Watch(type=3, state=3, path="/watched"),
+        )
