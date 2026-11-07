@@ -86,3 +86,43 @@ def test_reset_watchers_clears_persistent_watchers() -> None:
 
     assert len(client._persistent_watchers) == 0
     assert len(client._persistent_recursive_watchers) == 0
+
+
+def test_client_lifecycle_properties() -> None:
+    from kazoo.protocol.statemachine import (
+        AuthFailed,
+        Connected,
+        Connecting,
+        Inactive,
+    )
+
+    client = KazooClient(hosts="127.0.0.1:2181")
+
+    # Initial state is Inactive
+    assert client.connected is False
+    assert client.is_stopped is True
+    assert client.is_terminal is False
+
+    # Connected state
+    client._state_machine.state = Connected()
+    assert client.connected is True
+    assert client.is_stopped is False
+    assert client.is_terminal is False
+
+    # Connecting state
+    client._state_machine.state = Connecting()
+    assert client.connected is False
+    assert client.is_stopped is False
+    assert client.is_terminal is False
+
+    # AuthFailed state
+    client._state_machine.state = AuthFailed()
+    assert client.connected is False
+    assert client.is_stopped is False
+    assert client.is_terminal is True
+
+    # Inactive state & double stop no-op
+    client._state_machine.state = Inactive()
+    assert client.is_stopped is True
+    client.stop()
+    assert client.is_stopped is True

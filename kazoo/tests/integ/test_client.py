@@ -29,6 +29,11 @@ from kazoo.exceptions import (
     UnimplementedError,
 )
 from kazoo.protocol.connection import _CONNECTION_DROP
+from kazoo.protocol.statemachine import (
+    AuthFailedEvent,
+    Connected,
+    SessionExpiredEvent,
+)
 from kazoo.protocol.states import (
     AddWatchMode,
     EventType,
@@ -318,8 +323,8 @@ class TestConnection:
             condition.set()
 
         client.add_listener(listener)
-        client._make_state_change(KazooState.CONNECTED)
-        condition.wait(3)
+        with pytest.raises(AssertionError):
+            client._make_state_change(KazooState.CONNECTED)
         assert called[0] is False
 
     def test_no_connection(self, zkclient):
@@ -393,8 +398,8 @@ class TestConnection:
 
         # sneak in and patch client to simulate race between a thread
         # calling stop(); close() and one running a command
-        oldstate = client._state
-        client._state = KeeperState.CONNECTED
+        oldstate = client._state_machine.state
+        client._state_machine.state = Connected()
         client._connection._write_sock = write_sock
 
         try:
@@ -410,7 +415,7 @@ class TestConnection:
 
         finally:
             # reset for teardown
-            client._state = oldstate
+            client._state_machine.state = oldstate
             client._connection._write_sock = None
 
     def test_watch_trigger_expire(self, zkclient):
@@ -478,11 +483,11 @@ class TestClient:
     def test_create_on_broken_connection(self, zkclient):
         client = zkclient
 
-        client._state = KeeperState.EXPIRED_SESSION
+        client.send_event(SessionExpiredEvent())
         with pytest.raises(SessionExpiredError):
             client.create("/closedpath", b"bar")
 
-        client._state = KeeperState.AUTH_FAILED
+        client.send_event(AuthFailedEvent(error=AuthFailedError()))
         with pytest.raises(AuthFailedError):
             client.create("/closedpath", b"bar")
 
@@ -1039,11 +1044,10 @@ class TestClient:
 
     def test_invalid_auth(self, zkclient):
         from kazoo.exceptions import AuthFailedError
-        from kazoo.protocol.states import KeeperState
 
         client = zkclient
         client.stop()
-        client._state = KeeperState.AUTH_FAILED
+        client.send_event(AuthFailedEvent(error=AuthFailedError()))
 
         with pytest.raises(AuthFailedError):
             client.get("/")

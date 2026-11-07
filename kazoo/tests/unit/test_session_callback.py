@@ -5,33 +5,25 @@ import pytest
 
 from kazoo.client import KazooClient
 from kazoo.exceptions import AuthFailedError
-from kazoo.protocol.states import KazooState, KeeperState
+from kazoo.protocol.statemachine import (
+    AuthFailedEvent,
+    ConnectionLostEvent,
+    HandshakeCompleted,
+    SessionExpiredEvent,
+)
+from kazoo.protocol.states import KazooState
 
 
 def test_session_callback_states() -> None:
     client = KazooClient()
-    client._live.set()
 
-    client._session_callback(KeeperState.CONNECTED)
-
-    # Now with stopped
-    client._stopped.set()
-    client._session_callback(KeeperState.CONNECTED)
-
-    # Test several state transitions
-    client._stopped.clear()
-    client.start_async = (  # type: ignore[method-assign]
-        lambda: client.handler.async_result()
-    )
-    client._session_callback(KeeperState.CONNECTED)
+    client.send_event(HandshakeCompleted())
     assert client.state == KazooState.CONNECTED
 
-    client._session_callback(KeeperState.AUTH_FAILED)
-    # FIXME mypy seems to be under the impression that the state can't
-    # change as a result of the above call, even though it can.
-    assert client.state == KazooState.LOST  # type: ignore[comparison-overlap]
+    client.send_event(AuthFailedEvent())
+    assert client.state == KazooState.LOST
 
-    client._session_callback(-250)  # type: ignore[unreachable]
+    client.send_event(ConnectionLostEvent(keeper_state=-250))
     assert client.state == KazooState.SUSPENDED
 
 
@@ -39,7 +31,7 @@ def test_start_fails_immediately_on_auth_failed() -> None:
     client = KazooClient()
 
     def fake_conn_start() -> None:
-        client._session_callback(KeeperState.AUTH_FAILED)
+        client.send_event(AuthFailedEvent())
 
     client._connection.start = (  # type: ignore[method-assign]
         fake_conn_start
@@ -56,8 +48,7 @@ def test_start_fails_immediately_with_underlying_auth_error() -> None:
     expected_err = AuthFailedError("custom auth error")
 
     def fake_conn_start() -> None:
-        client._auth_error = expected_err
-        client._session_callback(KeeperState.AUTH_FAILED)
+        client.send_event(AuthFailedEvent(error=expected_err))
 
     client._connection.start = (  # type: ignore[method-assign]
         fake_conn_start
@@ -72,8 +63,7 @@ def test_start_async_triggers_on_auth_failed() -> None:
     expected_err = AuthFailedError("custom auth error")
 
     def fake_conn_start() -> None:
-        client._auth_error = expected_err
-        client._session_callback(KeeperState.AUTH_FAILED)
+        client.send_event(AuthFailedEvent(error=expected_err))
 
     client._connection.start = (  # type: ignore[method-assign]
         fake_conn_start
@@ -92,7 +82,7 @@ def test_start_async_success() -> None:
     client = KazooClient()
 
     def fake_conn_start() -> None:
-        client._session_callback(KeeperState.CONNECTED)
+        client.send_event(HandshakeCompleted())
 
     client._connection.start = (  # type: ignore[method-assign]
         fake_conn_start
@@ -115,9 +105,9 @@ def test_start_async_recovers_from_expired_session() -> None:
 
     def fake_conn_start() -> None:
         # First attempt receives EXPIRED_SESSION (not terminal)
-        client._session_callback(KeeperState.EXPIRED_SESSION)
+        client.send_event(SessionExpiredEvent())
         # Second attempt receives CONNECTED
-        client._session_callback(KeeperState.CONNECTED)
+        client.send_event(HandshakeCompleted())
 
     client._connection.start = (  # type: ignore[method-assign]
         fake_conn_start

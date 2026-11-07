@@ -3,6 +3,7 @@ from unittest import mock
 import pytest
 
 from kazoo import retry
+from kazoo.client import KazooClient
 from kazoo.handlers import threading
 from kazoo.protocol import connection
 from kazoo.protocol import states
@@ -11,10 +12,21 @@ from kazoo.protocol import states
 @mock.patch("kazoo.protocol.connection.ConnectionHandler._expand_client_hosts")
 def test_retry_logic(mock_expand: mock.MagicMock) -> None:
     mock_client = mock.Mock()
-    mock_client._state = states.KeeperState.CLOSED
+    mock_client.client_state = states.KeeperState.CLOSED
     mock_client._session_id = None
     mock_client._session_passwd = b"\x00" * 16
-    mock_client._stopped.is_set.return_value = False
+    mock_client._session_timeout = 10000
+    mock_client.hosts = [("a", 2181), ("b", 2181), ("c", 2181)]
+    mock_client.use_ssl = False
+    mock_client.keyfile = None
+    mock_client.certfile = None
+    mock_client.ca = None
+    mock_client.keyfile_password = None
+    mock_client.verify_certs = True
+    mock_client.check_hostname = False
+    mock_client.read_only = False
+    mock_client.auth_data = set()
+    mock_client.last_zxid = 0
     mock_client.handler.timeout_exception = threading.KazooTimeoutError
     mock_client.handler.create_connection.side_effect = (
         threading.KazooTimeoutError()
