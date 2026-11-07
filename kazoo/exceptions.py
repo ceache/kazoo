@@ -54,6 +54,19 @@ class SASLException(KazooException):
     """
 
 
+class InvalidStateTransitionError(KazooException):
+    """Raised when an invalid state transition is attempted
+    in the state machine."""
+
+    def __init__(self, state: object, event: object) -> None:
+        self.state = state
+        self.event = event
+        super().__init__(
+            f"Invalid state transition: received {type(event).__name__} "
+            f"in state {type(state).__name__}"
+        )
+
+
 def _invalid_error_code() -> Type[ZookeeperError]:
     raise RuntimeError("Invalid error code")
 
