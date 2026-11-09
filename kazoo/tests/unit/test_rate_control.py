@@ -10,6 +10,7 @@ from kazoo.client import KazooClient
 from kazoo.exceptions import ConfigurationError, ConnectionLoss
 from kazoo.handlers.threading import SequentialThreadingHandler
 from kazoo.protocol.connection import ConnectionHandler
+from kazoo.protocol.statemachine import Connected
 from kazoo.protocol.states import KeeperState
 
 
@@ -51,12 +52,9 @@ class TestRateControl:
             handler=handler,
             concurrent_request_limit=1,
         )
-        client._state = KeeperState.CONNECTED
-        client._live.set()
+        client._state_machine.state = Connected()
 
-        mock_sock = Mock()
         mock_conn = Mock()
-        mock_conn._write_sock = mock_sock
         client._connection = mock_conn
 
         # Submit 10 requests rapidly
@@ -71,7 +69,7 @@ class TestRateControl:
         # Ensure all 10 calls were non-blocking (took negligible time)
         assert elapsed < 0.5
         assert len(client._queue) == 10
-        assert mock_sock.send.call_count == 10
+        assert mock_conn.wake.call_count == 10
 
     def test_completion_worker_chained_requests_no_deadlock(self) -> None:
         handler = SequentialThreadingHandler()
@@ -82,8 +80,7 @@ class TestRateControl:
                 handler=handler,
                 concurrent_request_limit=1,
             )
-            client._state = KeeperState.CONNECTED
-            client._live.set()
+            client._state_machine.state = Connected()
 
             mock_sock = Mock()
             mock_conn = Mock()
@@ -289,8 +286,7 @@ class TestRateControl:
                 handler=handler,
                 concurrent_request_limit=1,
             )
-            client._state = KeeperState.CONNECTED
-            client._live.set()
+            client._state_machine.state = Connected()
 
             mock_sock = Mock()
             mock_conn = Mock()

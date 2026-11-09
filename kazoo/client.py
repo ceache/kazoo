@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from collections.abc import Callable, Iterable, Sequence
 from functools import partial
 import inspect
 import logging
@@ -13,13 +14,7 @@ from typing import (
     cast,
     overload,
     Any,
-    Callable,
-    Deque,
-    Iterable,
     Literal,
-    Optional,
-    Sequence,
-    Set,
     TypedDict,
     TYPE_CHECKING,
 )
@@ -40,13 +35,17 @@ from kazoo.handlers.threading import SequentialThreadingHandler
 from kazoo.handlers.utils import capture_exceptions, wrap
 from kazoo.hosts import collect_hosts
 from kazoo.loggingsupport import BLATHER
-from kazoo.protocol.connection import ConnectionHandler
+from kazoo.protocol.connection import (
+    ConnectionHandler,
+    RequestManager,
+    WatcherManager,
+)
 from kazoo.protocol.paths import _prefix_root, normpath
 from kazoo.protocol.serialization import (
     AddWatch,
     Auth,
     CheckVersion,
-    CloseInstance,
+    Close,
     Create,
     Create2,
     CreateContainer,
@@ -64,6 +63,7 @@ from kazoo.protocol.serialization import (
     Sync,
     Transaction,
 )
+from kazoo.protocol.sasl import SASLConfig
 from kazoo.protocol.states import (
     Callback,
     CLOSED_STATES,
@@ -73,6 +73,33 @@ from kazoo.protocol.states import (
     WatchedEvent,
     AddWatchMode,
     WatcherType,
+)
+from kazoo.protocol.statemachine import (
+    Authenticating,
+    AuthFailed,
+    ClientEvent,
+    ClientState,
+    CloseRequested,
+    Connected,
+    ConnectedReadOnly,
+    Connecting,
+    DrainWakeupPipe,
+    EmitKazooStateChange,
+    ExpiredSession,
+    FailPendingRequests,
+    Handshaking,
+    Inactive,
+    InvalidateWatchers,
+    LogStateTransition,
+    ReadSocketPacket,
+    ResetSessionData,
+    ResolveConnectResult,
+    SendHeartbeatPing,
+    SendQueuedRequest,
+    SessionClosedEvent,
+    SideEffect,
+    StateMachineDriver,
+    UpdateIOInterest,
 )
 from kazoo.retry import KazooRetry
 from kazoo.security import ACL, OPEN_ACL_UNSAFE
@@ -130,10 +157,10 @@ class LegacyRetryParams(TypedDict, total=False):
 
 
 # Signature for functions called by add_listener
-ListenerFunc = Callable[[KazooState], Optional[bool]]
+ListenerFunc = Callable[[KazooState], bool | None]
 
 # Signatures for get, get_children and exists watches
-WatchFunc = Callable[[WatchedEvent], Optional[bool]]
+WatchFunc = Callable[[WatchedEvent], bool | None]
 
 GenericArgs = ParamSpec("GenericArgs")
 
@@ -396,21 +423,13 @@ class KazooClient:
 
         # Curator like simplified state tracking, and listeners for
         # state transitions
-        self._state: KeeperState = KeeperState.CLOSED
-        self.state: KazooState = KazooState.LOST
+        self._state_machine = StateMachineDriver(
+            self.handler, self._execute_effect
+        )
+        self._request_manager = RequestManager()
+        self._watcher_manager = WatcherManager()
+        self._last_notified_state: KazooState = KazooState.LOST
         self.state_listeners: set[ListenerFunc] = set()
-        self._child_watchers: defaultdict[str, Set[WatchFunc]] = defaultdict(
-            set
-        )
-        self._data_watchers: defaultdict[str, Set[WatchFunc]] = defaultdict(
-            set
-        )
-        self._persistent_watchers: defaultdict[str, Set[WatchFunc]] = (
-            defaultdict(set)
-        )
-        self._persistent_recursive_watchers: defaultdict[
-            str, Set[WatchFunc]
-        ] = defaultdict(set)
         self._reset()
         self.read_only = read_only
 
@@ -423,15 +442,7 @@ class KazooClient:
         # ZK uses milliseconds
         self._session_timeout = int(timeout * 1000)
 
-        # We use events like twitter's client to track current and
-        # desired state (connected, and whether to shutdown)
-        self._live = self.handler.event_object()
-        self._writer_stopped = self.handler.event_object()
-        self._stopped = self.handler.event_object()
-        self._stopped.set()
-        self._writer_stopped.set()
         self._conn_result: IAsyncResult | None = None
-        self._auth_error: Exception | None = None
 
         # FIXME This is kind of gross but we need to set these to something so
         # that the type checker will understand that they are set by the time
@@ -502,45 +513,17 @@ class KazooClient:
                 )
 
         # Managing legacy SASL options
-        for scheme, auth in self.auth_data:
-            if scheme != "sasl":
-                continue
-            if sasl_options:
-                raise ConfigurationError(
-                    "Multiple SASL configurations provided"
-                )
-            warnings.warn(
-                "Passing SASL configuration as part of the auth_data is "
-                "deprecated, please use the sasl_options configuration "
-                "instead",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            username, password = auth.split(":")
-            # Generate an equivalent SASL configuration
-            sasl_options = {
-                "username": username,
-                "password": password,
-                "mechanism": "DIGEST-MD5",
-                "service": "zookeeper",
-                "principal": "zk-sasl-md5",
-            }
-        # Cleanup
-        self.auth_data = set(
-            [
-                (scheme, auth)
-                for scheme, auth in self.auth_data
-                if scheme != "sasl"
-            ]
+        sasl_config, self.auth_data = SASLConfig.from_client_options(
+            sasl_options, self.auth_data
         )
 
-        self._conn_retry.interrupt = lambda: self._stopped.is_set()
         self._connection = ConnectionHandler(
             self,
             self._conn_retry.copy(),
             logger=self.logger,
-            sasl_options=sasl_options,
+            sasl_config=sasl_config,
         )
+        self._conn_retry.interrupt = lambda: self._connection._is_terminal
 
         # Every retry call should have its own copy of the retry helper
         # to avoid shared retry counts
@@ -588,10 +571,63 @@ class KazooClient:
                 % (kwargs.keys(),)
             )
 
+    @property
+    def _queue(self) -> deque[tuple[Any, IAsyncResult]]:
+        return self._request_manager.queue
+
+    @_queue.setter
+    def _queue(self, value: deque[tuple[Any, IAsyncResult]]) -> None:
+        self._request_manager.queue = value
+
+    @property
+    def _pending(self) -> deque[tuple[Any, IAsyncResult, int]]:
+        return self._request_manager.pending
+
+    @_pending.setter
+    def _pending(self, value: deque[tuple[Any, IAsyncResult, int]]) -> None:
+        self._request_manager.pending = value
+
+    @property
+    def _child_watchers(self) -> defaultdict[str, set[WatchFunc]]:
+        return self._watcher_manager.child_watchers
+
+    @_child_watchers.setter
+    def _child_watchers(self, value: defaultdict[str, set[WatchFunc]]) -> None:
+        self._watcher_manager.child_watchers = value
+
+    @property
+    def _data_watchers(self) -> defaultdict[str, set[WatchFunc]]:
+        return self._watcher_manager.data_watchers
+
+    @_data_watchers.setter
+    def _data_watchers(self, value: defaultdict[str, set[WatchFunc]]) -> None:
+        self._watcher_manager.data_watchers = value
+
+    @property
+    def _persistent_watchers(self) -> defaultdict[str, set[WatchFunc]]:
+        return self._watcher_manager.persistent_watchers
+
+    @_persistent_watchers.setter
+    def _persistent_watchers(
+        self, value: defaultdict[str, set[WatchFunc]]
+    ) -> None:
+        self._watcher_manager.persistent_watchers = value
+
+    @property
+    def _persistent_recursive_watchers(
+        self,
+    ) -> defaultdict[str, set[WatchFunc]]:
+        return self._watcher_manager.persistent_recursive_watchers
+
+    @_persistent_recursive_watchers.setter
+    def _persistent_recursive_watchers(
+        self, value: defaultdict[str, set[WatchFunc]]
+    ) -> None:
+        self._watcher_manager.persistent_recursive_watchers = value
+
     def _reset(self) -> None:
         """Resets a variety of client states for a new connection."""
-        self._queue: Deque[tuple[Any, IAsyncResult]] = deque()
-        self._pending: Deque[tuple[Any, IAsyncResult, int]] = deque()
+        self._request_manager.reset(self.client_state)
 
         self._reset_watchers()
         self._reset_session()
@@ -599,31 +635,24 @@ class KazooClient:
         self._protocol_version: int | None = None
 
     def _reset_watchers(self) -> None:
-        watchers: list[WatchFunc] = []
-        for child_watchers in self._child_watchers.values():
-            watchers.extend(child_watchers)
-
-        for data_watchers in self._data_watchers.values():
-            watchers.extend(data_watchers)
-
-        for persistent_watchers in self._persistent_watchers.values():
-            watchers.extend(persistent_watchers)
-
-        for pr_watchers in self._persistent_recursive_watchers.values():
-            watchers.extend(pr_watchers)
-
-        self._child_watchers = defaultdict(set)
-        self._data_watchers = defaultdict(set)
-        self._persistent_watchers = defaultdict(set)
-        self._persistent_recursive_watchers = defaultdict(set)
-
-        ev = WatchedEvent(EventType.NONE, self._state, None)
+        watchers = self._watcher_manager.reset()
+        ev = WatchedEvent(EventType.NONE, self.client_state, None)
         for watch in watchers:
             self.handler.dispatch_callback(Callback("watch", watch, (ev,)))
 
     def _reset_session(self) -> None:
         self._session_id = None
         self._session_passwd = b"\x00" * 16
+
+    @property
+    def state_machine(self) -> ClientState:
+        """Returns the current immutable dataclass state instance."""
+        return self._state_machine.state
+
+    @property
+    def state(self) -> KazooState:
+        """Returns the current KazooState (LOST, SUSPENDED, or CONNECTED)."""
+        return self._state_machine.state.kazoo_state
 
     @property
     def client_state(self) -> KeeperState:
@@ -633,7 +662,7 @@ class KazooClient:
         not as useful as the simplified KazooState information.
 
         """
-        return self._state
+        return self._state_machine.state.keeper_state
 
     @property
     def client_id(self) -> tuple[int | None, bytes] | None:
@@ -644,15 +673,29 @@ class KazooClient:
                   password.
         :rtype: tuple
         """
-        if self._live.is_set():
-            return (self._session_id, self._session_passwd)
+        state = self._state_machine.state
+        if isinstance(state, (Connected, ConnectedReadOnly)):
+            return (state.session_id, self._session_passwd)
         return None
 
     @property
     def connected(self) -> bool:
         """Returns whether the Zookeeper connection has been
         established."""
-        return self._live.is_set()
+        return self._state_machine.state.is_connected
+
+    @property
+    def is_stopped(self) -> bool:
+        """Returns whether the client is stopped/closed."""
+        return (
+            isinstance(self._state_machine.state, Inactive)
+            and self._connection.connection_stopped.is_set()
+        )
+
+    @property
+    def is_terminal(self) -> bool:
+        """Returns whether the client is in a terminal state."""
+        return self._state_machine.state.is_terminal
 
     def set_hosts(
         self,
@@ -731,11 +774,11 @@ class KazooClient:
         self.state_listeners.discard(listener)
 
     def _make_state_change(self, state: KazooState) -> None:
-        # skip if state is current
-        if self.state == state:
-            return
+        assert self._last_notified_state != state, (
+            f"State machine emitted noop state change to {state}"
+        )
 
-        self.state = state
+        self._last_notified_state = state
 
         # Create copy of listeners for iteration in case one needs to
         # remove itself
@@ -747,85 +790,60 @@ class KazooClient:
             except Exception:
                 self.logger.exception("Error in connection state listener")
 
-    def _session_callback(self, state: KeeperState) -> None:
-        if state == self._state:
-            return
+    def send_event(self, event: ClientEvent) -> None:
+        """Thread/Greenlet-safe entry point for state machine events."""
+        self._state_machine.send_event(event)
 
-        # Note that we don't check self.state == LOST since that's also
-        # the client's initial state
-        closed_state = self._state in CLOSED_STATES
-        self._state = state
+    def _execute_effect(self, effect: SideEffect) -> None:
+        """Route and execute descriptive side effects."""
+        match effect:
+            case (
+                ReadSocketPacket()
+                | SendQueuedRequest()
+                | UpdateIOInterest()
+                | DrainWakeupPipe()
+                | SendHeartbeatPing()
+            ):
+                self._connection.execute_effect(effect)
 
-        # If we were previously closed or had an expired session, and
-        # are now connecting, don't bother with the rest of the
-        # transitions since they only apply after
-        # we've established a connection
-        if closed_state and state == KeeperState.CONNECTING:
-            self.logger.log(BLATHER, "Skipping state change")
-            return
+            case LogStateTransition(level=level, message=message, args=args):
+                self.logger.log(level, message, *args)
 
-        if state in (KeeperState.CONNECTED, KeeperState.CONNECTED_RO):
-            self.logger.info(
-                "Zookeeper connection established, state: %s", state
-            )
-            self._live.set()
-            if self._conn_result is not None and not self._conn_result.ready():
-                self._conn_result.set(True)
-            self._make_state_change(KazooState.CONNECTED)
-        elif state in CLOSED_STATES:
-            self.logger.info("Zookeeper session closed, state: %s", state)
-            self._live.clear()
-            if self._conn_result is not None and not self._conn_result.ready():
-                if state == KeeperState.AUTH_FAILED:
-                    if isinstance(self._auth_error, AuthFailedError):
-                        err: Exception = self._auth_error
-                    elif self._auth_error is not None:
-                        err = AuthFailedError("Authentication failed")
-                        err.__cause__ = self._auth_error
-                    else:
-                        err = AuthFailedError("Authentication failed")
-                    self._conn_result.set_exception(err)
-                elif state == KeeperState.CLOSED:
-                    self._conn_result.set_exception(
-                        ConnectionClosedError("Connection closed")
-                    )
-            self._make_state_change(KazooState.LOST)
-            self._notify_pending(state)
-            self._reset()
-        else:
-            self.logger.info("Zookeeper connection lost")
-            # Connection lost
-            self._live.clear()
-            self._notify_pending(state)
-            self._make_state_change(KazooState.SUSPENDED)
-            self._reset_watchers()
+            case ResolveConnectResult(success=True):
+                if (
+                    self._conn_result is not None
+                    and not self._conn_result.ready()
+                ):
+                    self._conn_result.set(True)
+
+            case ResolveConnectResult(success=False, exception=exc):
+                if (
+                    self._conn_result is not None
+                    and not self._conn_result.ready()
+                    and exc is not None
+                ):
+                    self._conn_result.set_exception(exc)
+
+            case EmitKazooStateChange(new_state=new_state):
+                self._make_state_change(new_state)
+
+            case FailPendingRequests(keeper_state=keeper_state):
+                self._notify_pending(keeper_state)
+
+            case InvalidateWatchers():
+                self._reset_watchers()
+
+            case ResetSessionData():
+                self._reset()
+                self._connection.execute_effect(effect)
+
+            case _:
+                self._connection.execute_effect(effect)
 
     def _notify_pending(self, state: KeeperState) -> None:
         """Used to clear a pending response queue and request queue
         during connection drops."""
-        exc: KazooException
-        if state == KeeperState.AUTH_FAILED:
-            exc = AuthFailedError()
-        elif state == KeeperState.EXPIRED_SESSION:
-            exc = SessionExpiredError()
-        else:
-            exc = ConnectionLoss()
-
-        while True:
-            try:
-                request, async_object, xid = self._pending.popleft()
-                if async_object:
-                    async_object.set_exception(exc)
-            except IndexError:
-                break
-
-        while True:
-            try:
-                request, async_object = self._queue.popleft()
-                if async_object:
-                    async_object.set_exception(exc)
-            except IndexError:
-                break
+        self._request_manager.fail_all(state)
 
     def _safe_close(self) -> None:
         self.handler.stop()
@@ -845,41 +863,34 @@ class KazooClient:
     def _call(
         self, request: object, async_object: IAsyncResult
     ) -> bool | None:
-        """Ensure the client is in CONNECTED or SUSPENDED state and put the
-        request in the queue if it is.
+        """Ensure the client is in a valid state and put the request
+        in the queue.
 
-        Returns False if the call short circuits due to AUTH_FAILED,
-        CLOSED, or EXPIRED_SESSION state.
-
+        Returns False if the call short circuits due to AuthFailed,
+        Inactive, or ExpiredSession state.
         """
-
-        if self._state == KeeperState.AUTH_FAILED:
+        state = self._state_machine.state
+        if isinstance(state, AuthFailed):
             async_object.set_exception(AuthFailedError())
             return False
-        elif self._state == KeeperState.CLOSED:
+        elif isinstance(state, Inactive):
             async_object.set_exception(
                 ConnectionClosedError("Connection has been closed")
             )
             return False
-        elif self._state == KeeperState.EXPIRED_SESSION:
+        elif isinstance(state, ExpiredSession):
             async_object.set_exception(SessionExpiredError())
             return False
 
-        self._queue.append((request, async_object))
+        self._request_manager.enqueue(request, async_object)
 
-        # wake the connection, guarding against a race with close()
-        write_sock = self._connection._write_sock
-        if write_sock is None:
+        # Wake the connection, guarding against a race with close()
+        if not self._connection.wake():
+            self._request_manager.remove_queued(request, async_object)
             async_object.set_exception(
                 ConnectionClosedError("Connection has been closed")
             )
             return None
-        try:
-            write_sock.send(b"\0")
-        except:  # NOQA
-            async_object.set_exception(
-                ConnectionClosedError("Connection has been closed")
-            )
         return None
 
     def start(self, timeout: float = 15.0) -> None:
@@ -894,7 +905,7 @@ class KazooClient:
                  failed during connection establishment.
 
         """
-        if self._live.is_set():
+        if self.connected:
             return
 
         async_result = self.start_async()
@@ -920,27 +931,20 @@ class KazooClient:
 
         """
         # If we're already connected, return an already-completed result
-        if self._live.is_set():
-            if self._conn_result is None:
-                # Defensive fallback to catch poor mocking in KazooClient
-                # internals (tests or mocks that manually set self._live.set()
-                # without going through start_async()). In production,
-                # self._conn_result is always initialized during start_async()
-                # and should *never* be None while self._live is set.
-                self._conn_result = self.handler.async_result()
-                self._conn_result.set(True)
+        if self.connected:
+            if self._conn_result is None or self._conn_result.ready():
+                result = self.handler.async_result()
+                result.set(True)
+                return result
             return self._conn_result
 
-        if self._conn_result is not None and not self._conn_result.ready():
-            return self._conn_result
+        state = self._state_machine.state
+        if isinstance(state, (Connecting, Handshaking, Authenticating)):
+            if self._conn_result is not None and not self._conn_result.ready():
+                return self._conn_result
 
-        # Make sure we're safely closed
+        # Make sure we're safely closed before starting
         self._safe_close()
-
-        # We've been asked to connect, clear the stop and our writer
-        # thread indicator
-        self._stopped.clear()
-        self._writer_stopped.clear()
         self._conn_result = self.handler.async_result()
 
         # Start the handler
@@ -962,16 +966,16 @@ class KazooClient:
         on their parents) will be triggered.
 
         """
-        if self._stopped.is_set():
+        if self.is_stopped:
             return
 
-        self._stopped.set()
-        self._queue.append((CloseInstance, cast("IAsyncResult", None)))
+        self.send_event(CloseRequested())
+        self._request_manager.enqueue(Close(), cast("IAsyncResult", None))
         try:
-            if self._connection._write_sock is not None:
-                self._connection._write_sock.send(b"\0")
+            self._connection.wake()
         finally:
             self._safe_close()
+            self.send_event(SessionClosedEvent())
 
     def restart(self) -> None:
         """Stop and restart the Zookeeper session."""
@@ -987,6 +991,7 @@ class KazooClient:
         .. versionadded:: 1.0
         """
         self._connection.close()
+        self.send_event(SessionClosedEvent())
 
     def command(self, cmd: bytes = b"ruok") -> str:
         """Sent a management command to the current ZK server.
@@ -1004,7 +1009,7 @@ class KazooClient:
         .. versionadded:: 0.5
 
         """
-        if not self._live.is_set():
+        if not self.connected:
             raise ConnectionLoss("No connection to server")
 
         sock_obj = self._connection._socket
@@ -1355,6 +1360,7 @@ class KazooClient:
         @capture_exceptions(async_result)
         def do_create() -> None:
             inner_async_result = self.handler.async_result()
+            inner_async_result.rawlink(create_completion)
 
             call_result = self._call(opcode, inner_async_result)
             if call_result is False:
@@ -1364,8 +1370,6 @@ class KazooClient:
                 # KazooClient.create so that it gets set on the correct
                 # async_result object
                 raise cast(Exception, inner_async_result.exception)
-
-            inner_async_result.rawlink(create_completion)
 
         @capture_exceptions(async_result)
         def retry_completion(result: IAsyncResult) -> None:

@@ -13,7 +13,7 @@ from kazoo.protocol.connection import _CONNECTION_DROP
 from kazoo.protocol.serialization import (
     Connect,
     int_struct,
-    write_string,
+    _write_string,
 )
 from kazoo.protocol.states import KazooState
 from kazoo.tests.util import CI, CI_ZK_VERSION, wait
@@ -24,7 +24,7 @@ class Delete(namedtuple("Delete", "path version")):
 
     def serialize(self):
         b = bytearray()
-        b.extend(write_string(self.path))
+        b.extend(_write_string(self.path))
         b.extend(int_struct.pack(self.version))
         return b
 
