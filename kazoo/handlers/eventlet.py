@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
 import atexit
 import contextlib
 import logging
-
-from typing import cast, Any, Generator, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING, cast
 
 import eventlet
 from eventlet.green import socket as green_socket
@@ -48,6 +48,35 @@ def _yield_before_after() -> Generator[None, None, None]:
         yield
     finally:
         eventlet.sleep(0)  # type: ignore[no-untyped-call]
+
+
+class _EventletSelector:
+    """Green selector wrapper that yields cooperatively around select()."""
+
+    def __init__(self) -> None:
+        self._selector = green_selectors.DefaultSelector()
+
+    def register(self, fileobj: Any, events: int, data: Any = None) -> Any:
+        return self._selector.register(fileobj, events, data)
+
+    def unregister(self, fileobj: Any) -> Any:
+        return self._selector.unregister(fileobj)
+
+    def modify(self, fileobj: Any, events: int, data: Any = None) -> Any:
+        return self._selector.modify(fileobj, events, data)
+
+    def get_key(self, fileobj: Any) -> Any:
+        return self._selector.get_key(fileobj)
+
+    def get_map(self) -> Any:
+        return self._selector.get_map()
+
+    def select(self, timeout: float | None = None) -> Any:
+        with _yield_before_after():
+            return self._selector.select(timeout)
+
+    def close(self) -> None:
+        self._selector.close()
 
 
 class TimeoutError(Exception):
@@ -221,6 +250,9 @@ class SequentialEventletHandler:
                 selectors_module=green_selectors,  # type: ignore[misc]
                 **kwargs,
             )
+
+    def create_selector(self) -> Any:
+        return _EventletSelector()
 
     def async_result(self) -> AsyncResult:
         return AsyncResult(self)  # type: ignore[arg-type]
