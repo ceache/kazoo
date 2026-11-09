@@ -737,3 +737,63 @@ class TestDataclassPacketsAndFrameDecoder:
             zxid=555,
             watch=serialization.Watch(type=3, state=3, path="/watched"),
         )
+
+    def test_frame_decoder_sliding_window_compaction(self) -> None:
+        decoder = serialization.FrameDecoder()
+        f_ping = _reply_header_struct.pack(
+            serialization.ReservedXID.PING, 10, 0
+        )
+        frame_wire = _int_struct.pack(len(f_ping)) + f_ping
+
+        # Feed and pop repeatedly to advance _r_pos beyond 64KB
+        for _ in range(4000):
+            decoder.feed(frame_wire)
+            p = decoder.pop_packet()
+            assert p == serialization.PingResponse(zxid=10, err=0)
+
+        # Buffer should have compacted and reset rather than growing
+        assert decoder._r_pos == 0
+        assert len(decoder._buffer) == 0
+
+    def test_frame_decoder_large_payload_getdata(self) -> None:
+        decoder = serialization.FrameDecoder()
+        payload_1mb = b"x" * (1024 * 1024)
+        stat_bytes = serialization.stat_struct.pack(
+            1, 2, 1000, 2000, 1, 0, 0, 0, len(payload_1mb), 0, 10
+        )
+        body = (
+            _reply_header_struct.pack(1, 100, 0)
+            + _write_buffer(payload_1mb)
+            + stat_bytes
+        )
+        wire = _int_struct.pack(len(body)) + body
+
+        decoder.feed(wire)
+        pkt = decoder.pop_packet()
+        assert isinstance(pkt, serialization.ReplyPacket)
+        assert pkt.header.xid == 1
+        assert pkt.header.zxid == 100
+
+        # Deserializing GetData from ReplyPacket
+        data, stat = serialization.GetData.deserialize(pkt.buffer, pkt.offset)
+        assert data == payload_1mb
+        assert isinstance(data, bytes)
+        assert stat.version == 1
+
+    def test_frame_decoder_zero_copy_memoryview_safety(self) -> None:
+        decoder = serialization.FrameDecoder()
+        f1 = _reply_header_struct.pack(1, 100, 0)
+        wire1 = _int_struct.pack(len(f1)) + f1
+        f2 = _reply_header_struct.pack(2, 101, 0)
+        wire2 = _int_struct.pack(len(f2)) + f2
+
+        decoder.feed(wire1)
+        p1 = decoder.pop_packet()
+        assert isinstance(p1, serialization.ReplyPacket)
+
+        # Ensure feeding more data while p1 exists does not raise BufferError
+        decoder.feed(wire2)
+        p2 = decoder.pop_packet()
+        assert isinstance(p2, serialization.ReplyPacket)
+        assert p1.header.xid == 1
+        assert p2.header.xid == 2

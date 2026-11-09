@@ -61,7 +61,7 @@ reply_header_struct = struct.Struct("!iqi")
 stat_struct = struct.Struct("!qqqqiiiqiiq")
 
 
-def _read_string(buffer: bytes, offset: int) -> tuple[str, int]:
+def _read_string(buffer: bytes | memoryview, offset: int) -> tuple[str, int]:
     """Reads an int specified buffer into a string and returns the
     string and the new offset in the buffer"""
     length = int_struct.unpack_from(buffer, offset)[0]
@@ -74,7 +74,7 @@ def _read_string(buffer: bytes, offset: int) -> tuple[str, int]:
     else:
         index = offset
         offset += length
-        return buffer[index : index + length].decode("utf-8"), offset
+        return bytes(buffer[index : index + length]).decode("utf-8"), offset
 
 
 def _read_acl(bytes: bytes, offset: int) -> tuple[ACL, int]:
@@ -106,15 +106,17 @@ def _write_buffer(bytes: bytes | None) -> bytes:
         return int_struct.pack(len(bytes)) + bytes
 
 
-def _read_buffer(bytes: bytes, offset: int) -> tuple[bytes | None, int]:
-    length = int_struct.unpack_from(bytes, offset)[0]
+def _read_buffer(
+    buffer: bytes | memoryview, offset: int
+) -> tuple[bytes | None, int]:
+    length = int_struct.unpack_from(buffer, offset)[0]
     offset += int_struct.size
     if length < 0:
         return None, offset
     else:
         index = offset
         offset += length
-        return bytes[index : index + length], offset
+        return bytes(buffer[index : index + length]), offset
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,7 +163,9 @@ class Connect:
         return b
 
     @classmethod
-    def deserialize(cls, bytes: bytes, offset: int) -> tuple[Connect, int]:
+    def deserialize(
+        cls, bytes: bytes | memoryview, offset: int
+    ) -> tuple[Connect, int]:
         proto_version, timeout, session_id = int_int_long_struct.unpack_from(
             bytes, offset
         )
@@ -660,7 +664,7 @@ class SASL:
 
     @classmethod
     def deserialize(
-        cls, bytes: bytes, offset: int
+        cls, bytes: bytes | memoryview, offset: int
     ) -> tuple[bytes | None, int]:
         challenge, offset = _read_buffer(bytes, offset)
         return challenge, offset
@@ -693,7 +697,9 @@ class Watch:
     path: str
 
     @classmethod
-    def deserialize(cls, bytes: bytes, offset: int) -> tuple[Watch, int]:
+    def deserialize(
+        cls, bytes: bytes | memoryview, offset: int
+    ) -> tuple[Watch, int]:
         """Given bytes and the current bytes offset, return the
         type, state, path, and new offset"""
         type, state = int_int_struct.unpack_from(bytes, offset)
@@ -709,7 +715,9 @@ class ReplyHeader:
     err: int
 
     @classmethod
-    def deserialize(cls, bytes: bytes, offset: int) -> tuple[ReplyHeader, int]:
+    def deserialize(
+        cls, bytes: bytes | memoryview, offset: int
+    ) -> tuple[ReplyHeader, int]:
         """Given bytes and the current bytes offset, return a
         :class:`ReplyHeader` instance and the new offset"""
         new_offset = offset + reply_header_struct.size
@@ -794,21 +802,21 @@ class FrameDecoder:
 
     def __init__(self) -> None:
         self._buffer = bytearray()
-        self._frames: deque[bytes] = deque()
+        self._r_pos = 0
 
     def reset(self) -> None:
         """Clear all buffered partial bytes and decoded frames."""
-        self._buffer.clear()
-        self._frames.clear()
+        self._buffer = bytearray()
+        self._r_pos = 0
 
     def bytes_needed(self) -> int:
         """Return the number of bytes needed to complete the next frame."""
-        if self._frames:
-            return 0
-        buf_len = len(self._buffer)
+        buf_len = len(self._buffer) - self._r_pos
         if buf_len < 4:
             return 4 - buf_len
-        frame_length = int(int_struct.unpack_from(self._buffer, 0)[0])
+        frame_length = int(
+            int_struct.unpack_from(self._buffer, self._r_pos)[0]
+        )
         if frame_length < 0:
             raise ConnectionDropped(
                 f"Invalid negative frame length: {frame_length}"
@@ -819,27 +827,50 @@ class FrameDecoder:
         return total_needed - buf_len
 
     def feed(self, data: bytes) -> None:
-        """Append incoming bytes and extract any completed frames."""
+        """Append incoming bytes and compact buffer when appropriate."""
+        # Compaction: if all data has been consumed, reset offset to zero;
+        # otherwise compact if the consumed prefix exceeds 64KB.
+        if self._r_pos == len(self._buffer):
+            self._buffer = bytearray()
+            self._r_pos = 0
+        elif self._r_pos > 65536:
+            del self._buffer[: self._r_pos]
+            self._r_pos = 0
+
         if not data:
             return
+
         self._buffer.extend(data)
-        while len(self._buffer) >= 4:
-            frame_length = int_struct.unpack_from(self._buffer, 0)[0]
+        if len(self._buffer) - self._r_pos >= 4:
+            frame_length = int_struct.unpack_from(self._buffer, self._r_pos)[0]
             if frame_length < 0:
                 raise ConnectionDropped(
                     f"Invalid negative frame length: {frame_length}"
                 )
-            total_len = 4 + frame_length
-            if len(self._buffer) < total_len:
-                break
-            self._frames.append(bytes(self._buffer[4:total_len]))
-            del self._buffer[:total_len]
 
     def pop_raw_frame(self) -> bytes | None:
         """Pop the next complete raw frame payload if available."""
-        if self._frames:
-            return self._frames.popleft()
-        return None
+        buf_len = len(self._buffer) - self._r_pos
+        if buf_len < 4:
+            return None
+        frame_length = int(
+            int_struct.unpack_from(self._buffer, self._r_pos)[0]
+        )
+        if frame_length < 0:
+            raise ConnectionDropped(
+                f"Invalid negative frame length: {frame_length}"
+            )
+        total_len = 4 + frame_length
+        if buf_len < total_len:
+            return None
+        start = self._r_pos + 4
+        end = self._r_pos + total_len
+        self._r_pos += total_len
+        raw = bytes(self._buffer[start:end])
+        if self._r_pos == len(self._buffer):
+            self._buffer = bytearray()
+            self._r_pos = 0
+        return raw
 
     def pop_packet(
         self,
@@ -850,16 +881,40 @@ class FrameDecoder:
         """Pop and decode the next typed server packet if a complete frame is
         available.
         """
-        frame = self.pop_raw_frame()
-        if frame is None:
+        buf_len = len(self._buffer) - self._r_pos
+        if buf_len < 4:
             return None
-        return self.decode_packet(
-            frame, is_connect=is_connect, is_sasl=is_sasl
+        frame_length = int(
+            int_struct.unpack_from(self._buffer, self._r_pos)[0]
         )
+        if frame_length < 0:
+            raise ConnectionDropped(
+                f"Invalid negative frame length: {frame_length}"
+            )
+        total_len = 4 + frame_length
+        if buf_len < total_len:
+            return None
+
+        start = self._r_pos + 4
+        end = self._r_pos + total_len
+        self._r_pos += total_len
+
+        # Transient memoryview slice strictly within decode_packet()
+        frame_view = memoryview(self._buffer)[start:end]
+        try:
+            packet = self.decode_packet(
+                frame_view, is_connect=is_connect, is_sasl=is_sasl
+            )
+        finally:
+            frame_view.release()
+        if self._r_pos == len(self._buffer):
+            self._buffer = bytearray()
+            self._r_pos = 0
+        return packet
 
     @staticmethod
     def decode_packet(
-        frame: bytes,
+        frame: bytes | memoryview,
         *,
         is_connect: bool = False,
         is_sasl: bool = False,
@@ -893,7 +948,11 @@ class FrameDecoder:
                 err=header.err,
                 challenge=challenge,
             )
-        return ReplyPacket(header=header, buffer=frame, offset=offset)
+        return ReplyPacket(
+            header=header,
+            buffer=bytes(frame) if isinstance(frame, memoryview) else frame,
+            offset=offset,
+        )
 
     @staticmethod
     def encode_request(request: Any, xid: int | None = None) -> bytes:
