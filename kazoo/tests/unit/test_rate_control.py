@@ -69,7 +69,9 @@ class TestRateControl:
         # Ensure all 10 calls were non-blocking (took negligible time)
         assert elapsed < 0.5
         assert len(client._queue) == 10
-        assert mock_conn.wake.call_count == 10
+        # Edge-triggered wakeup only signals when transitioning from
+        # empty to non-empty
+        assert mock_conn.wake.call_count == 1
 
     def test_completion_worker_chained_requests_no_deadlock(self) -> None:
         handler = SequentialThreadingHandler()
@@ -231,19 +233,13 @@ class TestRateControl:
             limit = client.concurrent_request_limit
             return limit is None or len(client._pending) < limit
 
-        # Tick 1: send request 0
-        assert can_send()
-        conn._send_request(10.0, 10.0)
-        assert len(client._pending) == 1
-        assert len(client._queue) == 4
-
-        # Tick 2: send request 1
+        # Tick 1: send requests up to limit=2
         assert can_send()
         conn._send_request(10.0, 10.0)
         assert len(client._pending) == 2
         assert len(client._queue) == 3
 
-        # Tick 3: limit reached! can_send must be False
+        # Limit reached! can_send must be False
         assert not can_send()
 
         # Response arrives for request 0
@@ -254,7 +250,7 @@ class TestRateControl:
         # Now can_send is True again!
         assert can_send()
 
-        # Tick 4: send request 2
+        # Tick 2: send request 2 up to limit=2
         conn._send_request(10.0, 10.0)
         assert len(client._pending) == 2
         assert len(client._queue) == 2

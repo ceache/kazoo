@@ -73,6 +73,7 @@ from kazoo.protocol.statemachine import (
     ClientEvent,
     ConfigureReadOnlyMode,
     ConfigureTimeouts,
+    CloseSocket,
     ConnectAttemptStarted,
     ConnectionLostEvent,
     ConnectResponseReceived,
@@ -101,7 +102,6 @@ from kazoo.protocol.statemachine import (
     StartSASLHandshake,
     StepSASLHandshake,
     StopConnectionLoop,
-    TriggerConnectionDrop,
     UPDATE_SEND_CAPACITY_FALSE,
     UPDATE_SEND_CAPACITY_TRUE,
     UpdateIOInterest,
@@ -151,35 +151,10 @@ class RequestManager:
     XID sequence generation.
     """
 
-    def __init__(self, client_fallback: Any = None) -> None:
-        self._queue: deque[tuple[Any, IAsyncResult]] = deque()
-        self._pending: deque[tuple[Any, IAsyncResult, int]] = deque()
+    def __init__(self) -> None:
+        self.queue: deque[tuple[Any, IAsyncResult]] = deque()
+        self.pending: deque[tuple[Any, IAsyncResult, int]] = deque()
         self.xid: int | None = None
-        self._client_fallback = client_fallback
-
-    @property
-    def queue(self) -> deque[tuple[Any, IAsyncResult]]:
-        if self._client_fallback is not None:
-            q = getattr(self._client_fallback, "_queue", None)
-            if isinstance(q, deque):
-                return q
-        return self._queue
-
-    @queue.setter
-    def queue(self, value: deque[tuple[Any, IAsyncResult]]) -> None:
-        self._queue = value
-
-    @property
-    def pending(self) -> deque[tuple[Any, IAsyncResult, int]]:
-        if self._client_fallback is not None:
-            p = getattr(self._client_fallback, "_pending", None)
-            if isinstance(p, (deque, list)):
-                return cast("deque[tuple[Any, IAsyncResult, int]]", p)
-        return self._pending
-
-    @pending.setter
-    def pending(self, value: deque[tuple[Any, IAsyncResult, int]]) -> None:
-        self._pending = value
 
     def reset_xid(self, value: int = 0) -> None:
         """Reset the XID counter for a new connection attempt."""
@@ -190,9 +165,14 @@ class RequestManager:
         self.xid = ((self.xid or 0) % 2147483647) + 1
         return self.xid
 
-    def enqueue(self, request: Any, async_object: IAsyncResult) -> None:
-        """Append a request and its completion handle to the send queue."""
+    def enqueue(self, request: Any, async_object: IAsyncResult) -> bool:
+        """Append a request and its completion handle to the send queue.
+
+        Returns True if the queue was previously empty (edge transition).
+        """
+        was_empty = not self.queue
         self.queue.append((request, async_object))
+        return was_empty
 
     def remove_queued(self, request: Any, async_object: IAsyncResult) -> None:
         """Remove a specific request pair from the send queue if present."""
@@ -262,83 +242,24 @@ class RequestManager:
         """Fail any remaining requests and reinitialize fresh deques."""
         if state is not None:
             self.fail_all(state)
-        self._queue = deque()
-        self._pending = deque()
+        self.queue = deque()
+        self.pending = deque()
 
 
 class WatcherManager:
     """Encapsulates client data, child, persistent, and recursive watchers."""
 
-    def __init__(self, client_fallback: Any = None) -> None:
-        self._child_watchers: defaultdict[str, set[WatchFunc]] = defaultdict(
+    def __init__(self) -> None:
+        self.child_watchers: defaultdict[str, set[WatchFunc]] = defaultdict(
             set
         )
-        self._data_watchers: defaultdict[str, set[WatchFunc]] = defaultdict(
-            set
-        )
-        self._persistent_watchers: defaultdict[str, set[WatchFunc]] = (
+        self.data_watchers: defaultdict[str, set[WatchFunc]] = defaultdict(set)
+        self.persistent_watchers: defaultdict[str, set[WatchFunc]] = (
             defaultdict(set)
         )
-        self._persistent_recursive_watchers: defaultdict[
+        self.persistent_recursive_watchers: defaultdict[
             str, set[WatchFunc]
         ] = defaultdict(set)
-        self._client_fallback = client_fallback
-
-    @property
-    def child_watchers(self) -> defaultdict[str, set[WatchFunc]]:
-        if self._client_fallback is not None:
-            d = getattr(self._client_fallback, "_child_watchers", None)
-            if isinstance(d, dict):
-                return cast("defaultdict[str, set[WatchFunc]]", d)
-        return self._child_watchers
-
-    @child_watchers.setter
-    def child_watchers(self, value: defaultdict[str, set[WatchFunc]]) -> None:
-        self._child_watchers = value
-
-    @property
-    def data_watchers(self) -> defaultdict[str, set[WatchFunc]]:
-        if self._client_fallback is not None:
-            d = getattr(self._client_fallback, "_data_watchers", None)
-            if isinstance(d, dict):
-                return cast("defaultdict[str, set[WatchFunc]]", d)
-        return self._data_watchers
-
-    @data_watchers.setter
-    def data_watchers(self, value: defaultdict[str, set[WatchFunc]]) -> None:
-        self._data_watchers = value
-
-    @property
-    def persistent_watchers(self) -> defaultdict[str, set[WatchFunc]]:
-        if self._client_fallback is not None:
-            d = getattr(self._client_fallback, "_persistent_watchers", None)
-            if isinstance(d, dict):
-                return cast("defaultdict[str, set[WatchFunc]]", d)
-        return self._persistent_watchers
-
-    @persistent_watchers.setter
-    def persistent_watchers(
-        self, value: defaultdict[str, set[WatchFunc]]
-    ) -> None:
-        self._persistent_watchers = value
-
-    @property
-    def persistent_recursive_watchers(
-        self,
-    ) -> defaultdict[str, set[WatchFunc]]:
-        if self._client_fallback is not None:
-            d = getattr(
-                self._client_fallback, "_persistent_recursive_watchers", None
-            )
-            if isinstance(d, dict):
-                return cast("defaultdict[str, set[WatchFunc]]", d)
-        return self._persistent_recursive_watchers
-
-    @persistent_recursive_watchers.setter
-    def persistent_recursive_watchers(
-        self, value: defaultdict[str, set[WatchFunc]]
-    ) -> None:
-        self._persistent_recursive_watchers = value
 
     def find_persistent_recursive(self, path: str) -> list[WatchFunc]:
         """Return persistent recursive watchers matching path or ancestors."""
@@ -422,10 +343,10 @@ class WatcherManager:
         for pr_w in self.persistent_recursive_watchers.values():
             watchers.extend(pr_w)
 
-        self._child_watchers = defaultdict(set)
-        self._data_watchers = defaultdict(set)
-        self._persistent_watchers = defaultdict(set)
-        self._persistent_recursive_watchers = defaultdict(set)
+        self.child_watchers = defaultdict(set)
+        self.data_watchers = defaultdict(set)
+        self.persistent_watchers = defaultdict(set)
+        self.persistent_recursive_watchers = defaultdict(set)
         return watchers
 
 
@@ -534,16 +455,18 @@ class ConnectionHandler:
         self._frame_decoder = FrameDecoder()
 
         req_mgr = getattr(client, "_request_manager", None)
-        if isinstance(req_mgr, RequestManager):
-            self._requests = req_mgr
-        else:
-            self._requests = RequestManager(client_fallback=client)
+        self._requests = (
+            req_mgr
+            if isinstance(req_mgr, RequestManager)
+            else RequestManager()
+        )
 
         watch_mgr = getattr(client, "_watcher_manager", None)
-        if isinstance(watch_mgr, WatcherManager):
-            self._watchers = watch_mgr
-        else:
-            self._watchers = WatcherManager(client_fallback=client)
+        self._watchers = (
+            watch_mgr
+            if isinstance(watch_mgr, WatcherManager)
+            else WatcherManager()
+        )
 
         self._rw_server: tuple[str, int] | None = None
         self._ro_mode: (
@@ -572,6 +495,9 @@ class ConnectionHandler:
 
     @property
     def _is_session_active(self) -> bool:
+        return self._check_session_active()
+
+    def _check_session_active(self) -> bool:
         state_machine = getattr(self.client, "_state_machine", None)
         if state_machine is not None and hasattr(state_machine, "state"):
             return getattr(state_machine.state, "is_connected", False) is True
@@ -632,7 +558,12 @@ class ConnectionHandler:
         sock = self._read_sock if target == "wakeup" else self._socket
         if sock is None:
             return
-        sel = self._ensure_selector()
+        if self._selector is None:
+            if not interest_mask:
+                return
+            sel = self._ensure_selector()
+        else:
+            sel = self._selector
         try:
             if interest_mask:
                 try:
@@ -666,9 +597,8 @@ class ConnectionHandler:
         )
         assert self._selector is not None
         events = self._selector.select(0.0 if has_ssl_pending else timeout)
-        ready: set[str] = {
-            key.data for key, mask in events if mask & selectors.EVENT_READ
-        }
+
+        ready: set[str] = {key.data for key, _ in events}
         if has_ssl_pending:
             ready.add("zk_socket")
         return ready
@@ -724,11 +654,7 @@ class ConnectionHandler:
 
             case DrainWakeupPipe():
                 self._update_io_interest(0, "wakeup")
-                if not self._requests.queue and self._read_sock is not None:
-                    try:
-                        self._read_sock.recv(1024)
-                    except OSError:
-                        pass
+                self._drain_wakeup()
 
             case SendHeartbeatPing():
                 self._send_ping(self._connect_timeout)
@@ -748,13 +674,21 @@ class ConnectionHandler:
                 )
                 self._last_send = time.monotonic()
 
-            case TriggerConnectionDrop(reason=reason):
+            case CloseSocket():
                 self.ping_outstanding.clear()
-                raise ConnectionDropped(reason)
+                self._close_selector()
+                if self._socket is not None:
+                    try:
+                        self._socket.close()
+                    except Exception:
+                        pass
+                    self._socket = None
 
             case SessionEstablished():
                 if self._current_retry is not None:
                     self._current_retry.reset()
+                if self._requests.queue:
+                    self.wake()
 
             case ResetSessionData():
                 self._frame_decoder.reset()
@@ -802,6 +736,8 @@ class ConnectionHandler:
         if self.connection_closed.is_set():
             rw_sockets = self.handler.create_socket_pair()
             self._read_sock, self._write_sock = rw_sockets
+            self._read_sock.setblocking(False)
+            self._write_sock.setblocking(False)
             self._update_io_interest(selectors.EVENT_READ, "wakeup")
             self.connection_closed.clear()
         if self._connection_routine:
@@ -847,8 +783,27 @@ class ConnectionHandler:
         try:
             sock.send(b"\0")
             return True
+        except BlockingIOError:
+            return True
         except OSError:
             return False
+
+    def _drain_wakeup(self) -> None:
+        """Drain all bytes from the non-blocking wakeup pipe."""
+        sock = self._read_sock
+        if sock is None:
+            return
+        try:
+            sock.setblocking(False)
+        except Exception:
+            pass
+        while True:
+            try:
+                chunk = sock.recv(4096)
+                if not chunk or not isinstance(chunk, (bytes, bytearray)):
+                    break
+            except (BlockingIOError, OSError):
+                break
 
     def _server_pinger(self) -> RWPinger:
         """Returns a server pinger iterable, that will ping the next
@@ -881,29 +836,27 @@ class ConnectionHandler:
     def _read(self, length: int, timeout: float | None) -> bytes:
         msgparts = []
         remaining = length
-        use_fast_read = "select" not in getattr(self.handler, "__dict__", {})
         # We know that self._socket is not None here because we only call
         # this method when we have set up the connection and the read socket.
         # But mypy doesn't understand that.
         while remaining > 0:
-            if use_fast_read:
-                try:
-                    chunk = self._socket.recv(  # type: ignore[union-attr]
-                        remaining
-                    )
-                    if chunk == b"":
-                        raise ConnectionDropped("socket connection broken")
-                    msgparts.append(chunk)
-                    remaining -= len(chunk)
-                    continue
-                except BlockingIOError:
-                    pass
-                except ssl.SSLError as e:
-                    if e.errno not in (
-                        ssl.SSL_ERROR_WANT_READ,
-                        ssl.SSL_ERROR_WANT_WRITE,
-                    ):
-                        raise
+            try:
+                chunk = self._socket.recv(  # type: ignore[union-attr]
+                    remaining
+                )
+                if chunk == b"":
+                    raise ConnectionDropped("socket connection broken")
+                msgparts.append(chunk)
+                remaining -= len(chunk)
+                continue
+            except BlockingIOError:
+                pass
+            except ssl.SSLError as e:
+                if e.errno not in (
+                    ssl.SSL_ERROR_WANT_READ,
+                    ssl.SSL_ERROR_WANT_WRITE,
+                ):
+                    raise
             # Because of SSL framing, a select may not return when using
             # an SSL socket because the underlying physical socket may not
             # have anything to select, but the wrapped object may still
@@ -959,45 +912,52 @@ class ConnectionHandler:
         )
         self._write(FrameDecoder.encode_request(request, xid), timeout)
 
-    def _write(self, msg: bytes, timeout: float | None) -> None:
-        """Write a raw msg to the socket"""
+    def _write(self, msg: bytes, timeout: float | None = None) -> None:
+        """Write raw bytes to the socket.
+
+        Attempts an optimistic non-blocking send first for the fast-path.
+        If a partial send occurs or socket buffer is full, drains the
+        remainder using handler.select bounded by timeout.
+        """
+        if self._socket is None:
+            return
+
         sent = 0
         msg_length = len(msg)
-        # Note: The casts/type: ignore are because mypy can't work out
-        # self._socket is not None, and I don't want to change any code.
-        use_fast_write = "select" not in getattr(self.handler, "__dict__", {})
+        view = memoryview(msg)
+
+        # Fast-path: optimistic direct non-blocking send
+        try:
+            bytes_sent = self._socket.send(view)
+            if not bytes_sent:
+                raise ConnectionDropped("socket connection broken")
+            if bytes_sent >= msg_length:
+                return
+            sent = bytes_sent
+        except BlockingIOError:
+            pass
+        except ssl.SSLError as e:
+            if e.errno not in (
+                ssl.SSL_ERROR_WANT_READ,
+                ssl.SSL_ERROR_WANT_WRITE,
+            ):
+                raise
+        except OSError as e:
+            raise ConnectionDropped(f"socket connection error: {e}") from e
+
+        # Slow-path: partial write or buffer full, drain bounded by timeout
+        eff_timeout = self._connect_timeout if timeout is None else timeout
+        deadline = time.monotonic() + eff_timeout
+
         while sent < msg_length:
-            msg_slice = buffer(msg, sent)
-            if use_fast_write:
-                try:
-                    bytes_sent = self._socket.send(  # type: ignore[union-attr]
-                        msg_slice
-                    )
-                    if not bytes_sent:
-                        raise ConnectionDropped("socket connection broken")
-                    sent += bytes_sent
-                    continue
-                except BlockingIOError:
-                    pass
-                except ssl.SSLError as e:
-                    if e.errno not in (
-                        ssl.SSL_ERROR_WANT_READ,
-                        ssl.SSL_ERROR_WANT_WRITE,
-                    ):
-                        raise
-            s = self.handler.select(
-                [], [cast("Socket", self._socket)], [], timeout
-            )[1]
-            if not s:  # pragma: nocover
-                # If the write list is empty, we got a timeout. We don't
-                # have to check rlist and xlist as we don't set any
+            rem_timeout = max(0.0, deadline - time.monotonic())
+            s = self.handler.select([], [self._socket], [], rem_timeout)[1]
+            if not s:
                 raise self.handler.timeout_exception(
                     "socket time-out during write"
                 )
             try:
-                bytes_sent = self._socket.send(  # type: ignore[union-attr]
-                    msg_slice
-                )
+                bytes_sent = self._socket.send(view[sent:])
             except BlockingIOError:
                 continue
             except ssl.SSLError as e:
@@ -1008,6 +968,8 @@ class ConnectionHandler:
                     continue
                 else:
                     raise
+            except OSError as e:
+                raise ConnectionDropped(f"socket connection error: {e}") from e
             if not bytes_sent:
                 raise ConnectionDropped("socket connection broken")
             sent += bytes_sent
@@ -1206,45 +1168,29 @@ class ConnectionHandler:
         connect_timeout: float,
     ) -> None:
         """Called when we have something to send out on the socket"""
-        try:
-            request, _ = self._requests.peek_queued()
-        except IndexError:
-            # Not actually something on the queue, this can occur if
-            # something happens to cancel the request such that we
-            # don't clear the socket below after sending
+        limit = self.client.concurrent_request_limit
+        while self._requests.has_send_capacity(limit):
             try:
-                # Clear possible inconsistence (no request in the queue
-                # but have data in the read socket), which causes cpu to spin.
-                #
-                # We know _read_sock is not None because we only call this
-                # method when we have set up the connection and the read
-                # socket, but mypy doesn't understand that.
-                self._read_sock.recv(1)  # type: ignore[union-attr]
-            except OSError:
-                pass
-            return
+                request, _ = self._requests.peek_queued()
+            except IndexError:
+                return
 
-        # Special case for testing, if this is a _SessionExpire object
-        # then throw a SessionExpiration error as if we were dropped
-        if request is _SESSION_EXPIRED:
-            raise SessionExpiredError("Session expired: Testing")
-        if request is _CONNECTION_DROP:
-            raise ConnectionDropped("Connection dropped: Testing")
+            # Special case for testing, if this is a _SessionExpire object
+            # then throw a SessionExpiration error as if we were dropped
+            if request is _SESSION_EXPIRED:
+                raise SessionExpiredError("Session expired: Testing")
+            if request is _CONNECTION_DROP:
+                raise ConnectionDropped("Connection dropped: Testing")
 
-        # Special case for auth packets
-        if request.type == Auth.type:
-            xid: int = ReservedXID.AUTH
-        else:
-            xid = self._requests.next_xid()
+            # Special case for auth packets
+            if request.type == Auth.type:
+                xid: int = ReservedXID.AUTH
+            else:
+                xid = self._requests.next_xid()
 
-        self._requests.dequeue_to_pending(xid)
-        # _read_sock should never be None here as we only call this method
-        # when we have set up the connection and the read socket.
-        try:
-            self._read_sock.recv(1)  # type: ignore[union-attr]
-        except OSError:
-            pass
-        self._submit(request, connect_timeout, xid)
+            self._requests.dequeue_to_pending(xid)
+            self._submit(request, connect_timeout, xid)
+            self._last_send = time.monotonic()
 
     def _send_ping(self, connect_timeout: float) -> None:
         self.ping_outstanding.set()
@@ -1346,8 +1292,10 @@ class ConnectionHandler:
 
     def _update_send_capacity(self) -> None:
         """Evaluate request queuing interest and notify state machine."""
-        can_send = bool(self._is_terminal) or self._requests.has_send_capacity(
-            self.client.concurrent_request_limit
+        can_send = bool(self._is_terminal) or (
+            self._requests.has_send_capacity(
+                self.client.concurrent_request_limit
+            )
         )
         self._emit_event(
             UPDATE_SEND_CAPACITY_TRUE
@@ -1367,18 +1315,31 @@ class ConnectionHandler:
             self._emit_event(POLL_TIMEOUT_EXPIRED)
         else:
             if "zk_socket" in ready:
-                self._emit_event(SOCKET_READABLE)
-                if isinstance(
-                    self.client._state_machine.state, (Inactive, AuthFailed)
-                ):
-                    return False
+                if self._check_session_active():
+                    self._read_socket()
+                    if not self._check_session_active():
+                        return False
+                else:
+                    self._emit_event(SOCKET_READABLE)
+                    if isinstance(
+                        self.client._state_machine.state,
+                        (Inactive, AuthFailed),
+                    ):
+                        return False
 
             # Check if any requests need sending before proceeding
             # to process more responses. Otherwise the responses
             # may choke out the requests. See PR#633.
             if "wakeup" in ready and self._wakeup_registered:
-                self._emit_event(WAKEUP_SIGNALED)
-                return True
+                self._drain_wakeup()
+                if self._is_session_active:
+                    self._send_request(
+                        self._read_timeout, self._connect_timeout
+                    )
+                    return True
+                else:
+                    self._emit_event(WAKEUP_SIGNALED)
+                    return True
 
         if (
             self._is_session_active
@@ -1395,14 +1356,21 @@ class ConnectionHandler:
 
         if self._is_session_active:
             self._update_send_capacity()
+            if self._requests.queue and self._requests.has_send_capacity(
+                self.client.concurrent_request_limit
+            ):
+                self._send_request(self._read_timeout, self._connect_timeout)
 
         ready = self._select(timeout)
         self._dispatch_ready_events(ready, deadline)
 
     def _run_io_loop(self) -> None:
-        """Drive the selector event loop until entering a terminal state."""
-        while not isinstance(
-            self.client._state_machine.state, (Inactive, AuthFailed)
+        """Drive selector loop until terminal state or socket closed."""
+        while (
+            not isinstance(
+                self.client._state_machine.state, (Inactive, AuthFailed)
+            )
+            and self._socket is not None
         ):
             self._poll_step()
 
@@ -1500,12 +1468,13 @@ class ConnectionHandler:
 
             self._run_io_loop()
 
-            self.logger.info("Closing connection to %s:%s", host, port)
-            if not isinstance(
-                self.client.state_machine, (Inactive, AuthFailed)
-            ):
-                self._emit_event(SessionClosedEvent())
-            return STOP_CONNECTING
+            if self._check_is_terminal():
+                self.logger.info("Closing connection to %s:%s", host, port)
+                if not isinstance(
+                    self.client.state_machine, (Inactive, AuthFailed)
+                ):
+                    self._emit_event(SessionClosedEvent())
+                return STOP_CONNECTING
         except (OSError, ConnectionDropped, KazooTimeoutError) as e:
             if isinstance(e, KazooTimeoutError):
                 self.logger.warning("Connection time-out: %s", e)
@@ -1544,14 +1513,11 @@ class ConnectionHandler:
         finally:
             self._current_retry = None
             self._dispose_sasl()
-            self._update_io_interest(0, "wakeup")
+            self._close_selector()
             if self._socket is not None:
-                # I think this is a bug in mypy, as the socket does get set up
-                # in self._connect, but it doesn't seem to be able to track
-                # that.
-                self._update_io_interest(  # type: ignore[unreachable]
-                    0, "zk_socket"
-                )
-                self._socket.close()
+                try:
+                    self._socket.close()
+                except Exception:
+                    pass
                 self._socket = None
         return None

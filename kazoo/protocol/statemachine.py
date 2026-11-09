@@ -212,20 +212,6 @@ class ConnectAttemptStarted:
 
 
 @dataclass(frozen=True, slots=True)
-class HandshakeCompleted:
-    """Emitted when the ZooKeeper Connect handshake response succeeds."""
-
-    host: str | None = None
-    port: int | None = None
-    session_id: int | None = None
-    read_timeout: float = 10.0
-    connect_timeout: float = 10.0
-    read_only: bool = False
-    has_sasl: bool = False
-    auth_data: tuple[tuple[str, str], ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
 class SocketConnected:
     """Emitted when transport socket connection is established."""
 
@@ -340,7 +326,6 @@ class UpdateSendCapacity:
 ClientEvent: TypeAlias = (
     StartRequested
     | ConnectAttemptStarted
-    | HandshakeCompleted
     | SocketConnected
     | ConnectResponseReceived
     | SASLChallengeReceived
@@ -458,8 +443,8 @@ class SendHeartbeatPing:
 
 
 @dataclass(frozen=True, slots=True)
-class TriggerConnectionDrop:
-    """Raise ConnectionDropped with the given reason."""
+class CloseSocket:
+    """Close the transport socket and unregister from selector."""
 
     reason: str
 
@@ -527,7 +512,7 @@ SideEffect: TypeAlias = (
     | ReadSocketPacket
     | SendQueuedRequest
     | SendHeartbeatPing
-    | TriggerConnectionDrop
+    | CloseSocket
     | SessionEstablished
     | StopConnectionLoop
     | SendConnectPacket
@@ -755,11 +740,25 @@ def transition(
             PollTimeoutExpired(),
         ):
             return (
-                replace(state, ping_outstanding=False),
+                Suspended(
+                    host=state.host,
+                    port=state.port,
+                    session_id=state.session_id,
+                    is_connecting_allowed=state.is_connecting_allowed,
+                ),
                 [
-                    TriggerConnectionDrop(
+                    CloseSocket(
                         reason="outstanding heartbeat ping not received"
-                    )
+                    ),
+                    LogStateTransition(
+                        logging.WARNING,
+                        "Connection dropped: %s",
+                        ("outstanding heartbeat ping not received",),
+                    ),
+                    *_suspend_effects(
+                        KeeperState.CONNECTING,
+                        disable_wakeup=True,
+                    ),
                 ],
             )
 
@@ -774,11 +773,19 @@ def transition(
             PollTimeoutExpired(),
         ):
             return (
-                state,
+                Connecting(
+                    host=state.host,
+                    port=state.port,
+                    attempt=1,
+                    is_connecting_allowed=state.is_connecting_allowed,
+                ),
                 [
-                    TriggerConnectionDrop(
-                        reason="socket time-out during handshake"
-                    )
+                    CloseSocket(reason="socket time-out during handshake"),
+                    LogStateTransition(
+                        logging.WARNING,
+                        "Connection time-out: %s",
+                        ("socket time-out during handshake",),
+                    ),
                 ],
             )
 
@@ -787,11 +794,21 @@ def transition(
             PollTimeoutExpired(),
         ):
             return (
-                state,
+                Connecting(
+                    host=state.host,
+                    port=state.port,
+                    attempt=1,
+                    is_connecting_allowed=state.is_connecting_allowed,
+                ),
                 [
-                    TriggerConnectionDrop(
+                    CloseSocket(
                         reason="socket time-out during authentication"
-                    )
+                    ),
+                    LogStateTransition(
+                        logging.WARNING,
+                        "Connection time-out: %s",
+                        ("socket time-out during authentication",),
+                    ),
                 ],
             )
 
@@ -1004,7 +1021,7 @@ def transition(
                     [
                         FailPendingRequests(KeeperState.EXPIRED_SESSION),
                         ResetSessionData(),
-                        TriggerConnectionDrop("Session has expired"),
+                        CloseSocket("Session has expired"),
                     ]
                 )
                 return (
@@ -1086,103 +1103,6 @@ def transition(
                 read_only=eff_ro,
             )
             return finalize_state, common_effects + finalize_effects
-
-        # -----------------------------------------------------------------
-        # 4. HandshakeCompleted & Authentication Progression
-        # -----------------------------------------------------------------
-        case (
-            Connected(),
-            HandshakeCompleted(
-                host=None,
-                session_id=None,
-                read_only=False,
-                has_sasl=False,
-                auth_data=(),
-            ),
-        ):
-            return state, []
-
-        case (
-            ConnectedReadOnly(),
-            HandshakeCompleted(
-                host=None,
-                session_id=None,
-                read_only=True,
-                has_sasl=False,
-                auth_data=(),
-            ),
-        ):
-            return state, []
-
-        case (
-            _,
-            HandshakeCompleted(
-                host=host,
-                port=port,
-                session_id=hs_session_id,
-                read_timeout=read_timeout,
-                connect_timeout=connect_timeout,
-                read_only=read_only,
-                has_sasl=has_sasl,
-                auth_data=auth_data,
-            ),
-        ):
-            eff_host = host or getattr(state, "host", None)
-            eff_port = port or getattr(state, "port", None)
-            hs_sid: int | None = (
-                hs_session_id
-                if hs_session_id is not None
-                else getattr(state, "session_id", None)
-            )
-            if has_sasl:
-                return (
-                    Authenticating(
-                        stage=AuthStage.SASL,
-                        host=eff_host,
-                        port=eff_port,
-                        session_id=hs_sid,
-                        read_timeout=read_timeout,
-                        connect_timeout=connect_timeout,
-                        read_only=read_only,
-                        pending_auth=auth_data,
-                        kazoo_state=state.kazoo_state,
-                        wakeup_interested=False,
-                    ),
-                    [
-                        UpdateIOInterest(interest_mask=0, target="wakeup"),
-                        StartSASLHandshake(host=eff_host),
-                    ],
-                )
-            if auth_data:
-                first_scheme, first_cred = auth_data[0]
-                return (
-                    Authenticating(
-                        stage=AuthStage.INITIAL_AUTH,
-                        host=eff_host,
-                        port=eff_port,
-                        session_id=hs_sid,
-                        read_timeout=read_timeout,
-                        connect_timeout=connect_timeout,
-                        read_only=read_only,
-                        pending_auth=auth_data[1:],
-                        kazoo_state=state.kazoo_state,
-                        wakeup_interested=False,
-                    ),
-                    [
-                        UpdateIOInterest(interest_mask=0, target="wakeup"),
-                        SendAuthPacket(
-                            scheme=first_scheme, credential=first_cred
-                        ),
-                    ],
-                )
-            return _finalize_connected(
-                host=eff_host,
-                port=eff_port,
-                session_id=hs_sid,
-                read_timeout=read_timeout,
-                connect_timeout=connect_timeout,
-                read_only=read_only,
-            )
 
         case (
             Authenticating(stage=AuthStage.SASL),
@@ -1551,21 +1471,7 @@ class StateMachineDriver:
                     else:
                         self._processing_events = False
                         current_event = None
-        except BaseException:
-            # If an effect raised (e.g. TriggerConnectionDrop), drain any
-            # lifecycle events (such as SessionClosedEvent) queued while
-            # the effect was executing before releasing _processing_events.
-            try:
-                while True:
-                    with self._dispatch_lock:
-                        if not self._event_queue:
-                            break
-                        queued_event = self._event_queue.popleft()
-                    next_state, effects = transition(self.state, queued_event)
-                    self.state = next_state
-                    for effect in effects:
-                        self._effect_executor(effect)
-            finally:
-                with self._dispatch_lock:
+        finally:
+            with self._dispatch_lock:
+                if current_event is not None:
                     self._processing_events = False
-            raise

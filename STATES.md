@@ -39,12 +39,12 @@ stateDiagram-v2
     Authenticating --> AuthFailed : AuthFailedEvent / ConnectionLostEvent [SASL]
 
     %% Active Session States
-    Connected --> Suspended : ConnectionLostEvent / RWServerFoundEvent
+    Connected --> Suspended : ConnectionLostEvent / RWServerFoundEvent / PollTimeoutExpired [ping_outstanding]
     Connected --> ExpiredSession : SessionExpiredEvent
     Connected --> AuthFailed : AuthFailedEvent
     Connected --> Inactive : SessionClosedEvent
 
-    ConnectedReadOnly --> Suspended : ConnectionLostEvent / RWServerFoundEvent
+    ConnectedReadOnly --> Suspended : ConnectionLostEvent / RWServerFoundEvent / PollTimeoutExpired [ping_outstanding]
     ConnectedReadOnly --> ExpiredSession : SessionExpiredEvent
     ConnectedReadOnly --> AuthFailed : AuthFailedEvent
     ConnectedReadOnly --> Inactive : SessionClosedEvent
@@ -135,7 +135,7 @@ Side effects are declarative command objects returned by `transition()` and disp
 | `DrainWakeupPipe` | Drain a wakeup byte from the internal pipe without sending a request (when wakeup signals arrive during non-connected states). |
 | `SendHeartbeatPing` | Transmit ZooKeeper heartbeat `Ping` frame (`xid=PING_XID`). |
 | `UpdateIOInterest` | Update selector interest mask (`EVENT_READ`, `EVENT_WRITE`) for socket or wakeup pipe. |
-| `TriggerConnectionDrop` | Raise `ConnectionDropped` with specified reason. |
+| `CloseSocket` | Close the network socket and selector cleanly without raising synthetic exceptions. |
 | `SessionEstablished` | Notify handler that session is active and reset retry backoff. |
 | `StopConnectionLoop` | Instruct connection loop to halt connecting. |
 | `ResolveConnectResult` | Complete or fail pending `start_async()` promise. |

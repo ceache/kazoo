@@ -5,10 +5,12 @@ import pytest
 
 from kazoo.client import KazooClient
 from kazoo.exceptions import AuthFailedError
+from kazoo.protocol.serialization import Connect
 from kazoo.protocol.statemachine import (
     AuthFailedEvent,
     ConnectionLostEvent,
-    HandshakeCompleted,
+    ConnectResponseReceived,
+    Handshaking,
     SessionExpiredEvent,
 )
 from kazoo.protocol.states import KazooState
@@ -17,7 +19,14 @@ from kazoo.protocol.states import KazooState
 def test_session_callback_states() -> None:
     client = KazooClient()
 
-    client.send_event(HandshakeCompleted())
+    client._state_machine.state = Handshaking(
+        host="127.0.0.1", port=2181, num_hosts=1
+    )
+    client.send_event(
+        ConnectResponseReceived(
+            connect_result=Connect(0, 0, 10000, 1, b"pwd", False), zxid=1
+        )
+    )
     assert client.state == KazooState.CONNECTED
 
     client.send_event(AuthFailedEvent())
@@ -82,7 +91,14 @@ def test_start_async_success() -> None:
     client = KazooClient()
 
     def fake_conn_start() -> None:
-        client.send_event(HandshakeCompleted())
+        client._state_machine.state = Handshaking(
+            host="127.0.0.1", port=2181, num_hosts=1
+        )
+        client.send_event(
+            ConnectResponseReceived(
+                connect_result=Connect(0, 0, 10000, 1, b"pwd", False), zxid=1
+            )
+        )
 
     client._connection.start = (  # type: ignore[method-assign]
         fake_conn_start
@@ -107,7 +123,14 @@ def test_start_async_recovers_from_expired_session() -> None:
         # First attempt receives EXPIRED_SESSION (not terminal)
         client.send_event(SessionExpiredEvent())
         # Second attempt receives CONNECTED
-        client.send_event(HandshakeCompleted())
+        client._state_machine.state = Handshaking(
+            host="127.0.0.1", port=2181, num_hosts=1
+        )
+        client.send_event(
+            ConnectResponseReceived(
+                connect_result=Connect(0, 0, 10000, 1, b"pwd", False), zxid=1
+            )
+        )
 
     client._connection.start = (  # type: ignore[method-assign]
         fake_conn_start

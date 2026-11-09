@@ -882,15 +882,16 @@ class KazooClient:
             async_object.set_exception(SessionExpiredError())
             return False
 
-        self._request_manager.enqueue(request, async_object)
+        was_empty = self._request_manager.enqueue(request, async_object)
 
-        # Wake the connection, guarding against a race with close()
-        if not self._connection.wake():
-            self._request_manager.remove_queued(request, async_object)
-            async_object.set_exception(
-                ConnectionClosedError("Connection has been closed")
-            )
-            return None
+        # Wake connection on edge transition (when queue was previously empty)
+        if was_empty:
+            if not self._connection.wake():
+                self._request_manager.remove_queued(request, async_object)
+                async_object.set_exception(
+                    ConnectionClosedError("Connection has been closed")
+                )
+                return None
         return None
 
     def start(self, timeout: float = 15.0) -> None:

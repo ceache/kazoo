@@ -66,7 +66,6 @@ from kazoo.protocol.statemachine import (
     EmitKazooStateChange,
     ExpiredSession,
     FailPendingRequests,
-    HandshakeCompleted,
     Handshaking,
     HeartbeatDeadlineReached,
     Inactive,
@@ -95,7 +94,7 @@ from kazoo.protocol.statemachine import (
     StepSASLHandshake,
     StopConnectionLoop,
     Suspended,
-    TriggerConnectionDrop,
+    CloseSocket,
     UpdateIOInterest,
     UpdateSendCapacity,
     UpdateSessionData,
@@ -305,7 +304,7 @@ class TestPureTransitionMatrix:
             EmitKazooStateChange(KazooState.LOST),
             FailPendingRequests(KeeperState.EXPIRED_SESSION),
             ResetSessionData(),
-            TriggerConnectionDrop("Session has expired"),
+            CloseSocket("Session has expired"),
         ]
 
     def test_handshaking_connect_response_expired_initial_connect(
@@ -337,7 +336,7 @@ class TestPureTransitionMatrix:
             ),
             FailPendingRequests(KeeperState.EXPIRED_SESSION),
             ResetSessionData(),
-            TriggerConnectionDrop("Session has expired"),
+            CloseSocket("Session has expired"),
         ]
 
     def test_handshaking_connect_response_with_sasl(self) -> None:
@@ -429,9 +428,16 @@ class TestPureTransitionMatrix:
     def test_handshaking_poll_timeout_drops_connection(self) -> None:
         state = Handshaking(host="127.0.0.1", port=2181)
         next_state, effects = transition(state, PollTimeoutExpired())
-        assert next_state == state
+        assert next_state == Connecting(
+            host="127.0.0.1", port=2181, attempt=1, is_connecting_allowed=True
+        )
         assert effects == [
-            TriggerConnectionDrop(reason="socket time-out during handshake")
+            CloseSocket(reason="socket time-out during handshake"),
+            LogStateTransition(
+                logging.WARNING,
+                "Connection time-out: %s",
+                ("socket time-out during handshake",),
+            ),
         ]
 
     def test_handshaking_connection_lost_transitions_to_connecting(
@@ -451,90 +457,24 @@ class TestPureTransitionMatrix:
         assert next_state == Connecting(host="127.0.0.1", port=2181, attempt=1)
         assert effects == []
 
-    def test_connecting_to_connected_rw(self) -> None:
-        state = Connecting(host="127.0.0.1", port=2181, attempt=1)
-        next_state, effects = transition(
-            state,
-            HandshakeCompleted(
-                host="127.0.0.1",
-                port=2181,
-                session_id=999,
-                read_timeout=6.6,
-                connect_timeout=3.3,
-                read_only=False,
-            ),
-        )
-        assert next_state == Connected(
+    def test_authenticating_sasl_and_auth_packets_progression(self) -> None:
+        state = Handshaking(
             host="127.0.0.1",
             port=2181,
+            num_hosts=1,
+            has_sasl=True,
+            auth_data=(("digest", "u1:p1"), ("digest", "u2:p2")),
+        )
+        connect_res = Connect(
+            protocol_version=0,
+            last_zxid_seen=0,
+            time_out=9000,
             session_id=999,
-            read_timeout=6.6,
-            connect_timeout=3.3,
-            wakeup_interested=True,
+            passwd=b"pwd",
+            read_only=False,
         )
-        assert effects == [
-            UpdateIOInterest(
-                interest_mask=selectors.EVENT_READ, target="wakeup"
-            ),
-            LogStateTransition(
-                logging.INFO,
-                "Zookeeper connection established, state: %s",
-                (KeeperState.CONNECTED,),
-            ),
-            ResolveConnectResult(success=True),
-            EmitKazooStateChange(KazooState.CONNECTED),
-            SessionEstablished(),
-        ]
-
-    def test_connecting_to_connected_ro(self) -> None:
-        state = Connecting(host="127.0.0.1", port=2181, attempt=1)
-        next_state, effects = transition(
-            state,
-            HandshakeCompleted(
-                host="127.0.0.1",
-                port=2181,
-                session_id=999,
-                read_timeout=6.6,
-                connect_timeout=3.3,
-                read_only=True,
-            ),
-        )
-        assert next_state == ConnectedReadOnly(
-            host="127.0.0.1",
-            port=2181,
-            session_id=999,
-            read_timeout=6.6,
-            connect_timeout=3.3,
-            wakeup_interested=True,
-        )
-        assert effects == [
-            UpdateIOInterest(
-                interest_mask=selectors.EVENT_READ, target="wakeup"
-            ),
-            LogStateTransition(
-                logging.INFO,
-                "Zookeeper connection established, state: %s",
-                (KeeperState.CONNECTED_RO,),
-            ),
-            ResolveConnectResult(success=True),
-            EmitKazooStateChange(KazooState.CONNECTED),
-            SessionEstablished(),
-        ]
-
-    def test_connecting_to_authenticating_sasl_and_auth_packets(self) -> None:
-        state = Connecting(host="127.0.0.1", port=2181, attempt=1)
         s1, eff1 = transition(
-            state,
-            HandshakeCompleted(
-                host="127.0.0.1",
-                port=2181,
-                session_id=999,
-                read_timeout=6.0,
-                connect_timeout=3.0,
-                read_only=False,
-                has_sasl=True,
-                auth_data=(("digest", "u1:p1"), ("digest", "u2:p2")),
-            ),
+            state, ConnectResponseReceived(connect_result=connect_res)
         )
         assert s1 == Authenticating(
             stage=AuthStage.SASL,
@@ -542,12 +482,20 @@ class TestPureTransitionMatrix:
             port=2181,
             session_id=999,
             read_timeout=6.0,
-            connect_timeout=3.0,
+            connect_timeout=9.0,
             read_only=False,
             pending_auth=(("digest", "u1:p1"), ("digest", "u2:p2")),
             wakeup_interested=False,
         )
         assert eff1 == [
+            UpdateSessionData(
+                session_id=999,
+                session_passwd=b"pwd",
+                protocol_version=0,
+                last_zxid=None,
+            ),
+            ConfigureTimeouts(read_timeout=6.0, connect_timeout=9.0),
+            ConfigureReadOnlyMode(read_only=False),
             UpdateIOInterest(interest_mask=0, target="wakeup"),
             StartSASLHandshake(host="127.0.0.1"),
         ]
@@ -578,7 +526,7 @@ class TestPureTransitionMatrix:
             port=2181,
             session_id=999,
             read_timeout=6.0,
-            connect_timeout=3.0,
+            connect_timeout=9.0,
             wakeup_interested=True,
         )
         assert eff5 == [
@@ -917,12 +865,19 @@ class TestPureTransitionMatrix:
 
         # 5. PollTimeoutExpired while ping_outstanding=True
         s5, eff5 = transition(s3, PollTimeoutExpired())
-        assert isinstance(s5, Connected)
-        assert s5.ping_outstanding is False
+        assert isinstance(s5, Suspended)
         assert eff5 == [
-            TriggerConnectionDrop(
-                reason="outstanding heartbeat ping not received"
-            )
+            CloseSocket(reason="outstanding heartbeat ping not received"),
+            LogStateTransition(
+                logging.WARNING,
+                "Connection dropped: %s",
+                ("outstanding heartbeat ping not received",),
+            ),
+            UpdateIOInterest(interest_mask=0, target="wakeup"),
+            LogStateTransition(logging.INFO, "Zookeeper connection lost"),
+            FailPendingRequests(KeeperState.CONNECTING),
+            EmitKazooStateChange(KazooState.SUSPENDED),
+            InvalidateWatchers(),
         ]
 
     def test_update_send_capacity_toggles_io_interest(self) -> None:
@@ -1109,9 +1064,12 @@ class TestClientStateMachineDriver:
                 client.send_event(ConnectionLostEvent(reason="simulated drop"))
 
         client.add_listener(reentrant_listener)
+        client._state_machine.state = Handshaking(
+            host="127.0.0.1", port=2181, num_hosts=1
+        )
         client.send_event(
-            HandshakeCompleted(
-                host="127.0.0.1", port=2181, session_id=100, read_only=False
+            ConnectResponseReceived(
+                connect_result=Connect(0, 0, 10000, 100, b"pwd", False), zxid=1
             )
         )
 
@@ -1137,9 +1095,12 @@ class TestClientStateMachineDriver:
             assert conn._selector is not None
             assert conn._wakeup_registered is True
 
+            client.send_event(StartRequested())
+            client.send_event(SocketConnected(host="127.0.0.1", port=2181))
             client.send_event(
-                HandshakeCompleted(
-                    host="127.0.0.1", port=2181, session_id=1, read_only=False
+                ConnectResponseReceived(
+                    connect_result=Connect(0, 0, 10000, 1, b"pwd", False),
+                    zxid=1,
                 )
             )
             assert isinstance(client.state_machine, Connected)
@@ -1282,9 +1243,12 @@ class TestClientStateMachineDriver:
         client._connection._start_sasl = (  # type: ignore[method-assign]
             lambda host: None
         )
+        client._state_machine.state = Handshaking(
+            host="127.0.0.1", port=2181, num_hosts=1, has_sasl=True
+        )
         client.send_event(
-            HandshakeCompleted(
-                host="127.0.0.1", port=2181, session_id=1, has_sasl=True
+            ConnectResponseReceived(
+                connect_result=Connect(0, 0, 10000, 1, b"pwd", False), zxid=1
             )
         )
         assert isinstance(client.state_machine, Authenticating)
@@ -1305,9 +1269,12 @@ class TestClientStateMachineDriver:
         conn._current_retry = mock_retry
         assert conn._is_session_active is False
 
+        client._state_machine.state = Handshaking(
+            host="127.0.0.1", port=2181, num_hosts=1
+        )
         client.send_event(
-            HandshakeCompleted(
-                host="127.0.0.1", port=2181, session_id=1, read_only=False
+            ConnectResponseReceived(
+                connect_result=Connect(0, 0, 10000, 1, b"pwd", False), zxid=1
             )
         )
         assert conn._is_session_active is True
