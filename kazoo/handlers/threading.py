@@ -13,14 +13,15 @@ environments that use threads.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 import atexit
 import logging
 import queue
+import selectors
 import socket
 import threading
 import time
-
-from typing import Any, Callable, Iterable, TYPE_CHECKING, cast
+from typing import Any, TYPE_CHECKING, cast
 
 from kazoo.handlers import utils
 from kazoo.handlers.utils import selector_select
@@ -186,6 +187,9 @@ class SequentialThreadingHandler(IHandler):
         self, *args: Any, **kwargs: Any
     ) -> tuple[Iterable[FdLike], Iterable[FdLike], Iterable[FdLike]]:
         return selector_select(*args, **kwargs)
+
+    def create_selector(self) -> selectors.BaseSelector:
+        return selectors.DefaultSelector()
 
     def socket(self) -> Socket:
         return utils.create_tcp_socket(socket)

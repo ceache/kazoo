@@ -13,7 +13,7 @@ from kazoo.protocol.connection import _CONNECTION_DROP
 from kazoo.protocol.serialization import (
     Connect,
     int_struct,
-    write_string,
+    _write_string,
 )
 from kazoo.protocol.states import KazooState
 from kazoo.tests.util import CI, CI_ZK_VERSION, wait
@@ -24,7 +24,7 @@ class Delete(namedtuple("Delete", "path version")):
 
     def serialize(self):
         b = bytearray()
-        b.extend(write_string(self.path))
+        b.extend(_write_string(self.path))
         b.extend(int_struct.pack(self.version))
         return b
 
@@ -63,15 +63,14 @@ class TestConnectionHandler:
         ev = threading.Event()
         path = "/" + uuid.uuid4().hex
         handler = zkclient.handler
-        _select = handler.select
+        orig_read = zkclient._connection._read
         _socket = zkclient._connection._socket
 
-        def delayed_select(*args, **kwargs):
-            result = _select(*args, **kwargs)
-            if len(args[0]) == 1 and _socket in args[0]:
-                # for any socket read, simulate a timeout
-                return [], [], []
-            return result
+        def delayed_read(length, timeout=None):
+            if zkclient._connection._socket is _socket:
+                # for any socket read on current socket, simulate a timeout
+                raise handler.timeout_exception("socket time-out during read")
+            return orig_read(length, timeout)
 
         def back(state):
             if state == KazooState.CONNECTED:
@@ -80,11 +79,11 @@ class TestConnectionHandler:
         zkclient.add_listener(back)
         zkclient.create(path, b"1")
         try:
-            handler.select = delayed_select
+            zkclient._connection._read = delayed_read
             with pytest.raises(ConnectionLoss):
                 zkclient.get(path)
         finally:
-            handler.select = _select
+            zkclient._connection._read = orig_read
         # the client reconnects automatically
         ev.wait(5)
         assert ev.is_set()
@@ -94,15 +93,11 @@ class TestConnectionHandler:
         ev = threading.Event()
         path = "/" + uuid.uuid4().hex
         handler = zkclient.handler
-        _select = handler.select
-        _socket = zkclient._connection._socket
+        orig_write = zkclient._connection._write
 
-        def delayed_select(*args, **kwargs):
-            result = _select(*args, **kwargs)
-            if _socket in args[1]:
-                # for any socket write, simulate a timeout
-                return [], [], []
-            return result
+        def delayed_write(msg, timeout=None):
+            # for any socket write, simulate a timeout
+            raise handler.timeout_exception("socket time-out during write")
 
         def back(state):
             if state == KazooState.CONNECTED:
@@ -111,11 +106,11 @@ class TestConnectionHandler:
         zkclient.add_listener(back)
 
         try:
-            handler.select = delayed_select
+            zkclient._connection._write = delayed_write
             with pytest.raises(ConnectionLoss):
                 zkclient.create(path)
         finally:
-            handler.select = _select
+            zkclient._connection._write = orig_write
         # the client reconnects automatically
         ev.wait(5)
         assert ev.is_set()
@@ -125,15 +120,11 @@ class TestConnectionHandler:
         ev = threading.Event()
         path = "/" + uuid.uuid4().hex
         handler = zkclient.handler
-        _select = handler.select
-        _socket = zkclient._connection._socket
+        orig_write = zkclient._connection._write
 
-        def delayed_select(*args, **kwargs):
-            result = _select(*args, **kwargs)
-            if _socket in args[1]:
-                # for any socket write, simulate a timeout
-                return [], [], []
-            return result
+        def delayed_write(msg, timeout=None):
+            # for any socket write, simulate a timeout
+            raise handler.timeout_exception("socket time-out during write")
 
         def back(state):
             if state == KazooState.CONNECTED:
@@ -155,11 +146,11 @@ class TestConnectionHandler:
         with patch.object(Connect, "deserialize") as mock_deserialize:
             mock_deserialize.side_effect = bad_deserialize
             try:
-                handler.select = delayed_select
+                zkclient._connection._write = delayed_write
                 with pytest.raises(ConnectionLoss):
                     zkclient.create(path)
             finally:
-                handler.select = _select
+                zkclient._connection._write = orig_write
             # the client reconnects automatically but the first attempt will
             # hit a deserialize failure. wait for that.
             deserialize_ev.wait(5)

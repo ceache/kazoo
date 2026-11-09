@@ -7,7 +7,7 @@ import pytest
 from kazoo.exceptions import ZookeeperError
 from kazoo.protocol import serialization
 from kazoo.protocol.states import ZnodeStat
-from kazoo.security import ACL, Id
+from kazoo.security import ACL, Id, Permissions
 
 _int_struct = struct.Struct("!i")
 _int_int_struct = struct.Struct("!ii")
@@ -49,14 +49,14 @@ class TestUtils:
         ],
     )
     def test_write_read_string_roundtrip(self, s: str | None) -> None:
-        b = serialization.write_string(s)
-        decoded, offset = serialization.read_string(b, 0)
+        b = serialization._write_string(s)
+        decoded, offset = serialization._read_string(b, 0)
         assert decoded == s
         assert offset == len(b)
 
     def test_write_read_empty_string_roundtrip(self) -> None:
-        b = serialization.write_string("")
-        decoded, offset = serialization.read_string(b, 0)
+        b = serialization._write_string("")
+        decoded, offset = serialization._read_string(b, 0)
         assert offset == len(b)
         assert decoded is None
 
@@ -69,8 +69,8 @@ class TestUtils:
         ],
     )
     def test_write_read_buffer_roundtrip(self, data: bytes | None) -> None:
-        b = serialization.write_buffer(data)
-        decoded, offset = serialization.read_buffer(b, 0)
+        b = serialization._write_buffer(data)
+        decoded, offset = serialization._read_buffer(b, 0)
         assert decoded == data
         assert offset == len(b)
 
@@ -81,10 +81,11 @@ class TestUtils:
         # build bytes: perms + scheme + id
         b = (
             serialization.int_struct.pack(perms)
-            + serialization.write_string(scheme)
-            + serialization.write_string(idv)
+            + serialization._write_string(scheme)
+            + serialization._write_string(idv)
         )
-        acl_obj, offset = serialization.read_acl(b, 0)
+        acl_obj, offset = serialization._read_acl(b, 0)
+        assert isinstance(acl_obj.perms, Permissions)
         assert acl_obj.perms == perms
         assert acl_obj.id.scheme == scheme
         assert acl_obj.id.id == idv
@@ -97,7 +98,7 @@ class TestClose:
 
     def test_serialize(self) -> None:
         assert serialization.Close.serialize() == b""
-        assert serialization.CloseInstance.serialize() == b""
+        assert serialization.Close().serialize() == b""
 
 
 class TestPing:
@@ -106,7 +107,7 @@ class TestPing:
 
     def test_serialize(self) -> None:
         assert serialization.Ping.serialize() == b""
-        assert serialization.PingInstance.serialize() == b""
+        assert serialization.Ping().serialize() == b""
 
 
 class TestConnect:
@@ -668,3 +669,131 @@ class TestAddWatch:
 
     def test_deserialize(self) -> None:
         assert serialization.AddWatch.deserialize(b"", 0) is None
+
+
+class TestDataclassPacketsAndFrameDecoder:
+    def test_all_packets_are_slotted_dataclasses(self) -> None:
+        from dataclasses import FrozenInstanceError, is_dataclass
+
+        packets = [
+            serialization.Close(),
+            serialization.Ping(),
+            serialization.Connect(0, 0, 10000, 0, b"", False),
+            serialization.Create("/p", b"", _make_acl_list(), 0),
+            serialization.Delete("/p", -1),
+            serialization.Exists("/p", None),
+            serialization.GetData("/p", None),
+            serialization.SetData("/p", b"", -1),
+            serialization.GetACL("/p"),
+            serialization.SetACL("/p", _make_acl_list(), -1),
+            serialization.GetChildren("/p", None),
+            serialization.Sync("/p"),
+            serialization.GetChildren2("/p", None),
+            serialization.CheckVersion("/p", 0),
+            serialization.Create2("/p", b"", _make_acl_list(), 0),
+            serialization.CreateContainer("/p", b"", _make_acl_list(), 4),
+            serialization.CreateTTL("/p", b"", _make_acl_list(), 5, 1000),
+            serialization.Transaction([]),
+            serialization.Reconfig(None, None, "m", -1),
+            serialization.RemoveWatches("/p", 1),
+            serialization.Auth(0, "digest", "u:p"),
+            serialization.SASL(b"tok"),
+            serialization.AddWatch("/p", lambda ev: None, 0),
+            serialization.Watch(1, 3, "/p"),
+            serialization.ReplyHeader(1, 2, 0),
+            serialization.MultiHeader(1, False, -1),
+            serialization.PingResponse(10),
+            serialization.AuthResponse(10),
+            serialization.WatchPacket(10, serialization.Watch(1, 3, "/p")),
+            serialization.SASLResponse(1, 10, 0, b"tok"),
+            serialization.ReplyPacket(
+                serialization.ReplyHeader(1, 2, 0), b"", 0
+            ),
+        ]
+        for pkt in packets:
+            assert is_dataclass(pkt)
+            assert not hasattr(pkt, "__dict__")
+            with pytest.raises((FrozenInstanceError, TypeError)):
+                pkt.path = "/mutated"  # type: ignore[misc, union-attr]
+
+    def test_frame_decoder_encode_and_pop_watch_packet(self) -> None:
+        decoder = serialization.FrameDecoder()
+        encoded_ping = serialization.FrameDecoder.encode_request(
+            serialization.Ping(), xid=serialization.ReservedXID.PING
+        )
+        assert encoded_ping == _int_struct.pack(8) + _int_int_struct.pack(
+            serialization.ReservedXID.PING, 11
+        )
+
+        # Build a XID.WATCH (-1) server frame
+        watch_payload = (
+            _reply_header_struct.pack(serialization.ReservedXID.WATCH, 555, 0)
+            + _int_int_struct.pack(3, 3)
+            + _write_string("/watched")
+        )
+        decoder.feed(_int_struct.pack(len(watch_payload)) + watch_payload)
+        pkt = decoder.pop_packet()
+        assert pkt == serialization.WatchPacket(
+            zxid=555,
+            watch=serialization.Watch(type=3, state=3, path="/watched"),
+        )
+
+    def test_frame_decoder_sliding_window_compaction(self) -> None:
+        decoder = serialization.FrameDecoder()
+        f_ping = _reply_header_struct.pack(
+            serialization.ReservedXID.PING, 10, 0
+        )
+        frame_wire = _int_struct.pack(len(f_ping)) + f_ping
+
+        # Feed and pop repeatedly to advance _r_pos beyond 64KB
+        for _ in range(4000):
+            decoder.feed(frame_wire)
+            p = decoder.pop_packet()
+            assert p == serialization.PingResponse(zxid=10, err=0)
+
+        # Buffer should have compacted and reset rather than growing
+        assert decoder._r_pos == 0
+        assert len(decoder._buffer) == 0
+
+    def test_frame_decoder_large_payload_getdata(self) -> None:
+        decoder = serialization.FrameDecoder()
+        payload_1mb = b"x" * (1024 * 1024)
+        stat_bytes = serialization.stat_struct.pack(
+            1, 2, 1000, 2000, 1, 0, 0, 0, len(payload_1mb), 0, 10
+        )
+        body = (
+            _reply_header_struct.pack(1, 100, 0)
+            + _write_buffer(payload_1mb)
+            + stat_bytes
+        )
+        wire = _int_struct.pack(len(body)) + body
+
+        decoder.feed(wire)
+        pkt = decoder.pop_packet()
+        assert isinstance(pkt, serialization.ReplyPacket)
+        assert pkt.header.xid == 1
+        assert pkt.header.zxid == 100
+
+        # Deserializing GetData from ReplyPacket
+        data, stat = serialization.GetData.deserialize(pkt.buffer, pkt.offset)
+        assert data == payload_1mb
+        assert isinstance(data, bytes)
+        assert stat.version == 1
+
+    def test_frame_decoder_zero_copy_memoryview_safety(self) -> None:
+        decoder = serialization.FrameDecoder()
+        f1 = _reply_header_struct.pack(1, 100, 0)
+        wire1 = _int_struct.pack(len(f1)) + f1
+        f2 = _reply_header_struct.pack(2, 101, 0)
+        wire2 = _int_struct.pack(len(f2)) + f2
+
+        decoder.feed(wire1)
+        p1 = decoder.pop_packet()
+        assert isinstance(p1, serialization.ReplyPacket)
+
+        # Ensure feeding more data while p1 exists does not raise BufferError
+        decoder.feed(wire2)
+        p2 = decoder.pop_packet()
+        assert isinstance(p2, serialization.ReplyPacket)
+        assert p1.header.xid == 1
+        assert p2.header.xid == 2

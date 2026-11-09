@@ -2,56 +2,17 @@
 
 from __future__ import annotations
 
-from base64 import b64encode
+import base64
+from collections.abc import Iterator
+import dataclasses
+import enum
 import hashlib
-from typing import NamedTuple
+from typing import Any
+from typing_extensions import deprecated
 
 
-# Represents a Zookeeper ID and ACL object
-class Id(NamedTuple):
-    scheme: str
-    id: str
-
-
-class ACL(NamedTuple):
-    """An ACL for a Zookeeper Node
-
-    An ACL object is created by using an :class:`Id` object along with
-    a :class:`Permissions` setting. For convenience,
-    :meth:`make_digest_acl` should be used to create an ACL object with
-    the desired scheme, id, and permissions.
-    """
-
-    perms: int
-    id: Id
-
-    @property
-    def acl_list(self) -> list[str]:
-        perms = []
-        if self.perms & Permissions.ALL == Permissions.ALL:
-            perms.append("ALL")
-            return perms
-        if self.perms & Permissions.READ == Permissions.READ:
-            perms.append("READ")
-        if self.perms & Permissions.WRITE == Permissions.WRITE:
-            perms.append("WRITE")
-        if self.perms & Permissions.CREATE == Permissions.CREATE:
-            perms.append("CREATE")
-        if self.perms & Permissions.DELETE == Permissions.DELETE:
-            perms.append("DELETE")
-        if self.perms & Permissions.ADMIN == Permissions.ADMIN:
-            perms.append("ADMIN")
-        return perms
-
-    def __repr__(self) -> str:
-        return "ACL(perms=%r, acl_list=%s, id=%r)" % (
-            self.perms,
-            self.acl_list,
-            self.id,
-        )
-
-
-class Permissions:
+class Permissions(enum.IntFlag):
+    NONE = 0
     READ = 1
     WRITE = 2
     CREATE = 4
@@ -60,9 +21,119 @@ class Permissions:
     ALL = 31
 
 
+_ATOMIC_PERMISSIONS = (
+    (Permissions.READ, "READ"),
+    (Permissions.WRITE, "WRITE"),
+    (Permissions.CREATE, "CREATE"),
+    (Permissions.DELETE, "DELETE"),
+    (Permissions.ADMIN, "ADMIN"),
+)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Id:
+    """Represents a Zookeeper ID and ACL object"""
+
+    scheme: str
+    id: str
+
+    @deprecated(
+        "Tuple unpacking/iteration is deprecated; access attributes directly "
+        "via .scheme and .id instead."
+    )
+    def __iter__(self) -> Iterator[str]:
+        yield self.scheme
+        yield self.id
+
+    @deprecated(
+        "Tuple indexing is deprecated; access attributes directly via "
+        ".scheme and .id instead."
+    )
+    def __getitem__(self, index: int) -> str:
+        if index in (0, -2):
+            return self.scheme
+        if index in (1, -1):
+            return self.id
+        raise IndexError("tuple index out of range")
+
+    @deprecated(
+        "len() on Id is deprecated; access attributes directly via "
+        ".scheme and .id instead."
+    )
+    def __len__(self) -> int:
+        return 2
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ACL:
+    """An ACL for a Zookeeper Node
+
+    An ACL object is created by using an :class:`Id` object along with
+    a :class:`Permissions` setting. For convenience,
+    :meth:`make_digest_acl` should be used to create an ACL object with
+    the desired scheme, id, and permissions.
+    """
+
+    perms: Permissions | int
+    id: Id
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.perms, Permissions):
+            object.__setattr__(self, "perms", Permissions(self.perms))
+
+    @deprecated(
+        "Tuple unpacking/iteration is deprecated; access attributes directly "
+        "via .perms and .id instead."
+    )
+    def __iter__(self) -> Iterator[Any]:
+        yield self.perms
+        yield self.id
+
+    @deprecated(
+        "Tuple indexing is deprecated; access attributes directly via "
+        ".perms and .id instead."
+    )
+    def __getitem__(self, index: int) -> Any:
+        if index in (0, -2):
+            return self.perms
+        if index in (1, -1):
+            return self.id
+        raise IndexError("tuple index out of range")
+
+    @deprecated(
+        "len() on ACL is deprecated; access attributes directly via "
+        ".perms and .id instead."
+    )
+    def __len__(self) -> int:
+        return 2
+
+    @property
+    def _acl_list(self) -> list[str]:
+        if self.perms & Permissions.ALL == Permissions.ALL:
+            return ["ALL"]
+        return [
+            name for perm, name in _ATOMIC_PERMISSIONS if self.perms & perm
+        ]
+
+    @property
+    @deprecated(
+        "acl_list is deprecated; inspect .perms with Permissions flags "
+        "directly instead."
+    )
+    def acl_list(self) -> list[str]:
+        return self._acl_list
+
+    def __repr__(self) -> str:
+        return "ACL(perms=%d, acl_list=%s, id=%r)" % (
+            self.perms,
+            self._acl_list,
+            self.id,
+        )
+
+
 # Shortcuts for common Ids
-ANYONE_ID_UNSAFE = Id("world", "anyone")
-AUTH_IDS = Id("auth", "")
+ANYONE_ID_UNSAFE = Id(scheme="world", id="anyone")
+AUTH_IDS = Id(scheme="auth", id="")
 
 # Shortcuts for common ACLs
 OPEN_ACL_UNSAFE = [ACL(Permissions.ALL, ANYONE_ID_UNSAFE)]
@@ -83,7 +154,7 @@ def make_digest_acl_credential(username: str, password: str) -> str:
 
     """
     credential = username.encode("utf-8") + b":" + password.encode("utf-8")
-    cred_hash = b64encode(hashlib.sha1(credential).digest()).strip()
+    cred_hash = base64.b64encode(hashlib.sha1(credential).digest()).strip()
     return username + ":" + cred_hash.decode("utf-8")
 
 
@@ -124,7 +195,7 @@ def make_acl(
     if all:
         permissions = Permissions.ALL
     else:
-        permissions = 0
+        permissions = Permissions.NONE
         if read:
             permissions |= Permissions.READ
         if write:
