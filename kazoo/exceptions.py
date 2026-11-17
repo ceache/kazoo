@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Callable, Type
+from typing import Callable, ClassVar, Type
 
 
 class KazooException(Exception):
@@ -14,6 +14,8 @@ class KazooException(Exception):
 class ZookeeperError(KazooException):
     """Base Zookeeper exception for errors originating from the
     Zookeeper server"""
+
+    code: ClassVar[int]
 
 
 class CancelledError(KazooException):
@@ -31,6 +33,10 @@ class ZookeeperStoppedError(KazooException):
 
 class ConnectionDropped(KazooException):
     """Internal error for jumping out of loops"""
+
+
+class ReplyTooLargeError(KazooException):
+    """Raised when a server reply exceeds the client's ``max_buffer`` limit."""
 
 
 class LockTimeout(KazooException):
@@ -54,6 +60,19 @@ class SASLException(KazooException):
     """
 
 
+class InvalidStateTransitionError(KazooException):
+    """Raised when an invalid state transition is attempted
+    in the state machine."""
+
+    def __init__(self, state: object, event: object) -> None:
+        self.state = state
+        self.event = event
+        super().__init__(
+            f"Invalid state transition: received {type(event).__name__} "
+            f"in state {type(state).__name__}"
+        )
+
+
 def _invalid_error_code() -> Type[ZookeeperError]:
     raise RuntimeError("Invalid error code")
 
@@ -68,11 +87,7 @@ def _zookeeper_exception(
 ) -> Callable[[Type[ZookeeperError]], Type[ZookeeperError]]:
     def decorator(klass: Type[ZookeeperError]) -> Type[ZookeeperError]:
         EXCEPTIONS[code] = klass
-        # Unfortunately there is currently no good of doing the assignment here
-        # in a way that type checkers would allow. It's a known problem (see
-        # https://discuss.python.org/t/how-to-type-hint-a-class-decorator/63010
-        # )
-        klass.code = code  # type: ignore[attr-defined]
+        klass.code = code
         return klass
 
     return decorator

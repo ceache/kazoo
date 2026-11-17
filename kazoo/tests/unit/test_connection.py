@@ -1,56 +1,137 @@
 from __future__ import annotations
 
 import collections
-from unittest.mock import Mock, patch
+import selectors
+import threading
+import time
+from typing import Any
+from unittest.mock import Mock, call, patch
 
 import pytest
 
+from kazoo.client import KazooClient
 from kazoo.exceptions import (
+    ConfigurationError,
+    ConnectionDropped,
+    KazooException,
+    ReplyTooLargeError,
     SASLException,
     SessionClosedRequireSaslError,
+    ZookeeperError,
 )
 from kazoo.protocol.connection import (
+    CLOSE_RESPONSE,
     ConnectionHandler,
+    RequestManager,
+    RWServerAvailable,
     STOP_CONNECTING,
+    WatcherManager,
+    _exception_to_event,
 )
-from kazoo.protocol.serialization import ReplyHeader
+from kazoo.protocol.sasl import SASLConfig
+from kazoo.protocol.serialization import (
+    Close,
+    Connect,
+    GetData,
+    JUTE_MAX_BUFFER,
+    Ping,
+    ReplyHeader,
+    ResponsePacket,
+    SASL,
+    Watch,
+    int_int_long_struct,
+    int_struct,
+    reply_header_struct,
+    stat_struct,
+    _write_buffer,
+)
 from kazoo.protocol.states import KeeperState
-from kazoo.retry import KazooRetry
+from kazoo.protocol.statemachine import (
+    AuthFailed,
+    AuthFailedEvent,
+    CloseRequested,
+    ConnectAttemptStarted,
+    Connected,
+    Connecting,
+    ConnectResponseReceived,
+    EnqueueCloseRequest,
+    HeartbeatDeadlineReached,
+    Inactive,
+    InvalidStateTransitionError,
+    PollTimeoutExpired,
+    ReadConnectResponsePacket,
+    ResetSessionData,
+    SendConnectPacket,
+    SocketReadable,
+    UpdateSendCapacity,
+    WakeUpSignaled,
+    transition,
+)
+from kazoo.retry import KazooRetry, RetryFailedError
+
+
+def _make_mock_client(**kwargs: Any) -> Mock:
+    client = Mock()
+    handler = Mock()
+    handler.timeout_exception = TimeoutError
+    handler.lock_object = threading.Lock
+    client.handler = handler
+    client.hosts = [("127.0.0.1", 2181)]
+    client._session_timeout = 10000
+    client._session_id = None
+    client._session_passwd = b""
+    client.last_zxid = 0
+    client.read_only = False
+    client.auth_data = set()
+    client.use_ssl = False
+    client.keyfile = None
+    client.certfile = None
+    client.ca = None
+    client.keyfile_password = None
+    client.verify_certs = True
+    client.check_hostname = False
+    client.client_state = KeeperState.CONNECTING
+    sm = Mock()
+    sm.state = Connecting()
+    client._state_machine = sm
+    client._request_manager = RequestManager()
+    client._watcher_manager = WatcherManager()
+    for key, value in kwargs.items():
+        setattr(client, key, value)
+    return client
 
 
 class TestConnectionAuthExceptions:
     def test_connect_attempt_sasl_exception(self) -> None:
-        client = Mock()
-        handler = Mock()
-        handler.timeout_exception = TimeoutError
-        client.handler = handler
-        client._state = KeeperState.CONNECTING
+        client = _make_mock_client()
         retry = KazooRetry()
         connection = ConnectionHandler(client, retry)
 
         with patch.object(
-            connection, "_connect", side_effect=SASLException("library error")
+            client.handler,
+            "create_connection",
+            side_effect=SASLException("library error"),
         ):
             result = connection._connect_attempt(
                 "127.0.0.1", "127.0.0.1", 2181, retry
             )
             assert result is STOP_CONNECTING
-            client._session_callback.assert_called_with(
-                KeeperState.AUTH_FAILED
+            assert client.send_event.call_count == 2
+            assert client.send_event.call_args_list[0][0][0] == (
+                ConnectAttemptStarted(host="127.0.0.1", port=2181)
             )
+            event = client.send_event.call_args_list[1][0][0]
+            assert isinstance(event, AuthFailedEvent)
+            assert isinstance(event.error, SASLException)
 
     def test_connect_attempt_session_closed_require_sasl(self) -> None:
-        client = Mock()
-        handler = Mock()
-        handler.timeout_exception = TimeoutError
-        client.handler = handler
-        client._state = KeeperState.CONNECTING
+        client = _make_mock_client()
         retry = KazooRetry()
         connection = ConnectionHandler(client, retry)
 
         with patch.object(
-            connection,
-            "_connect",
+            client.handler,
+            "create_connection",
             side_effect=SessionClosedRequireSaslError(
                 "session closed require sasl"
             ),
@@ -59,90 +140,156 @@ class TestConnectionAuthExceptions:
                 "127.0.0.1", "127.0.0.1", 2181, retry
             )
             assert result is STOP_CONNECTING
-            client._session_callback.assert_called_with(
-                KeeperState.AUTH_FAILED
+            assert client.send_event.call_count == 2
+            assert client.send_event.call_args_list[0][0][0] == (
+                ConnectAttemptStarted(host="127.0.0.1", port=2181)
             )
+            event = client.send_event.call_args_list[1][0][0]
+            assert isinstance(event, AuthFailedEvent)
+            assert isinstance(event.error, SessionClosedRequireSaslError)
+
+    def test_connection_handler_with_typed_sasl_config(self) -> None:
+        client = _make_mock_client()
+        retry = KazooRetry()
+        cfg = SASLConfig(
+            mechanism="DIGEST-MD5", username="user", password="pwd"
+        )
+        connection = ConnectionHandler(client, retry, sasl_config=cfg)
+        assert connection.sasl_config == cfg
+        assert not hasattr(connection, "sasl_options")
+
+    def test_step_sasl_appends_pending_and_fail_all_skips_none(self) -> None:
+        client = _make_mock_client()
+        connection = ConnectionHandler(client, KazooRetry())
+        exchange = Mock()
+        exchange.is_complete = False
+        exchange.next_token.return_value = b"init-token"
+        connection._sasl_exchange = exchange
+
+        with patch.object(connection, "_submit") as mock_submit:
+            connection._step_sasl(challenge=None)
+
+        assert len(connection._requests.pending) == 1
+        req, async_obj, xid = connection._requests.pending[0]
+        assert isinstance(req, SASL)
+        assert req.challenge == b"init-token"
+        assert async_obj is None
+        assert xid == 1
+        mock_submit.assert_called_once_with(
+            req, connection._connect_timeout, 1
+        )
+        connection._requests.fail_all(KeeperState.CONNECTING)
+        assert len(connection._requests.pending) == 0
 
 
 class TestConnectionXidMismatch:
-    def test_read_response_xid_mismatch_sets_exception_and_raises(
+    def test_decode_packet_xid_mismatch_sets_exception_and_raises(
         self,
     ) -> None:
-        client = Mock()
+        client = _make_mock_client()
         async_obj = Mock()
         request = Mock()
         expected_xid = 1
-        client._pending = collections.deque(
+
+        connection = ConnectionHandler(client, KazooRetry())
+        connection._requests.pending = collections.deque(
             [(request, async_obj, expected_xid)]
         )
-
-        connection = ConnectionHandler(client, KazooRetry())
-        header = ReplyHeader(xid=2, zxid=100, err=0)
+        wire = reply_header_struct.pack(2, 100, 0)
 
         with pytest.raises(RuntimeError) as exc_info:
-            connection._read_response(header, b"", 0)
+            connection._frame_decoder.decode_packet(wire)
 
         assert exc_info.value.args == (
-            "xids do not match, expected %r received %r",
-            1,
-            2,
+            "xids do not match, expected 1 received 2",
         )
-        assert client.last_zxid == 100
         async_obj.set_exception.assert_called_once_with(exc_info.value)
 
-    def test_invoke_xid_mismatch_raises(self) -> None:
-        client = Mock()
+    def test_execute_effect_send_connect_packet(self) -> None:
+        client = _make_mock_client()
         connection = ConnectionHandler(client, KazooRetry())
+        connect_packet = Connect(0, 0, 10000, 0, b"", False)
+        with patch.object(connection, "_submit") as mock_submit:
+            connection.execute_effect(
+                SendConnectPacket(connect=connect_packet, timeout=5.0)
+            )
+            mock_submit.assert_called_once_with(connect_packet, 5.0)
 
-        header = ReplyHeader(xid=99, zxid=50, err=0)
-        with patch.object(connection, "_submit"):
-            with patch.object(
-                connection, "_read_header", return_value=(header, b"", 0)
-            ):
-                with pytest.raises(RuntimeError) as exc_info:
-                    connection._invoke(timeout=1.0, request=Mock(), xid=42)
+    def test_execute_effect_read_connect_response_packet(self) -> None:
+        client = _make_mock_client()
+        connection = ConnectionHandler(client, KazooRetry())
+        body = bytearray()
+        body.extend(int_int_long_struct.pack(0, 30000, 12345))
+        body.extend(_write_buffer(b"password12345678"))
+        body.extend([0])
+        chunks = [int_struct.pack(len(body)), bytes(body)]
+        sock = Mock()
 
-        assert exc_info.value.args == (
-            "xids do not match, expected %r received %r",
-            42,
-            99,
-        )
+        def fake_recv_into(buf: memoryview) -> int:
+            chunk = chunks.pop(0)
+            buf[: len(chunk)] = chunk
+            return len(chunk)
 
-    def test_read_socket_dispatches_to_read_response_on_mismatch(
+        sock.recv_into.side_effect = fake_recv_into
+        connection._socket = sock
+        connection.execute_effect(ReadConnectResponsePacket())
+        assert client.send_event.call_count == 1
+        event = client.send_event.call_args[0][0]
+        assert isinstance(event, ConnectResponseReceived)
+        assert event.connect_result.session_id == 12345
+        assert event.connect_result.time_out == 30000
+        assert event.connect_result.passwd == b"password12345678"
+        assert event.connect_result.read_only is False
+
+    def test_execute_effect_reset_session_data(self) -> None:
+        client = _make_mock_client()
+        retry = Mock()
+        connection = ConnectionHandler(client, KazooRetry())
+        connection._current_retry = retry
+        connection.execute_effect(ResetSessionData())
+        retry.reset.assert_called_once()
+
+    def test_read_socket_dispatches_to_decoder_on_mismatch(
         self,
     ) -> None:
-        client = Mock()
+        client = _make_mock_client()
         async_obj = Mock()
         request = Mock()
-        client._pending = collections.deque([(request, async_obj, 5)])
 
         connection = ConnectionHandler(client, KazooRetry())
-        header = ReplyHeader(xid=6, zxid=200, err=0)
+        connection._requests.pending = collections.deque(
+            [(request, async_obj, 5)]
+        )
+        body = reply_header_struct.pack(6, 200, 0)
+        wire = int_struct.pack(len(body)) + body
+        sock = Mock()
 
-        with patch.object(
-            connection, "_read_header", return_value=(header, b"", 0)
-        ):
-            with pytest.raises(RuntimeError) as exc_info:
-                connection._read_socket(read_timeout=1.0)
+        def fake_recv_into(buf: memoryview) -> int:
+            buf[: len(wire)] = wire
+            return len(wire)
+
+        sock.recv_into.side_effect = fake_recv_into
+        connection._socket = sock
+
+        with pytest.raises(RuntimeError) as exc_info:
+            connection._read_socket(read_timeout=1.0)
 
         assert exc_info.value.args == (
-            "xids do not match, expected %r received %r",
-            5,
-            6,
+            "xids do not match, expected 5 received 6",
         )
         async_obj.set_exception.assert_called_once_with(exc_info.value)
 
 
 class TestPersistentWatchEvents:
     def test_find_persistent_recursive_watchers(self) -> None:
-        client = Mock()
+        client = _make_mock_client()
         w_root = Mock()
         w_a = Mock()
-        client._persistent_recursive_watchers = {
+        connection = ConnectionHandler(client, KazooRetry())
+        connection._watchers.persistent_recursive_watchers = {
             "/": [w_root],
             "/a": [w_a],
         }
-        connection = ConnectionHandler(client, KazooRetry())
 
         assert connection._find_persistent_recursive_watchers("/") == [w_root]
         assert connection._find_persistent_recursive_watchers("/b") == [w_root]
@@ -160,22 +307,18 @@ class TestPersistentWatchEvents:
         ]
 
     def test_child_event_triggers_persistent_watcher(self) -> None:
-        from kazoo.protocol.serialization import int_int_struct, write_string
-
-        client = Mock()
-        client._stopped.is_set.return_value = False
-        client._state = KeeperState.CONNECTED
+        client = _make_mock_client()
+        client.client_state = KeeperState.CONNECTED
         client.unchroot.side_effect = lambda p: p
         w_child = Mock()
         w_pers = Mock()
-        client._child_watchers = {"/a": {w_child}}
-        client._persistent_watchers = {"/a": {w_pers}}
-        client._persistent_recursive_watchers = {}
 
         connection = ConnectionHandler(client, KazooRetry())
-        # Watch(type=4 (CHILD_EVENT), state=3, path="/a")
-        buf = int_int_struct.pack(4, 3) + write_string("/a")
-        connection._read_watch_event(buf, 0)
+        connection._watchers.child_watchers = {"/a": {w_child}}
+        connection._watchers.persistent_watchers = {"/a": {w_pers}}
+        connection._watchers.persistent_recursive_watchers = {}
+
+        connection._read_watch_event(Watch(type=4, state=3, path="/a"))
 
         # Both child watch and persistent watch should be dispatched
         assert client.handler.dispatch_callback.call_count == 2
@@ -186,30 +329,26 @@ class TestPersistentWatchEvents:
         called_funcs = {cb.func for cb in callbacks}
         assert called_funcs == {w_child, w_pers}
         # One-time child watcher should be popped
-        assert "/a" not in client._child_watchers
+        assert "/a" not in connection._watchers.child_watchers
         # Persistent watcher should remain
-        assert client._persistent_watchers["/a"] == {w_pers}
+        assert connection._watchers.persistent_watchers["/a"] == {w_pers}
 
     def test_created_event_triggers_persistent_and_recursive_watchers(
         self,
     ) -> None:
-        from kazoo.protocol.serialization import int_int_struct, write_string
-
-        client = Mock()
-        client._stopped.is_set.return_value = False
-        client._state = KeeperState.CONNECTED
+        client = _make_mock_client()
+        client.client_state = KeeperState.CONNECTED
         client.unchroot.side_effect = lambda p: p
         w_data = Mock()
         w_pers = Mock()
         w_rec = Mock()
-        client._data_watchers = {"/a/b": {w_data}}
-        client._persistent_watchers = {"/a/b": {w_pers}}
-        client._persistent_recursive_watchers = {"/a": [w_rec]}
 
         connection = ConnectionHandler(client, KazooRetry())
-        # Watch(type=1 (CREATED_EVENT), state=3, path="/a/b")
-        buf = int_int_struct.pack(1, 3) + write_string("/a/b")
-        connection._read_watch_event(buf, 0)
+        connection._watchers.data_watchers = {"/a/b": {w_data}}
+        connection._watchers.persistent_watchers = {"/a/b": {w_pers}}
+        connection._watchers.persistent_recursive_watchers = {"/a": [w_rec]}
+
+        connection._read_watch_event(Watch(type=1, state=3, path="/a/b"))
 
         assert client.handler.dispatch_callback.call_count == 3
         callbacks = [
@@ -219,87 +358,83 @@ class TestPersistentWatchEvents:
         called_funcs = {cb.func for cb in callbacks}
         assert called_funcs == {w_data, w_pers, w_rec}
         # One-time data watcher should be popped
-        assert "/a/b" not in client._data_watchers
+        assert "/a/b" not in connection._watchers.data_watchers
         # Persistent and recursive watchers remain
-        assert client._persistent_watchers["/a/b"] == {w_pers}
-        assert client._persistent_recursive_watchers["/a"] == [w_rec]
+        assert connection._watchers.persistent_watchers["/a/b"] == {w_pers}
+        assert connection._watchers.persistent_recursive_watchers["/a"] == [
+            w_rec
+        ]
 
     def test_changed_event_triggers_persistent_and_recursive_watchers(
         self,
     ) -> None:
-        from kazoo.protocol.serialization import int_int_struct, write_string
-
-        client = Mock()
-        client._stopped.is_set.return_value = False
-        client._state = KeeperState.CONNECTED
+        client = _make_mock_client()
+        client.client_state = KeeperState.CONNECTED
         client.unchroot.side_effect = lambda p: p
         w_data = Mock()
         w_pers = Mock()
         w_rec = Mock()
-        client._data_watchers = {"/a/b": {w_data}}
-        client._persistent_watchers = {"/a/b": {w_pers}}
-        client._persistent_recursive_watchers = {"/a": [w_rec]}
 
         connection = ConnectionHandler(client, KazooRetry())
-        # Watch(type=3 (CHANGED_EVENT), state=3, path="/a/b")
-        buf = int_int_struct.pack(3, 3) + write_string("/a/b")
-        connection._read_watch_event(buf, 0)
+        connection._watchers.data_watchers = {"/a/b": {w_data}}
+        connection._watchers.persistent_watchers = {"/a/b": {w_pers}}
+        connection._watchers.persistent_recursive_watchers = {"/a": [w_rec]}
+
+        connection._read_watch_event(Watch(type=3, state=3, path="/a/b"))
 
         assert client.handler.dispatch_callback.call_count == 3
         # One-time data watcher should be popped
-        assert "/a/b" not in client._data_watchers
+        assert "/a/b" not in connection._watchers.data_watchers
         # Persistent and recursive watchers remain
-        assert client._persistent_watchers["/a/b"] == {w_pers}
-        assert client._persistent_recursive_watchers["/a"] == [w_rec]
+        assert connection._watchers.persistent_watchers["/a/b"] == {w_pers}
+        assert connection._watchers.persistent_recursive_watchers["/a"] == [
+            w_rec
+        ]
 
     def test_deleted_event_triggers_all_watchers(self) -> None:
-        from kazoo.protocol.serialization import int_int_struct, write_string
-
-        client = Mock()
-        client._stopped.is_set.return_value = False
-        client._state = KeeperState.CONNECTED
+        client = _make_mock_client()
+        client.client_state = KeeperState.CONNECTED
         client.unchroot.side_effect = lambda p: p
         w_data = Mock()
         w_child = Mock()
         w_pers = Mock()
         w_rec = Mock()
-        client._data_watchers = {"/a": {w_data}}
-        client._child_watchers = {"/a": {w_child}}
-        client._persistent_watchers = {"/a": {w_pers}}
-        client._persistent_recursive_watchers = {"/": [w_rec]}
 
         connection = ConnectionHandler(client, KazooRetry())
-        # Watch(type=2 (DELETED_EVENT), state=3, path="/a")
-        buf = int_int_struct.pack(2, 3) + write_string("/a")
-        connection._read_watch_event(buf, 0)
+        connection._watchers.data_watchers = {"/a": {w_data}}
+        connection._watchers.child_watchers = {"/a": {w_child}}
+        connection._watchers.persistent_watchers = {"/a": {w_pers}}
+        connection._watchers.persistent_recursive_watchers = {"/": [w_rec]}
+
+        connection._read_watch_event(Watch(type=2, state=3, path="/a"))
 
         assert client.handler.dispatch_callback.call_count == 4
         # Data and child watchers should be popped
-        assert "/a" not in client._data_watchers
-        assert "/a" not in client._child_watchers
+        assert "/a" not in connection._watchers.data_watchers
+        assert "/a" not in connection._watchers.child_watchers
         # Persistent and recursive watchers remain
-        assert client._persistent_watchers["/a"] == {w_pers}
-        assert client._persistent_recursive_watchers["/"] == [w_rec]
+        assert connection._watchers.persistent_watchers["/a"] == {w_pers}
+        assert connection._watchers.persistent_recursive_watchers["/"] == [
+            w_rec
+        ]
 
     def test_watch_event_dispatches_zxid(self) -> None:
         """Test that watch events dispatched via ConnectionHandler include the
         zxid.
         """
-        from kazoo.protocol.serialization import int_int_struct, write_string
-
-        client = Mock()
-        client._stopped.is_set.return_value = False
-        client._state = KeeperState.CONNECTED
+        client = _make_mock_client()
+        client.client_state = KeeperState.CONNECTED
         client.unchroot.side_effect = lambda p: p
         watcher = Mock()
-        client._data_watchers = {"/node": {watcher}}
-        client._persistent_watchers = {}
-        client._persistent_recursive_watchers = {}
 
         connection = ConnectionHandler(client, KazooRetry())
-        # Watch(type=1 (CREATED_EVENT), state=3, path="/node")
-        buf = int_int_struct.pack(1, 3) + write_string("/node")
-        connection._read_watch_event(buf, 0, zxid=99999)
+        connection._watchers.data_watchers = {"/node": {watcher}}
+        connection._watchers.persistent_watchers = {}
+        connection._watchers.persistent_recursive_watchers = {}
+
+        connection._read_watch_event(
+            Watch(type=1, state=3, path="/node"), zxid=99999
+        )
 
         assert client.handler.dispatch_callback.call_count == 1
         cb = client.handler.dispatch_callback.call_args[0][0]
@@ -313,21 +448,20 @@ class TestPersistentWatchEvents:
         """Test that ConnectionHandler dispatches zxid to persistent and
         persistent recursive watchers.
         """
-        from kazoo.protocol.serialization import int_int_struct, write_string
-
-        client = Mock()
-        client._stopped.is_set.return_value = False
-        client._state = KeeperState.CONNECTED
+        client = _make_mock_client()
+        client.client_state = KeeperState.CONNECTED
         client.unchroot.side_effect = lambda p: p
         w_pers = Mock()
         w_rec = Mock()
-        client._data_watchers = {}
-        client._persistent_watchers = {"/node": {w_pers}}
-        client._persistent_recursive_watchers = {"/": [w_rec]}
 
         connection = ConnectionHandler(client, KazooRetry())
-        buf = int_int_struct.pack(3, 3) + write_string("/node")
-        connection._read_watch_event(buf, 0, zxid=88888)
+        connection._watchers.data_watchers = {}
+        connection._watchers.persistent_watchers = {"/node": {w_pers}}
+        connection._watchers.persistent_recursive_watchers = {"/": [w_rec]}
+
+        connection._read_watch_event(
+            Watch(type=3, state=3, path="/node"), zxid=88888
+        )
 
         assert client.handler.dispatch_callback.call_count == 2
         callbacks = [
@@ -389,149 +523,1159 @@ class TestConnectionHandlerWatchRegistration:
     """
 
     def test_read_response_add_watch_persistent(self) -> None:
-        from collections import defaultdict, deque
+        from collections import defaultdict
         from kazoo.protocol.serialization import AddWatch
         from kazoo.protocol.states import AddWatchMode
 
-        client = Mock()
-        client._stopped.is_set.return_value = False
-        client._persistent_watchers = defaultdict(set)
-        client._persistent_recursive_watchers = defaultdict(set)
-
+        client = _make_mock_client()
         w = Mock()
         async_obj = Mock()
         request = AddWatch("/a", w, AddWatchMode.PERSISTENT)
-        client._pending = deque([(request, async_obj, 1)])
 
         connection = ConnectionHandler(client, KazooRetry())
-        header = ReplyHeader(xid=1, zxid=10, err=0)
-        connection._read_response(header, b"", 0)
+        connection._watchers.persistent_watchers = defaultdict(set)
+        connection._watchers.persistent_recursive_watchers = defaultdict(set)
 
-        assert client._persistent_watchers["/a"] == {w}
-        assert len(client._persistent_recursive_watchers) == 0
+        header = ReplyHeader(xid=1, zxid=10, err=0)
+        connection._read_response(
+            ResponsePacket(
+                header=header, request=request, async_object=async_obj
+            )
+        )
+
+        assert connection._watchers.persistent_watchers["/a"] == {w}
+        assert len(connection._watchers.persistent_recursive_watchers) == 0
         async_obj.set.assert_called_once_with(None)
 
     def test_read_response_add_watch_persistent_recursive(self) -> None:
-        from collections import defaultdict, deque
+        from collections import defaultdict
         from kazoo.protocol.serialization import AddWatch
         from kazoo.protocol.states import AddWatchMode
 
-        client = Mock()
-        client._stopped.is_set.return_value = False
-        client._persistent_watchers = defaultdict(set)
-        client._persistent_recursive_watchers = defaultdict(set)
-
+        client = _make_mock_client()
         w = Mock()
         async_obj = Mock()
         request = AddWatch("/a", w, AddWatchMode.PERSISTENT_RECURSIVE)
-        client._pending = deque([(request, async_obj, 1)])
 
         connection = ConnectionHandler(client, KazooRetry())
-        header = ReplyHeader(xid=1, zxid=10, err=0)
-        connection._read_response(header, b"", 0)
+        connection._watchers.persistent_watchers = defaultdict(set)
+        connection._watchers.persistent_recursive_watchers = defaultdict(set)
 
-        assert client._persistent_recursive_watchers["/a"] == {w}
-        assert len(client._persistent_watchers) == 0
+        header = ReplyHeader(xid=1, zxid=10, err=0)
+        connection._read_response(
+            ResponsePacket(
+                header=header, request=request, async_object=async_obj
+            )
+        )
+
+        assert connection._watchers.persistent_recursive_watchers["/a"] == {w}
+        assert len(connection._watchers.persistent_watchers) == 0
 
     def test_read_response_remove_watches_children(self) -> None:
-        from collections import deque
         from kazoo.protocol.serialization import RemoveWatches
         from kazoo.protocol.states import WatcherType
 
-        client = Mock()
-        client._stopped.is_set.return_value = False
+        client = _make_mock_client()
         w1, w2 = Mock(), Mock()
-        client._child_watchers = {"/a": {w1}}
-        client._data_watchers = {"/a": {w2}}
-
         async_obj = Mock()
         request = RemoveWatches("/a", WatcherType.CHILDREN)
-        client._pending = deque([(request, async_obj, 1)])
 
         connection = ConnectionHandler(client, KazooRetry())
-        header = ReplyHeader(xid=1, zxid=10, err=0)
-        connection._read_response(header, b"", 0)
+        connection._watchers.child_watchers = {"/a": {w1}}
+        connection._watchers.data_watchers = {"/a": {w2}}
 
-        assert "/a" not in client._child_watchers
-        assert client._data_watchers["/a"] == {w2}
+        header = ReplyHeader(xid=1, zxid=10, err=0)
+        connection._read_response(
+            ResponsePacket(
+                header=header, request=request, async_object=async_obj
+            )
+        )
+
+        assert "/a" not in connection._watchers.child_watchers
+        assert connection._watchers.data_watchers["/a"] == {w2}
 
     def test_read_response_remove_watches_data(self) -> None:
-        from collections import deque
         from kazoo.protocol.serialization import RemoveWatches
         from kazoo.protocol.states import WatcherType
 
-        client = Mock()
-        client._stopped.is_set.return_value = False
+        client = _make_mock_client()
         w1, w2 = Mock(), Mock()
-        client._child_watchers = {"/a": {w1}}
-        client._data_watchers = {"/a": {w2}}
-
         async_obj = Mock()
         request = RemoveWatches("/a", WatcherType.DATA)
-        client._pending = deque([(request, async_obj, 1)])
 
         connection = ConnectionHandler(client, KazooRetry())
-        header = ReplyHeader(xid=1, zxid=10, err=0)
-        connection._read_response(header, b"", 0)
+        connection._watchers.child_watchers = {"/a": {w1}}
+        connection._watchers.data_watchers = {"/a": {w2}}
 
-        assert "/a" not in client._data_watchers
-        assert client._child_watchers["/a"] == {w1}
+        header = ReplyHeader(xid=1, zxid=10, err=0)
+        connection._read_response(
+            ResponsePacket(
+                header=header, request=request, async_object=async_obj
+            )
+        )
+
+        assert "/a" not in connection._watchers.data_watchers
+        assert connection._watchers.child_watchers["/a"] == {w1}
 
     def test_read_response_remove_watches_any(self) -> None:
-        from collections import deque
         from kazoo.protocol.serialization import RemoveWatches
         from kazoo.protocol.states import WatcherType
 
-        client = Mock()
-        client._stopped.is_set.return_value = False
+        client = _make_mock_client()
         w1, w2, w3, w4 = Mock(), Mock(), Mock(), Mock()
-        client._child_watchers = {"/a": {w1}}
-        client._data_watchers = {"/a": {w2}}
-        client._persistent_watchers = {"/a": {w3}}
-        client._persistent_recursive_watchers = {"/a": {w4}}
-
         async_obj = Mock()
         request = RemoveWatches("/a", WatcherType.ANY)
-        client._pending = deque([(request, async_obj, 1)])
 
         connection = ConnectionHandler(client, KazooRetry())
-        header = ReplyHeader(xid=1, zxid=10, err=0)
-        connection._read_response(header, b"", 0)
+        connection._watchers.child_watchers = {"/a": {w1}}
+        connection._watchers.data_watchers = {"/a": {w2}}
+        connection._watchers.persistent_watchers = {"/a": {w3}}
+        connection._watchers.persistent_recursive_watchers = {"/a": {w4}}
 
-        assert "/a" not in client._child_watchers
-        assert "/a" not in client._data_watchers
-        assert "/a" not in client._persistent_watchers
-        assert "/a" not in client._persistent_recursive_watchers
+        header = ReplyHeader(xid=1, zxid=10, err=0)
+        connection._read_response(
+            ResponsePacket(
+                header=header, request=request, async_object=async_obj
+            )
+        )
+
+        assert "/a" not in connection._watchers.child_watchers
+        assert "/a" not in connection._watchers.data_watchers
+        assert "/a" not in connection._watchers.persistent_watchers
+        assert "/a" not in connection._watchers.persistent_recursive_watchers
 
     def test_read_response_add_watch_unexpected_mode(self) -> None:
-        from collections import deque
         from kazoo.protocol.serialization import AddWatch
 
-        client = Mock()
-        client._stopped.is_set.return_value = False
-
+        client = _make_mock_client()
         w = Mock()
         async_obj = Mock()
         request = AddWatch("/a", w, 999)  # invalid mode
-        client._pending = deque([(request, async_obj, 1)])
 
         connection = ConnectionHandler(client, KazooRetry())
         header = ReplyHeader(xid=1, zxid=10, err=0)
         with pytest.raises(ValueError, match="Unexpected AddWatchMode: 999"):
-            connection._read_response(header, b"", 0)
+            connection._read_response(
+                ResponsePacket(
+                    header=header, request=request, async_object=async_obj
+                )
+            )
 
     def test_read_response_remove_watches_unexpected_type(self) -> None:
-        from collections import deque
         from kazoo.protocol.serialization import RemoveWatches
 
-        client = Mock()
-        client._stopped.is_set.return_value = False
-
+        client = _make_mock_client()
         async_obj = Mock()
         request = RemoveWatches("/a", 999)  # invalid type
-        client._pending = deque([(request, async_obj, 1)])
 
         connection = ConnectionHandler(client, KazooRetry())
         header = ReplyHeader(xid=1, zxid=10, err=0)
         with pytest.raises(ValueError, match="Unexpected WatcherType: 999"):
-            connection._read_response(header, b"", 0)
+            connection._read_response(
+                ResponsePacket(
+                    header=header, request=request, async_object=async_obj
+                )
+            )
+
+
+class TestConnectionIOLoopDecomposition:
+    def test_is_terminal_property(self) -> None:
+        client = _make_mock_client()
+        conn = ConnectionHandler(client, KazooRetry())
+
+        # Initially non-terminal
+        assert conn._is_terminal is False
+
+        # When state machine state is Connecting (non-terminal)
+        client._state_machine = Mock()
+        client._state_machine.state = Connecting()
+        assert conn._is_terminal is False
+
+        # When state machine state is Inactive (terminal for connecting)
+        client._state_machine.state = Inactive()
+        assert conn._is_terminal is True
+
+        # When state machine state is AuthFailed (terminal)
+        client._state_machine.state = AuthFailed()
+        assert conn._is_terminal is True
+
+        client._state_machine.state = Connected()
+        assert conn._is_terminal is False
+
+    def test_compute_poll_timeout_non_session(self) -> None:
+        client = _make_mock_client()
+        conn = ConnectionHandler(client, KazooRetry())
+        conn._connect_timeout = 5.0
+        timeout, deadline = conn._compute_poll_timeout()
+        assert timeout == 5.0
+        assert deadline is None
+
+    def test_compute_poll_timeout_session_active(self) -> None:
+        client = _make_mock_client()
+        client._state_machine = Mock()
+        client._state_machine.state = Connected()
+        conn = ConnectionHandler(client, KazooRetry())
+        conn._read_timeout = 10.0
+        conn._last_send = 100.0
+
+        with patch("time.monotonic", return_value=102.0):
+            timeout, deadline = conn._compute_poll_timeout()
+            assert deadline is not None
+            assert timeout > 0
+
+    def test_update_send_capacity(self) -> None:
+        client = _make_mock_client()
+        client.concurrent_request_limit = 5
+        conn = ConnectionHandler(client, KazooRetry())
+        conn._requests.pending = [1, 2]  # type: ignore[assignment]
+
+        events: list[Any] = []
+        conn._emit_event = events.append  # type: ignore[method-assign]
+        conn._update_send_capacity()
+
+        assert len(events) == 1
+        assert isinstance(events[0], UpdateSendCapacity)
+        assert events[0].can_send is True
+
+    def test_dispatch_ready_events(self) -> None:
+        client = _make_mock_client()
+        conn = ConnectionHandler(client, KazooRetry())
+        events: list[Any] = []
+        conn._emit_event = events.append  # type: ignore[method-assign]
+
+        # 1. Empty ready set -> PollTimeoutExpired
+        conn._dispatch_ready_events(set(), None)
+        assert len(events) == 1
+        assert isinstance(events[0], PollTimeoutExpired)
+
+        # 2. zk_socket in ready -> SocketReadable
+        events.clear()
+        conn._dispatch_ready_events({"zk_socket"}, None)
+        assert len(events) == 1
+        assert isinstance(events[0], SocketReadable)
+
+        # 3. wakeup in ready with wakeup registered -> WakeUpSignaled
+        events.clear()
+        conn._selector = Mock()
+        conn._read_sock = Mock()
+        conn._read_sock.recv.side_effect = BlockingIOError
+        conn._selector.get_key.return_value = Mock(events=1)
+        res = conn._dispatch_ready_events({"wakeup"}, None)
+        assert res is True
+        assert len(events) == 1
+        assert isinstance(events[0], WakeUpSignaled)
+
+        # 4. deadline expired while session active -> HeartbeatDeadlineReached
+        events.clear()
+        client._state_machine = Mock()
+        client._state_machine.state = Connected()
+        with patch("time.monotonic", return_value=105.0):
+            conn._dispatch_ready_events(set(), 100.0)
+            assert any(isinstance(e, PollTimeoutExpired) for e in events)
+            assert any(isinstance(e, HeartbeatDeadlineReached) for e in events)
+
+        # 5. Fast-path: zk_socket when session active bypasses state machine
+        events.clear()
+        read_called = False
+
+        def fake_read_socket(*args: Any, **kwargs: Any) -> None:
+            nonlocal read_called
+            read_called = True
+
+        conn._read_socket = fake_read_socket  # type: ignore[method-assign]
+        conn._dispatch_ready_events({"zk_socket"}, None)
+        assert read_called is True
+        assert len(events) == 0
+
+        # 6. Fast-path: wakeup when session active calls _send_request directly
+        events.clear()
+        send_called = False
+
+        def fake_send_request(*args: Any, **kwargs: Any) -> None:
+            nonlocal send_called
+            send_called = True
+
+        conn._send_request = fake_send_request  # type: ignore[method-assign]
+        res = conn._dispatch_ready_events({"wakeup"}, None)
+        assert res is True
+        assert send_called is True
+        assert len(events) == 0
+
+    def test_run_io_loop_terminates_when_is_terminal(self) -> None:
+        client = _make_mock_client()
+        client._state_machine = Mock()
+        client._state_machine.state = Connecting()
+        conn = ConnectionHandler(client, KazooRetry())
+        conn._socket = Mock()
+
+        steps = 0
+
+        def fake_poll_step() -> None:
+            nonlocal steps
+            steps += 1
+            if steps == 3:
+                client._state_machine.state = Inactive()
+
+        conn._poll_step = fake_poll_step  # type: ignore[method-assign]
+        conn._run_io_loop()
+        assert steps == 3
+
+    def test_run_io_loop_terminates_when_socket_closed(self) -> None:
+        client = _make_mock_client()
+        client._state_machine = Mock()
+        client._state_machine.state = Connected()
+        conn = ConnectionHandler(client, KazooRetry())
+        conn._socket = Mock()
+
+        steps = 0
+
+        def fake_poll_step() -> None:
+            nonlocal steps
+            steps += 1
+            if steps == 2:
+                conn._socket = None
+
+        conn._poll_step = fake_poll_step  # type: ignore[method-assign]
+        conn._run_io_loop()
+        assert steps == 2
+
+    def test_wake_sends_byte_on_write_sock(self) -> None:
+        client = _make_mock_client()
+        conn = ConnectionHandler(client, KazooRetry())
+
+        # When write_sock is None, returns False
+        assert conn.wake() is False
+
+        # When write_sock is present, sends byte and returns True
+        mock_sock = Mock()
+        conn._write_sock = mock_sock
+        assert conn.wake() is True
+        mock_sock.send.assert_called_once_with(b"\0")
+
+        # When write_sock raises OSError, returns False
+        mock_sock.send.side_effect = OSError("broken pipe")
+        assert conn.wake() is False
+
+    def test_write_partial_send_drains_remaining_bytes(
+        self,
+    ) -> None:
+        client = _make_mock_client()
+        conn = ConnectionHandler(client, KazooRetry())
+        mock_sock = Mock()
+        conn._socket = mock_sock
+        conn.handler.select = Mock(return_value=([], [mock_sock], []))  # type: ignore[assignment]
+
+        # Send 10 of 20 bytes initially, then remaining 10
+        mock_sock.send.side_effect = [10, 10]
+        payload = b"0123456789abcdefghij"
+        conn._write(payload)
+
+        assert mock_sock.send.call_count == 2
+        conn.handler.select.assert_called_once()  # type: ignore[attr-defined]
+
+    def test_write_timeout_during_drain(self) -> None:
+        client = _make_mock_client()
+        conn = ConnectionHandler(client, KazooRetry())
+        mock_sock = Mock()
+        conn._socket = mock_sock
+        conn.handler.select = Mock(return_value=([], [], []))  # type: ignore[assignment]
+
+        # Send 10 of 20 bytes initially, then select times out
+        mock_sock.send.return_value = 10
+        payload = b"0123456789abcdefghij"
+        with pytest.raises(conn.handler.timeout_exception):
+            conn._write(payload, timeout=0.1)
+
+    def test_write_raises_connection_dropped_when_socket_is_none(self) -> None:
+        client = _make_mock_client()
+        conn = ConnectionHandler(client, KazooRetry())
+        conn._socket = None
+        with pytest.raises(ConnectionDropped, match="socket closed"):
+            conn._write(b"data", timeout=0.1)
+
+    def test_unconditional_enqueue_and_wake(self) -> None:
+        client = _make_mock_client()
+        client._connection = Mock()
+        client._connection.wake.return_value = True
+        client._state_machine = Mock()
+        client._state_machine.state = Connected()
+        client._request_manager = RequestManager()
+
+        r1, a1 = Mock(), Mock()
+        r2, a2 = Mock(), Mock()
+
+        # First request on empty queue triggers wake
+        KazooClient._call(client, r1, a1)
+        client._connection.wake.assert_called_once()
+
+        # Second request on non-empty queue also triggers wake (F-5)
+        KazooClient._call(client, r2, a2)
+        assert client._connection.wake.call_count == 2
+
+    def test_send_request_batches_multiple_queued_requests(self) -> None:
+        client = _make_mock_client()
+        client.concurrent_request_limit = 10
+        conn = ConnectionHandler(client, KazooRetry())
+        conn._socket = Mock()
+        conn._socket.send.side_effect = lambda v: len(v)
+
+        r1, a1 = Ping(), Mock()
+        r2, a2 = Ping(), Mock()
+        conn._requests.enqueue(r1, a1)
+        conn._requests.enqueue(r2, a2)
+
+        conn._send_request(10.0, 10.0)
+
+        # Both requests should have been dequeued and submitted
+        assert len(conn._requests.queue) == 0
+        assert len(conn._requests.pending) == 2
+
+    def test_poll_step_dispatches_queued_requests_when_session_active(
+        self,
+    ) -> None:
+        client = _make_mock_client()
+        client.concurrent_request_limit = 10
+        client._state_machine = Mock()
+        client._state_machine.state = Connected()
+        conn = ConnectionHandler(client, KazooRetry())
+        conn._socket = Mock()
+        conn._socket.send.side_effect = lambda v: len(v)
+        conn._select = Mock(return_value=set())  # type: ignore[method-assign]
+
+        r1, a1 = Ping(), Mock()
+        conn._requests.enqueue(r1, a1)
+        assert len(conn._requests.queue) == 1
+
+        conn._poll_step()
+
+        # Request should have been sent directly before/during poll step
+        assert len(conn._requests.queue) == 0
+        assert len(conn._requests.pending) == 1
+
+    def test_session_established_wakes_selector_when_requests_queued(
+        self,
+    ) -> None:
+        from kazoo.protocol.statemachine import SessionEstablished
+
+        client = _make_mock_client()
+        conn = ConnectionHandler(client, KazooRetry())
+        conn.wake = Mock()  # type: ignore[method-assign]
+
+        r1, a1 = Ping(), Mock()
+        conn._requests.enqueue(r1, a1)
+
+        conn.execute_effect(SessionEstablished())
+        conn.wake.assert_called_once()
+
+    def test_execute_effect_enqueue_close_request(self) -> None:
+        client = _make_mock_client()
+        conn = ConnectionHandler(client, KazooRetry())
+        conn.wake = Mock()  # type: ignore[method-assign]
+
+        conn.execute_effect(EnqueueCloseRequest())
+        assert len(conn._requests.queue) == 1
+        req, async_obj = conn._requests.peek_queued()
+        assert isinstance(req, Close)
+        assert async_obj is None
+        conn.wake.assert_called_once()
+
+    def test_emit_event_unexpected_event_raises_connection_dropped(
+        self,
+    ) -> None:
+        client = _make_mock_client()
+        client.send_event.side_effect = InvalidStateTransitionError(
+            state=Connecting(), event=Mock()
+        )
+        conn = ConnectionHandler(client, KazooRetry())
+
+        with pytest.raises(ConnectionDropped) as exc_info:
+            conn._emit_event(Mock())
+        assert "unexpected event" in str(exc_info.value)
+
+    def test_send_request_bypasses_limit_when_terminal(self) -> None:
+        client = _make_mock_client()
+        client.concurrent_request_limit = 1
+        conn = ConnectionHandler(client, KazooRetry())
+        conn._socket = Mock()
+        conn._socket.send.side_effect = lambda v: len(v)
+
+        # Enqueue 1 request that fills capacity
+        r1, a1 = Ping(), Mock()
+        conn._requests.enqueue(r1, a1)
+        conn._send_request(10.0, 10.0)
+        assert len(conn._requests.pending) == 1
+        assert not conn._requests.has_send_capacity(1)
+
+        # Enqueue Close request
+        r2, a2 = Close(), None
+        conn._requests.enqueue(r2, a2)
+
+        # When not terminal, _send_request cannot send r2
+        conn._send_request(10.0, 10.0)
+        assert len(conn._requests.queue) == 1
+
+        # When terminal, _send_request bypasses capacity and sends Close
+        client._state_machine.state = Inactive()
+        conn._send_request(10.0, 10.0)
+        assert len(conn._requests.queue) == 0
+        assert len(conn._requests.pending) == 2
+
+    def test_stop_when_non_connected_leaves_queue_empty(self) -> None:
+        from kazoo.exceptions import AuthFailedError
+        from kazoo.protocol.statemachine import (
+            AuthFailedEvent,
+            SessionExpiredEvent,
+            StartRequested,
+        )
+
+        for ev in (
+            AuthFailedEvent(error=AuthFailedError("auth err")),
+            SessionExpiredEvent(session_id=123),
+        ):
+            client = KazooClient(hosts="127.0.0.1:2181")
+            client.send_event(StartRequested())
+            client.send_event(ev)
+            assert not client.state_machine.is_connected
+            client.stop()
+            assert isinstance(client.state_machine, Inactive)
+            assert len(client._request_manager.queue) == 0
+
+    def test_connected_close_requested_enqueues_close_and_wakes(self) -> None:
+        from kazoo.protocol.statemachine import (
+            CloseRequested,
+            Connected,
+            ConnectResponseReceived,
+            Handshaking,
+        )
+
+        client = KazooClient(hosts="127.0.0.1:2181")
+        sock = Mock()
+        sock.send.side_effect = lambda v: len(v)
+        client._connection._socket = sock
+        client._state_machine.state = Handshaking(host="127.0.0.1", port=2181)
+        client.send_event(
+            ConnectResponseReceived(
+                Connect(0, 0, 10000, 42, b"pwd", False), zxid=1
+            )
+        )
+        assert isinstance(client.state_machine, Connected)
+        client._connection.wake = Mock()  # type: ignore[method-assign]
+
+        client.send_event(CloseRequested())
+        assert len(client._request_manager.queue) == 1
+        req, async_obj = client._request_manager.peek_queued()
+        assert isinstance(req, Close)
+        assert async_obj is None
+        client._connection.wake.assert_called_once()
+
+        # Second CloseRequested while closing must be a no-op (I-2 idempotency)
+        client.send_event(CloseRequested())
+        assert len(client._request_manager.queue) == 1
+        client._connection.wake.assert_called_once()
+
+    def test_emit_event_driver_e2e_reconnects(self) -> None:
+        from kazoo.protocol.statemachine import (
+            Connecting,
+            SASLChallengeReceived,
+            StartRequested,
+        )
+
+        client = KazooClient(hosts="127.0.0.1:2181")
+        client.send_event(StartRequested())
+        assert isinstance(client.state_machine, Connecting)
+
+        conn = ConnectionHandler(client, client.retry)
+        with pytest.raises(ConnectionDropped) as exc_info:
+            conn._emit_event(SASLChallengeReceived(challenge=b"token"))
+        assert "unexpected event" in str(exc_info.value)
+        # State machine remains in Connecting (drop is handled cleanly
+        # by transport)
+        assert isinstance(client.state_machine, Connecting)
+
+    def test_update_send_capacity_deduplicates_events(self) -> None:
+        client = _make_mock_client()
+        client.concurrent_request_limit = 1
+        sm = client._state_machine
+        sm.state = Connected(host="127.0.0.1", port=2181)
+        conn = ConnectionHandler(client, KazooRetry())
+        events: list[Any] = []
+
+        def emit(event: Any) -> None:
+            events.append(event)
+            sm.state, _ = transition(sm.state, event)
+
+        conn._emit_event = emit  # type: ignore[method-assign]
+
+        # Connected starts with wakeup interest on and capacity free
+        conn._update_send_capacity()
+        assert events == []
+
+        # Filling capacity emits False once
+        conn._requests.pending.append((Ping(), None, 1))
+        conn._update_send_capacity()
+        conn._update_send_capacity()
+        assert events == [UpdateSendCapacity(can_send=False)]
+
+        # Draining capacity emits True once
+        conn._requests.pending.clear()
+        conn._update_send_capacity()
+        conn._update_send_capacity()
+        assert events == [
+            UpdateSendCapacity(can_send=False),
+            UpdateSendCapacity(can_send=True),
+        ]
+
+        # A requested close keeps wakeup interest on at full capacity
+        sm.state, _ = transition(sm.state, CloseRequested())
+        conn._requests.pending.append((Ping(), None, 2))
+        conn._update_send_capacity()
+        assert len(events) == 2
+        assert sm.state.wakeup_interested is True
+
+    def test_update_io_interest_concurrent_enable(self) -> None:
+        client = KazooClient(hosts="127.0.0.1:2181")
+        conn = client._connection
+        errors: list[BaseException] = []
+
+        def enable(barrier: threading.Barrier) -> None:
+            barrier.wait()
+            try:
+                conn._update_io_interest(selectors.EVENT_READ, "wakeup")
+            except BaseException as exc:
+                errors.append(exc)
+
+        try:
+            with patch.object(client.handler, "spawn", return_value=Mock()):
+                conn.start()
+            # client.stop() and the connection routine can both enable
+            # wakeup interest while it is unregistered.
+            for _ in range(500):
+                conn._update_io_interest(0, "wakeup")
+                barrier = threading.Barrier(2)
+                threads = [
+                    threading.Thread(target=enable, args=(barrier,))
+                    for _ in range(2)
+                ]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+            assert errors == []
+            assert conn._wakeup_registered is True
+        finally:
+            conn.connection_stopped.set()
+            conn._connection_routine = None
+            conn.close()
+
+    def test_exception_to_event_mapping(self) -> None:
+        import logging
+        from kazoo.exceptions import AuthFailedError, SessionExpiredError
+        from kazoo.protocol.statemachine import (
+            ConnectionLostEvent,
+            RWServerFoundEvent,
+            SessionExpiredEvent,
+        )
+
+        logger = logging.getLogger("kazoo.tests.connection")
+
+        # 1. Timeout exception
+        mapped = _exception_to_event(
+            TimeoutError("timed out"), TimeoutError, 99, None, logger
+        )
+        assert mapped == (
+            ConnectionLostEvent(reason="timed out"),
+            False,
+            False,
+        )
+
+        # 2. OSError / ConnectionDropped
+        mapped = _exception_to_event(
+            ConnectionDropped("eof"), TimeoutError, 99, None, logger
+        )
+        assert mapped == (ConnectionLostEvent(reason="eof"), False, False)
+
+        # 3. Auth failure variants
+        for err in (
+            AuthFailedError("bad"),
+            SASLException("sasl"),
+            SessionClosedRequireSaslError("require sasl"),
+        ):
+            mapped = _exception_to_event(err, TimeoutError, 99, None, logger)
+            assert mapped == (AuthFailedEvent(error=err), True, True)
+
+        # 4. Session expired
+        mapped = _exception_to_event(
+            SessionExpiredError("expired"), TimeoutError, 99, None, logger
+        )
+        assert mapped == (SessionExpiredEvent(session_id=99), True, False)
+
+        # 5. RWServerAvailable
+        mapped = _exception_to_event(
+            RWServerAvailable(), TimeoutError, 99, ("10.0.0.2", 2181), logger
+        )
+        assert mapped == (
+            RWServerFoundEvent(server=("10.0.0.2", 2181)),
+            True,
+            False,
+        )
+
+        # 6. Unhandled
+        assert (
+            _exception_to_event(
+                RuntimeError("boom"), TimeoutError, 99, None, logger
+            )
+            is None
+        )
+
+    def test_persistent_selector_lifecycle(self) -> None:
+        import socket
+        from kazoo.protocol.statemachine import CloseSocket
+
+        client = KazooClient(hosts="127.0.0.1:2181")
+        conn = client._connection
+        try:
+            with patch.object(client.handler, "spawn", return_value=Mock()):
+                conn.start()
+
+            sel = conn._selector
+            assert sel is not None
+            # Registered per connection attempt, not by start()
+            assert conn._wakeup_registered is False
+
+            # Register both sockets via _setup_selector
+            s_a, s_b = socket.socketpair()
+            try:
+                fd_a = s_a.fileno()
+                conn._socket = s_a
+                conn._setup_selector()
+                assert fd_a in sel.get_map()
+                assert len(sel.get_map()) == 2
+
+                # CloseSocket unregisters _socket, keeping the selector open
+                conn.execute_effect(CloseSocket(reason="drop"))
+                assert conn._selector is sel
+                assert conn._socket is None
+                assert s_a.fileno() == -1
+                assert fd_a not in sel.get_map()
+                assert len(sel.get_map()) == 1
+                assert conn._wakeup_registered is True
+            finally:
+                s_a.close()
+                s_b.close()
+
+            # close() shuts down the selector cleanly
+            conn.connection_stopped.set()
+            conn._connection_routine = None
+            conn.close()
+            assert conn._selector is None
+        finally:
+            conn.connection_stopped.set()
+            conn._connection_routine = None
+            if not conn.connection_closed.is_set():
+                conn.close()
+
+
+class TestConnectionRecvIntoAndBurstScheduling:
+    @staticmethod
+    def _make_getdata_wire(xid: int, payload: bytes) -> bytes:
+        st = stat_struct.pack(1, 2, 3, 4, 1, 0, 0, 0, len(payload), 0, 5)
+        body = (
+            reply_header_struct.pack(xid, xid * 10, 0)
+            + _write_buffer(payload)
+            + st
+        )
+        return int_struct.pack(len(body)) + body
+
+    def test_coalesced_burst_replies_bypass_select(self) -> None:
+        client = _make_mock_client(concurrent_request_limit=10)
+        client._state_machine.state = Connected(wakeup_interested=True)
+        conn = ConnectionHandler(client, KazooRetry())
+        conn._socket = Mock()
+
+        frames: list[bytes] = []
+        results: list[Mock] = []
+        for xid in range(1, 6):
+            req = GetData(f"/k{xid}", None)
+            async_obj = Mock()
+            results.append(async_obj)
+            conn._requests.pending.append((req, async_obj, xid))
+            frames.append(self._make_getdata_wire(xid, f"v{xid}".encode()))
+
+        burst = b"".join(frames)
+        called = False
+
+        def fake_recv_into(buf: memoryview) -> int:
+            nonlocal called
+            if not called:
+                called = True
+                buf[: len(burst)] = burst
+                return len(burst)
+            raise BlockingIOError
+
+        conn._socket.recv_into.side_effect = fake_recv_into
+
+        with patch.object(
+            conn, "_select", return_value={"zk_socket"}
+        ) as mock_select:
+            for _ in range(5):
+                conn._poll_step()
+            assert mock_select.call_count == 1
+            for i, async_obj in enumerate(results, start=1):
+                async_obj.set.assert_called_once()
+                assert async_obj.set.call_args[0][0][0] == f"v{i}".encode()
+
+            # Once all buffered replies are drained, the next cycle selects
+            mock_select.return_value = set()
+            conn._poll_step()
+            assert mock_select.call_count == 2
+
+    def test_queued_requests_interleaved_between_buffered_replies(
+        self,
+    ) -> None:
+        client = _make_mock_client(concurrent_request_limit=10)
+        client._state_machine.state = Connected(wakeup_interested=True)
+        conn = ConnectionHandler(client, KazooRetry())
+        conn._socket = Mock()
+
+        frames: list[bytes] = []
+        for xid in (1, 2, 3):
+            conn._requests.pending.append(
+                (GetData(f"/n{xid}", None), Mock(), xid)
+            )
+            frames.append(self._make_getdata_wire(xid, f"d{xid}".encode()))
+        burst = b"".join(frames)
+
+        def fake_recv_into(buf: memoryview) -> int:
+            buf[: len(burst)] = burst
+            return len(burst)
+
+        conn._socket.recv_into.side_effect = fake_recv_into
+
+        with (
+            patch.object(conn, "_select", return_value={"zk_socket"}),
+            patch.object(
+                conn,
+                "_send_request",
+                side_effect=lambda *_: conn._requests.queue.popleft(),
+            ) as mock_send,
+        ):
+            # Step 1: reads all 3 frames in one recv_into and processes #1
+            conn._poll_step()
+            assert mock_send.call_count == 0
+            assert conn._frame_decoder.frame_ready is True
+
+            # Queue a new request while frames #2 and #3 remain buffered
+            conn._requests.queue.append((Ping(), Mock()))
+            conn._poll_step()
+            assert mock_send.call_count == 1
+            assert conn._frame_decoder.frame_ready is True
+
+            conn._poll_step()
+            assert mock_send.call_count == 1
+            assert conn._frame_decoder.frame_ready is False
+
+    def test_replies_per_yield_triggers_yield_control_and_resets(self) -> None:
+        client = _make_mock_client(concurrent_request_limit=200)
+        client._state_machine.state = Connected(wakeup_interested=True)
+        conn = ConnectionHandler(client, KazooRetry())
+        conn._socket = Mock()
+
+        count = conn._REPLIES_PER_YIELD + 2
+        frames: list[bytes] = []
+        for xid in range(1, count + 1):
+            conn._requests.pending.append(
+                (GetData(f"/r{xid}", None), Mock(), xid)
+            )
+            frames.append(self._make_getdata_wire(xid, b"ok"))
+        burst = b"".join(frames)
+
+        def fake_recv_into(buf: memoryview) -> int:
+            buf[: len(burst)] = burst
+            return len(burst)
+
+        conn._socket.recv_into.side_effect = fake_recv_into
+
+        with patch.object(conn, "_select", return_value={"zk_socket"}):
+            for _ in range(count):
+                conn._poll_step()
+
+        assert client.handler.yield_control.call_count == 1
+        assert conn._replies_since_select == 1
+
+        # Next empty _poll_step selects and resets _replies_since_select
+        with patch.object(conn, "_select", return_value=set()):
+            conn._poll_step()
+        assert conn._replies_since_select == 0
+
+        # _close_socket also resets _replies_since_select
+        conn._replies_since_select = 17
+        conn._close_socket()
+        assert conn._replies_since_select == 0
+
+    def test_eof_with_partial_frame_resets_decoder(self) -> None:
+        client = _make_mock_client()
+        conn = ConnectionHandler(client, KazooRetry())
+        conn._socket = Mock()
+
+        partial_hdr = int_struct.pack(64)[:2]
+        calls = 0
+
+        def fake_recv_into(buf: memoryview) -> int:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                buf[: len(partial_hdr)] = partial_hdr
+                return len(partial_hdr)
+            return 0
+
+        conn._socket.recv_into.side_effect = fake_recv_into
+
+        with pytest.raises(
+            ConnectionDropped, match="socket connection broken"
+        ):
+            conn._read_packet(timeout=1.0)
+
+        assert conn._frame_decoder._head == 0
+        assert conn._frame_decoder._tail == 0
+        assert conn._frame_decoder._scan == 0
+        assert conn._frame_decoder.frame_ready is False
+
+    def test_missing_yield_control_fails_at_construction(self) -> None:
+        class MinimalHandler:
+            timeout_exception = TimeoutError
+
+            def lock_object(self) -> threading.Lock:
+                return threading.Lock()
+
+            def event_object(self) -> threading.Event:
+                return threading.Event()
+
+        client = _make_mock_client()
+        client.handler = MinimalHandler()
+        with pytest.raises(AttributeError, match="yield_control"):
+            ConnectionHandler(client, KazooRetry())
+
+    def test_read_packet_timeout_applies_to_each_wait(self) -> None:
+        client = _make_mock_client()
+        conn = ConnectionHandler(client, KazooRetry())
+        conn._socket = Mock()
+        conn._requests.pending.append((GetData("/x", None), Mock(), 7))
+
+        wire = self._make_getdata_wire(7, b"x" * 100)
+        pieces = [wire[:10], wire[10:50], wire[50:]]
+        # The socket blocks before each piece: every piece costs one select
+        script: list[bytes | None] = []
+        for piece in pieces:
+            script += [None, piece]
+
+        def fake_recv_into(buf: memoryview) -> int:
+            piece = script.pop(0)
+            if piece is None:
+                raise BlockingIOError()
+            buf[: len(piece)] = piece
+            return len(piece)
+
+        conn._socket.recv_into.side_effect = fake_recv_into
+        client.handler.select.return_value = ([conn._socket], [], [])
+
+        pkt = conn._read_packet(timeout=2.5)
+
+        assert isinstance(pkt, ResponsePacket)
+        assert pkt.header.xid == 7
+        assert pkt.response[0] == b"x" * 100
+        # A slow reply is not cut short by the time already spent on it
+        assert client.handler.select.call_args_list == [
+            call([conn._socket], [], [], 2.5)
+        ] * len(pieces)
+
+    def test_read_packet_raises_timeout_when_socket_stays_silent(
+        self,
+    ) -> None:
+        client = _make_mock_client()
+        conn = ConnectionHandler(client, KazooRetry())
+        conn._socket = Mock()
+
+        wire = self._make_getdata_wire(7, b"x" * 100)
+        script: list[bytes | None] = [wire[:10], None]
+
+        def fake_recv_into(buf: memoryview) -> int:
+            piece = script.pop(0)
+            if piece is None:
+                raise BlockingIOError()
+            buf[: len(piece)] = piece
+            return len(piece)
+
+        conn._socket.recv_into.side_effect = fake_recv_into
+        client.handler.select.return_value = ([], [], [])
+
+        with pytest.raises(
+            client.handler.timeout_exception,
+            match="socket time-out during read",
+        ):
+            conn._read_packet(timeout=2.5)
+
+        client.handler.select.assert_called_once_with(
+            [conn._socket], [], [], 2.5
+        )
+
+    def test_read_response_error_and_max_buffer_plumbing(self) -> None:
+        assert issubclass(ReplyTooLargeError, KazooException)
+        assert not issubclass(ReplyTooLargeError, ZookeeperError)
+
+        retry = KazooRetry(max_tries=3, delay=0)
+        attempts = 0
+
+        def fail_too_large() -> None:
+            nonlocal attempts
+            attempts += 1
+            raise ReplyTooLargeError("too large: max_buffer")
+
+        with pytest.raises(ReplyTooLargeError):
+            retry(fail_too_large)
+        assert attempts == 1
+
+        c_default = KazooClient(hosts="127.0.0.1:2181")
+        assert c_default.max_buffer == JUTE_MAX_BUFFER
+        assert c_default._connection._frame_decoder._max_buffer == (
+            JUTE_MAX_BUFFER
+        )
+
+        c_custom = KazooClient(hosts="127.0.0.1:2181", max_buffer=4096)
+        assert c_custom.max_buffer == 4096
+        assert c_custom._connection._frame_decoder._max_buffer == 4096
+
+        with pytest.raises(ConfigurationError):
+            KazooClient(hosts="127.0.0.1:2181", max_buffer=0)
+        with pytest.raises(ConfigurationError):
+            KazooClient(hosts="127.0.0.1:2181", max_buffer=-5)
+
+        client = _make_mock_client()
+        conn = ConnectionHandler(client, KazooRetry())
+        watcher = Mock()
+        async_obj = Mock()
+        req = GetData("/z", watcher)
+        err = ReplyTooLargeError("exceeds max_buffer")
+        pkt = ResponsePacket(
+            header=ReplyHeader(xid=1, zxid=55, err=0),
+            request=req,
+            async_object=async_obj,
+            error=err,
+        )
+        assert conn._read_response(pkt) is None
+        assert client.last_zxid == 55
+        async_obj.set_exception.assert_called_once_with(err)
+        assert "/z" not in conn._watchers.data_watchers
+
+        close_pkt = ResponsePacket(
+            header=ReplyHeader(xid=2, zxid=56, err=0),
+            request=Close(),
+            async_object=None,
+            error=ValueError("bad close"),
+        )
+        assert conn._read_response(close_pkt) is CLOSE_RESPONSE
+        assert client.last_zxid == 56
+        assert client.send_event.call_count == 1
+
+
+class TestWakeupOutsideSelect:
+    @staticmethod
+    def _assert_wakeup_released(conn: ConnectionHandler) -> None:
+        assert conn._wakeup_registered is False
+        assert conn._read_sock is not None
+        with pytest.raises(BlockingIOError):
+            conn._read_sock.recv(1)
+
+    def test_routine_exit_releases_wakeup(self) -> None:
+        """Nothing is left registered or unread when retries run out."""
+        client = KazooClient(hosts="127.0.0.1:2181")
+        conn = client._connection
+        try:
+            with patch.object(client.handler, "spawn", return_value=Mock()):
+                conn.start()
+            with patch.object(
+                conn, "_connect_loop", side_effect=RetryFailedError("done")
+            ):
+                conn.zk_loop()
+
+            assert isinstance(client.state_machine, Inactive)
+            self._assert_wakeup_released(conn)
+        finally:
+            conn._connection_routine = None
+            conn.close()
+
+    def test_stop_after_routine_exit_releases_wakeup(self) -> None:
+        """stop() cleans up the wake-up it sent to a finished routine."""
+        client = KazooClient(hosts="127.0.0.1:2181")
+        conn = client._connection
+        try:
+            with patch.object(client.handler, "spawn", return_value=Mock()):
+                conn.start()
+            # The routine returned on its own: authentication failed.
+            client._state_machine.state = AuthFailed()
+            conn.connection_stopped.set()
+
+            client.stop()
+
+            assert isinstance(client.state_machine, Inactive)
+            self._assert_wakeup_released(conn)
+        finally:
+            conn.connection_stopped.set()
+            conn._connection_routine = None
+            conn.close()
+
+    def test_gevent_wake_during_backoff_does_not_spin_hub(self) -> None:
+        """A wake byte sent while the routine backs off costs no CPU.
+
+        gevent's selector keeps watching registered sockets between
+        select() calls, so a readable wakeup socket that nobody selects
+        on would make the hub loop spin.
+        """
+        gevent = pytest.importorskip("gevent")
+        import gevent.event
+        import gevent.server
+
+        from kazoo.handlers.gevent import SequentialGeventHandler
+
+        def read_request_then_drop(sock: Any, address: Any) -> None:
+            # Reading first makes the client fail in select(), with the
+            # wakeup socket registered, and not in connect() or send().
+            sock.recv(4096)
+            sock.close()
+
+        server = gevent.server.StreamServer(
+            ("127.0.0.1", 0), read_request_then_drop
+        )
+        server.start()
+        backing_off = gevent.event.Event()
+
+        def backoff_sleep(seconds: float) -> None:
+            backing_off.set()
+            gevent.sleep(seconds)
+
+        class Handler(SequentialGeventHandler):
+            sleep_func = staticmethod(backoff_sleep)
+
+        handler = Handler()
+        client = KazooClient(
+            hosts=f"127.0.0.1:{server.server_port}",
+            handler=handler,
+            connection_retry={
+                "max_tries": -1,
+                "delay": 30,
+                "max_jitter": 0.0,
+                "sleep_func": handler.sleep_func,
+            },
+        )
+        try:
+            client.start_async()
+            assert backing_off.wait(5)
+
+            # What submitting a request during an outage does.
+            assert client._connection.wake() is True
+            cpu_before = time.process_time()
+            gevent.sleep(0.2)
+            assert time.process_time() - cpu_before < 0.05
+        finally:
+            client.stop()
+            client.close()
+            server.stop()
