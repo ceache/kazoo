@@ -4,10 +4,12 @@ on:
   push:
     branches:
       - master
+      - next
       - release/*
   pull_request:
     branches:
       - master
+      - next
       - release/*
 
 jobs:
@@ -58,7 +60,7 @@ jobs:
         # matrix, you MUST update `codecov.after_n_builds` in .codecov.yml to match
         # len(python-version) * len(zk-version) so Codecov waits for all matrix builds
         # before evaluating coverage status checks.
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "pypy-3.11-v7.3.21"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "pypy-3.11-v7.3.21"]
         zk-version: ["3.7.2", "3.8.6", "3.9.5"]
     steps:
       - uses: actions/checkout@v7
