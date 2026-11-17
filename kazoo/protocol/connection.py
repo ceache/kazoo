@@ -3,61 +3,112 @@
 from __future__ import annotations
 
 from binascii import hexlify
-from contextlib import contextmanager
-import copy
+from collections import defaultdict, deque
+from collections.abc import Callable, Iterator
 import logging
 import random
-import select
+import selectors
 import socket
 import ssl
 import time
 from typing import (
-    Callable,
-    ContextManager,
-    Iterator,
+    Any,
     Literal,
     TypeVar,
     TYPE_CHECKING,
     cast,
-    overload,
 )
 from typing_extensions import Buffer
 
 from kazoo.exceptions import (
     AuthFailedError,
     ConnectionDropped,
+    ConnectionLoss,
     EXCEPTIONS,
-    SessionExpiredError,
-    SessionClosedRequireSaslError,
+    InvalidStateTransitionError,
+    KazooException,
     NoNodeError,
+    ReplyTooLargeError,
     SASLException,
+    SessionClosedRequireSaslError,
+    SessionExpiredError,
 )
 from kazoo.loggingsupport import BLATHER
+from kazoo.protocol.sasl import (
+    SASLConfig,
+    SASLExchange,
+)
 from kazoo.protocol.serialization import (
     AddWatch,
     Auth,
+    AuthResponse,
     Close,
     Connect,
     Exists,
+    FrameDecoder,
     GetChildren,
     GetChildren2,
+    JUTE_MAX_BUFFER,
     Ping,
-    PingInstance,
+    PingResponse,
     RemoveWatches,
-    ReplyHeader,
+    ResponsePacket,
     SASL,
+    SASLResponse,
     Transaction,
     Watch,
-    int_struct,
+    WatchPacket,
+    ReservedXID,
 )
 from kazoo.protocol.states import (
     AddWatchMode,
     Callback,
-    CLOSED_STATES,
     KeeperState,
     WatchedEvent,
     EVENT_TYPE_MAP,
     WatcherType,
+)
+from kazoo.protocol.statemachine import (
+    AuthFailed,
+    AuthFailedEvent,
+    AuthPacketCompleted,
+    ClientEvent,
+    ConfigureReadOnlyMode,
+    ConfigureTimeouts,
+    CloseSocket,
+    ConnectAttemptStarted,
+    ConnectionLostEvent,
+    ConnectResponseReceived,
+    DrainWakeupPipe,
+    EnqueueCloseRequest,
+    HEARTBEAT_DEADLINE_REACHED,
+    Inactive,
+    PING_RECEIVED,
+    POLL_TIMEOUT_EXPIRED,
+    ReadConnectResponsePacket,
+    ReadSocketPacket,
+    ResetSessionData,
+    RWServerFoundEvent,
+    SASLChallengeReceived,
+    SASLCompleted,
+    SendAuthPacket,
+    SendConnectPacket,
+    SendHeartbeatPing,
+    SessionClosedEvent,
+    SessionEstablished,
+    SessionExpiredEvent,
+    SideEffect,
+    SOCKET_READABLE,
+    SocketConnected,
+    StartRequested,
+    StartSASLHandshake,
+    StepSASLHandshake,
+    StopConnectionLoop,
+    UPDATE_SEND_CAPACITY_FALSE,
+    UPDATE_SEND_CAPACITY_TRUE,
+    UpdateIOInterest,
+    UpdateSessionData,
+    WAKEUP_SIGNALED,
 )
 from kazoo.retry import (
     ForceRetryError,
@@ -67,17 +118,8 @@ from kazoo.retry import (
 
 if TYPE_CHECKING:
     from kazoo.client import KazooClient, WatchFunc
-    from kazoo.interfaces import Socket, Threadlike
-
-# FIXME This is NOT pretty, but we don't want to force users to have to
-# install puresasl. Can we avoid some of the type: ignore stuff?
-try:
-    import puresasl  # type: ignore[import-untyped,import-not-found]
-    import puresasl.client  # type: ignore[import-untyped,import-not-found]
-
-    PURESASL_AVAILABLE = True
-except ImportError:
-    PURESASL_AVAILABLE = False
+    from kazoo.interfaces import IAsyncResult, Socket, Threadlike
+    from kazoo.protocol.serialization import ServerPacket
 
 
 log = logging.getLogger(__name__)
@@ -95,16 +137,221 @@ DELETED_EVENT = 2
 CHANGED_EVENT = 3
 CHILD_EVENT = 4
 
-WATCH_XID = -1
-PING_XID = -2
-AUTH_XID = -4
-
 CLOSE_RESPONSE = Close.type
+
+# Micro-optimization: We will always use the same ping instance
+_PingInstance = Ping()
 
 
 # removed from Python3+
 def buffer(obj: Buffer, offset: int = 0) -> memoryview:
     return memoryview(obj)[offset:]
+
+
+class RequestManager:
+    """Encapsulates client request queuing, in-flight pending requests, and
+    XID sequence generation.
+    """
+
+    def __init__(self) -> None:
+        self.queue: deque[tuple[Any, IAsyncResult | None]] = deque()
+        self.pending: deque[tuple[Any, IAsyncResult | None, int]] = deque()
+        self.xid: int | None = None
+
+    def reset_xid(self, value: int = 0) -> None:
+        """Reset the XID counter for a new connection attempt."""
+        self.xid = value
+
+    def next_xid(self) -> int:
+        """Advance and return the next positive 31-bit XID."""
+        self.xid = ((self.xid or 0) % 2147483647) + 1
+        return self.xid
+
+    def enqueue(
+        self, request: Any, async_object: IAsyncResult | None = None
+    ) -> None:
+        """Append a request and its completion handle to the send queue."""
+        self.queue.append((request, async_object))
+
+    def remove_queued(
+        self, request: Any, async_object: IAsyncResult | None
+    ) -> None:
+        """Remove a specific request pair from the send queue if present.
+
+        Uses O(n) ``deque.remove``; for rare wake-failure cleanup only.
+        """
+        try:
+            self.queue.remove((request, async_object))
+        except ValueError:
+            pass
+
+    def peek_queued(self) -> tuple[Any, IAsyncResult | None]:
+        """Return the head of the send queue without removing it."""
+        return self.queue[0]
+
+    def dequeue_to_pending(self, xid: int) -> tuple[Any, IAsyncResult | None]:
+        """Pop the oldest queued request and record it as pending with xid."""
+        request, async_object = self.queue.popleft()
+        self.pending.append((request, async_object, xid))
+        return request, async_object
+
+    def pop_pending(self) -> tuple[Any, IAsyncResult | None, int]:
+        """Pop and return the oldest in-flight pending request."""
+        return self.pending.popleft()
+
+    def pop_auth_pending(
+        self, auth_xid: int = ReservedXID.AUTH
+    ) -> IAsyncResult | None:
+        """Find and remove the first pending Auth request matching auth_xid."""
+        pending = self.pending
+        for idx, (_, a_obj, xid) in enumerate(pending):
+            if xid == auth_xid:
+                del pending[idx]
+                return a_obj
+        return None
+
+    def has_send_capacity(self, limit: int | None) -> bool:
+        """Return True if the number of pending requests is below limit."""
+        return limit is None or len(self.pending) < limit
+
+    def fail_all(self, state: KeeperState) -> None:
+        """Fail all pending and queued requests with the state's exception."""
+        exc: KazooException
+        if state == KeeperState.AUTH_FAILED:
+            exc = AuthFailedError()
+        elif state == KeeperState.EXPIRED_SESSION:
+            exc = SessionExpiredError()
+        else:
+            exc = ConnectionLoss()
+
+        pending = self.pending
+        while True:
+            try:
+                _, async_object, _ = pending.popleft()
+                if async_object:
+                    async_object.set_exception(exc)
+            except IndexError:
+                break
+
+        queue = self.queue
+        while True:
+            try:
+                _, async_object = queue.popleft()
+                if async_object:
+                    async_object.set_exception(exc)
+            except IndexError:
+                break
+
+    def reset(self, state: KeeperState | None = None) -> None:
+        """Fail any remaining requests and reinitialize fresh deques."""
+        if state is not None:
+            self.fail_all(state)
+        self.queue = deque()
+        self.pending = deque()
+
+
+class WatcherManager:
+    """Encapsulates client data, child, persistent, and recursive watchers."""
+
+    def __init__(self) -> None:
+        self.child_watchers: defaultdict[str, set[WatchFunc]] = defaultdict(
+            set
+        )
+        self.data_watchers: defaultdict[str, set[WatchFunc]] = defaultdict(set)
+        self.persistent_watchers: defaultdict[str, set[WatchFunc]] = (
+            defaultdict(set)
+        )
+        self.persistent_recursive_watchers: defaultdict[
+            str, set[WatchFunc]
+        ] = defaultdict(set)
+
+    def find_persistent_recursive(self, path: str) -> list[WatchFunc]:
+        """Return persistent recursive watchers matching path or ancestors."""
+        watchers: list[WatchFunc] = []
+        candidates = ["/"]
+        stripped = path.strip("/")
+        if stripped:
+            parts = stripped.split("/")
+            candidates.extend(
+                "/" + "/".join(parts[: i + 1]) for i in range(len(parts))
+            )
+        pr_watchers = self.persistent_recursive_watchers
+        for candidate in candidates:
+            watchers.extend(pr_watchers.get(candidate, []))
+        return watchers
+
+    def collect_for_event(
+        self, watch_type: int, path: str
+    ) -> list[WatchFunc] | None:
+        """Pop one-shot watchers and collect persistent watchers for event."""
+        watchers: list[WatchFunc] = []
+        if watch_type in (CREATED_EVENT, CHANGED_EVENT):
+            watchers.extend(self.data_watchers.pop(path, []))
+            watchers.extend(self.persistent_watchers.get(path, []))
+            watchers.extend(self.find_persistent_recursive(path))
+        elif watch_type == DELETED_EVENT:
+            watchers.extend(self.data_watchers.pop(path, []))
+            watchers.extend(self.child_watchers.pop(path, []))
+            watchers.extend(self.persistent_watchers.get(path, []))
+            watchers.extend(self.find_persistent_recursive(path))
+        elif watch_type == CHILD_EVENT:
+            watchers.extend(self.child_watchers.pop(path, []))
+            watchers.extend(self.persistent_watchers.get(path, []))
+        else:
+            return None
+        return watchers
+
+    def update_for_response(self, request: Any) -> None:
+        """Register or remove watchers after a successful request response."""
+        watcher = getattr(request, "watcher", None)
+        if watcher:
+            if isinstance(request, AddWatch):
+                if request.mode == AddWatchMode.PERSISTENT:
+                    self.persistent_watchers[request.path].add(watcher)
+                elif request.mode == AddWatchMode.PERSISTENT_RECURSIVE:
+                    self.persistent_recursive_watchers[request.path].add(
+                        watcher
+                    )
+                else:
+                    raise ValueError(
+                        f"Unexpected AddWatchMode: {request.mode}"
+                    )
+            elif isinstance(request, (GetChildren, GetChildren2)):
+                self.child_watchers[request.path].add(watcher)
+            else:
+                self.data_watchers[request.path].add(watcher)
+        if isinstance(request, RemoveWatches):
+            if request.watcher_type == WatcherType.CHILDREN:
+                self.child_watchers.pop(request.path, None)
+            elif request.watcher_type == WatcherType.DATA:
+                self.data_watchers.pop(request.path, None)
+            elif request.watcher_type == WatcherType.ANY:
+                self.child_watchers.pop(request.path, None)
+                self.data_watchers.pop(request.path, None)
+                self.persistent_watchers.pop(request.path, None)
+                self.persistent_recursive_watchers.pop(request.path, None)
+            else:
+                raise ValueError(
+                    f"Unexpected WatcherType: {request.watcher_type}"
+                )
+
+    def reset(self) -> list[WatchFunc]:
+        """Clear all watcher tables and return previously registered ones."""
+        watchers: list[WatchFunc] = []
+        for child_w in self.child_watchers.values():
+            watchers.extend(child_w)
+        for data_w in self.data_watchers.values():
+            watchers.extend(data_w)
+        for pers_w in self.persistent_watchers.values():
+            watchers.extend(pers_w)
+        for pr_w in self.persistent_recursive_watchers.values():
+            watchers.extend(pr_w)
+
+        self.child_watchers = defaultdict(set)
+        self.data_watchers = defaultdict(set)
+        self.persistent_watchers = defaultdict(set)
+        self.persistent_recursive_watchers = defaultdict(set)
+        return watchers
 
 
 class RWPinger:
@@ -125,12 +372,10 @@ class RWPinger:
         self,
         hosts: list[tuple[str, int]],
         connection_func: Callable[[tuple[str, int]], Socket],
-        socket_handling: Callable[[], ContextManager[None]],
     ):
         self.hosts = hosts
         self.connection = connection_func
         self.last_attempt: float | None = None
-        self.socket_handling = socket_handling
 
     def __iter__(self) -> Iterator[tuple[str, int] | Literal[False] | None]:
         if not self.last_attempt:
@@ -152,16 +397,15 @@ class RWPinger:
             log.debug("Pinging server for r/w: %s:%s", host, port)
             self.last_attempt = time.monotonic()
             try:
-                with self.socket_handling():
-                    sock = self.connection((host, port))
-                    sock.sendall(b"isro")
-                    result = sock.recv(8192)
-                    sock.close()
-                    if result == b"rw":
-                        return (host, port)
-                    else:
-                        return False
-            except ConnectionDropped:
+                sock = self.connection((host, port))
+                sock.sendall(b"isro")
+                result = sock.recv(8192)
+                sock.close()
+                if result == b"rw":
+                    return (host, port)
+                else:
+                    return False
+            except (OSError, ConnectionDropped):
                 return False
 
             # NOTE: This does actually look like it's unreachable but I don't
@@ -184,19 +428,60 @@ class RWServerAvailable(Exception):
 ReturnValue = TypeVar("ReturnValue")
 
 
+def _exception_to_event(
+    exc: BaseException,
+    timeout_exception: type[BaseException],
+    session_id: int | None,
+    rw_server: tuple[str, int] | None,
+    logger: logging.Logger,
+) -> tuple[ClientEvent, bool, bool] | None:
+    """Map an I/O error to ``(event, reset_retry, stop_connecting)``.
+
+    Returns ``None`` if ``exc`` is not a handled connection exception.
+    """
+    if isinstance(exc, timeout_exception):
+        logger.warning("Connection time-out: %s", exc)
+        return ConnectionLostEvent(reason=str(exc)), False, False
+    if isinstance(exc, (OSError, ConnectionDropped)):
+        logger.warning("Connection dropped: %s", exc)
+        return ConnectionLostEvent(reason=str(exc)), False, False
+    if isinstance(
+        exc,
+        (AuthFailedError, SASLException, SessionClosedRequireSaslError),
+    ):
+        if isinstance(exc, SessionClosedRequireSaslError):
+            logger.warning(
+                "AUTH_FAILED closing (server requires SASL auth): %s", exc
+            )
+        else:
+            logger.warning("AUTH_FAILED closing: %s", exc)
+        return AuthFailedEvent(error=exc), True, True
+    if isinstance(exc, SessionExpiredError):
+        logger.warning("Session has expired")
+        return SessionExpiredEvent(session_id=session_id), True, False
+    if isinstance(exc, RWServerAvailable):
+        logger.warning("Found a RW server, dropping connection")
+        return RWServerFoundEvent(server=rw_server), True, False
+    return None
+
+
 class ConnectionHandler:
     """Zookeeper connection handler"""
+
+    _REPLIES_PER_YIELD = 64
 
     def __init__(
         self,
         client: KazooClient,
         retry_sleeper: KazooRetry,
         logger: logging.Logger | None = None,
-        sasl_options: dict[str, str] | None = None,
+        sasl_config: SASLConfig | None = None,
+        max_buffer: int = JUTE_MAX_BUFFER,
     ):
         self.client = client
         self.handler = client.handler
         self.retry_sleeper = retry_sleeper
+        self.retry_sleeper.interrupt = lambda: self._is_terminal
         self.logger = logger or log
 
         # Our event objects
@@ -204,13 +489,25 @@ class ConnectionHandler:
         self.connection_closed.set()
         self.connection_stopped = client.handler.event_object()
         self.connection_stopped.set()
-        self.ping_outstanding = client.handler.event_object()
 
         self._read_sock: Socket | None = None
         self._write_sock: Socket | None = None
 
         self._socket: Socket | None = None
-        self._xid: int | None = None
+        self._socket_is_ssl: bool = False
+        self._selector: selectors.BaseSelector | None = None
+        # _update_io_interest runs on the connection routine and, for
+        # StopConnectionLoop, on the thread that called client.stop().
+        self._selector_lock = client.handler.lock_object()
+        self._requests: RequestManager = client._request_manager
+        self._watchers: WatcherManager = client._watcher_manager
+        self._frame_decoder = FrameDecoder(
+            max_buffer=max_buffer,
+            pop_pending=self._requests.pop_pending,
+        )
+        self._replies_since_select: int = 0
+        self._yield_control = client.handler.yield_control
+
         self._rw_server: tuple[str, int] | None = None
         self._ro_mode: (
             Iterator[Literal[False] | tuple[str, int] | None]
@@ -219,30 +516,263 @@ class ConnectionHandler:
         ) = False
 
         self._connection_routine: Threadlike | None = None
+        self._last_send: float = 0.0
+        self._read_timeout: float = 10.0
+        self._connect_timeout: float = 10.0
 
-        self.sasl_options = sasl_options
-        self.sasl_cli = None
+        self.sasl_config: SASLConfig | None = sasl_config
+        self._sasl_exchange: SASLExchange | None = None
 
-    # This is instance specific to avoid odd thread bug issues in Python
-    # during shutdown global cleanup
-    @contextmanager
-    def _socket_error_handling(self) -> Iterator[None]:
+        self._current_retry: KazooRetry | None = None
+
+    @property
+    def _is_session_active(self) -> bool:
+        return self.client._state_machine.state.is_connected
+
+    @property
+    def _is_terminal(self) -> bool:
+        return self._check_is_terminal()
+
+    def _check_is_terminal(self) -> bool:
+        # A method, not only the property above, on purpose: code that
+        # re-checks after a blocking call must use this form. mypy narrows
+        # a bool property to False after ``if self._is_terminal: return``
+        # and then reports the later re-check as unreachable, although
+        # another thread can change the state in between.
+        state = self.client._state_machine.state
+        return state.is_terminal or not state.is_connecting_allowed
+
+    @property
+    def _wakeup_registered(self) -> bool:
+        if self._selector is None or self._read_sock is None:
+            return False
         try:
-            yield
-        except (socket.error, select.error) as e:
-            err = getattr(e, "strerror", e)
-            raise ConnectionDropped("socket connection error: %s" % (err,))
+            self._selector.get_key(self._read_sock)
+            return True
+        except (KeyError, ValueError):
+            return False
+
+    def _emit_event(self, event: ClientEvent) -> None:
+        """Send an event to the client state machine."""
+        try:
+            self.client.send_event(event)
+        except InvalidStateTransitionError as exc:
+            self.logger.warning(
+                "Unexpected event %r in state %r; dropping connection",
+                event,
+                self.client.state_machine,
+            )
+            raise ConnectionDropped(
+                f"unexpected event {event!r} in {self.client.state_machine!r}"
+            ) from exc
+
+    def _setup_selector(self) -> None:
+        """Register active sockets on the persistent selector."""
+        self._update_io_interest(selectors.EVENT_READ, "zk_socket")
+        self._update_io_interest(selectors.EVENT_READ, "wakeup")
+
+    def _close_selector(self) -> None:
+        """Close the persistent selector if active."""
+        if self._selector is not None:
+            try:
+                self._selector.close()
+            except Exception:
+                pass
+            self._selector = None
+
+    def _close_socket(self) -> None:
+        """Unregister and close the active transport socket."""
+        self._update_io_interest(0, "zk_socket")
+        if self._socket is not None:
+            try:
+                self._socket.close()
+            except Exception:
+                pass
+            self._socket = None
+        self._socket_is_ssl = False
+        self._replies_since_select = 0
+        self._frame_decoder.reset()
+
+    def _update_io_interest(
+        self, interest_mask: int, target: Literal["zk_socket", "wakeup"]
+    ) -> None:
+        """Set the selector registration for the target socket.
+
+        Safe to call from the connection routine and from a thread running
+        a state machine effect at the same time.
+        """
+        sock = self._read_sock if target == "wakeup" else self._socket
+        with self._selector_lock:
+            sel = self._selector
+            if sock is None or sel is None:
+                return
+            if interest_mask:
+                # Usually a transition from unregistered, so register
+                # first: a modify() miss costs more than a register() hit.
+                try:
+                    sel.register(sock, interest_mask, data=target)
+                except KeyError:
+                    sel.modify(sock, interest_mask, data=target)
+            else:
+                try:
+                    sel.unregister(sock)
+                except (KeyError, ValueError):
+                    pass
+
+    def _select(self, timeout: float) -> set[str]:
+        """Wait for readable events on the persistent selector."""
+        has_ssl_pending = (
+            self._socket_is_ssl
+            and self._socket is not None
+            and cast(ssl.SSLSocket, self._socket).pending() > 0
+        )
+        assert self._selector is not None
+        events = self._selector.select(0.0 if has_ssl_pending else timeout)
+
+        ready: set[str] = {key.data for key, _ in events}
+        if has_ssl_pending:
+            ready.add("zk_socket")
+        return ready
+
+    def _dispose_sasl(self) -> None:
+        """Dispose of active SASL exchange if present."""
+        if self._sasl_exchange is not None:
+            self._sasl_exchange.dispose()
+            self._sasl_exchange = None
+
+    def _start_sasl(self, host: str) -> None:
+        """Initialize the SASL exchange and send the initial token."""
+        self._dispose_sasl()
+        if not self.sasl_config:
+            self._emit_event(SASLCompleted())
+            return
+        self._sasl_exchange = SASLExchange(self.sasl_config, host)
+        self.client.sasl_cli = (  # type: ignore[attr-defined]
+            self._sasl_exchange.client
+        )
+        self._step_sasl(challenge=None)
+
+    def _step_sasl(self, challenge: bytes | None) -> None:
+        """Advance the SASL exchange by one step."""
+        if self._sasl_exchange is None:
+            return
+        if self._sasl_exchange.is_complete:
+            self._dispose_sasl()
+            self._emit_event(SASLCompleted())
+            return
+        token = self._sasl_exchange.next_token(challenge)
+        if token is None:
+            self._dispose_sasl()
+            self._emit_event(SASLCompleted())
+            return
+        req = SASL(token)
+        xid = self._requests.next_xid()
+        self._requests.pending.append((req, None, xid))
+        self._submit(req, self._connect_timeout, xid)
+        self._last_send = time.monotonic()
+
+    def execute_effect(self, effect: SideEffect) -> None:
+        """Execute I/O and selector side effects from the state machine."""
+        match effect:
+            case ReadSocketPacket():
+                self._read_socket(self._read_timeout)
+
+            case UpdateIOInterest(interest_mask=mask, target=target):
+                self._update_io_interest(mask, target)
+
+            case DrainWakeupPipe():
+                self._release_wakeup()
+
+            case SendHeartbeatPing():
+                self._send_ping(self._connect_timeout)
+                self._last_send = time.monotonic()
+
+            case StartSASLHandshake(host=host):
+                self._start_sasl(host)
+
+            case StepSASLHandshake(challenge=challenge):
+                self._step_sasl(challenge)
+
+            case SendAuthPacket(scheme=scheme, credential=credential):
+                self._submit(
+                    Auth(0, scheme, credential),
+                    self._connect_timeout,
+                    ReservedXID.AUTH,
+                )
+                self._last_send = time.monotonic()
+
+            case EnqueueCloseRequest():
+                self._requests.enqueue(Close(), None)
+                self.wake()
+
+            case CloseSocket():
+                self._close_socket()
+
+            case SessionEstablished():
+                if self._current_retry is not None:
+                    self._current_retry.reset()
+                if self._requests.queue:
+                    self.wake()
+
+            case ResetSessionData():
+                self._frame_decoder.reset()
+                if self._current_retry is not None:
+                    self._current_retry.reset()
+
+            case StopConnectionLoop():
+                self._update_io_interest(selectors.EVENT_READ, "wakeup")
+                self.wake()
+
+            case SendConnectPacket(connect=connect, timeout=timeout):
+                self._connect_timeout = timeout
+                self._submit(connect, timeout)
+                self._last_send = time.monotonic()
+
+            case ReadConnectResponsePacket():
+                self._read_socket(self._connect_timeout)
+
+            case UpdateSessionData(
+                session_id=sid,
+                session_passwd=passwd,
+                protocol_version=proto_version,
+                last_zxid=zxid,
+            ):
+                self.client._session_id = sid
+                self.client._session_passwd = passwd
+                self.client._protocol_version = proto_version
+                if zxid is not None and zxid > 0:
+                    self.client.last_zxid = zxid
+
+            case ConfigureTimeouts(
+                read_timeout=r_timeout, connect_timeout=c_timeout
+            ):
+                self._read_timeout = r_timeout
+                self._connect_timeout = c_timeout
+                self._last_send = time.monotonic()
+
+            case ConfigureReadOnlyMode(read_only=ro_enabled):
+                if ro_enabled:
+                    self._ro_mode = iter(self._server_pinger())
+                else:
+                    self._ro_mode = None
 
     def start(self) -> None:
         """Start the connection up"""
         if self.connection_closed.is_set():
             rw_sockets = self.handler.create_socket_pair()
             self._read_sock, self._write_sock = rw_sockets
+            self._read_sock.setblocking(False)
+            self._write_sock.setblocking(False)
+            # The wakeup socket is registered per connection attempt, by
+            # _setup_selector, and not here: see _release_wakeup.
+            self._selector = self.handler.create_selector()
             self.connection_closed.clear()
         if self._connection_routine:
             raise Exception(
                 "Unable to start, connection routine already active."
             )
+        self.connection_stopped.clear()
+        self._emit_event(StartRequested())
         self._connection_routine = self.handler.spawn(self.zk_loop)
 
     def stop(self, timeout: float | None = None) -> bool:
@@ -251,6 +781,9 @@ class ConnectionHandler:
         if self._connection_routine:
             self._connection_routine.join()
             self._connection_routine = None
+        # client.stop() runs StopConnectionLoop on this thread. When the
+        # routine had already returned, nothing consumed that wake-up.
+        self._release_wakeup()
         return self.connection_stopped.is_set()
 
     def close(self) -> None:
@@ -261,6 +794,7 @@ class ConnectionHandler:
         if not self.connection_stopped.is_set():
             raise Exception("Cannot close connection until it is stopped")
         self.connection_closed.set()
+        self._close_selector()
         ws, rs = self._write_sock, self._read_sock
         self._write_sock = self._read_sock = None
         if ws is not None:
@@ -268,131 +802,122 @@ class ConnectionHandler:
         if rs is not None:
             rs.close()
 
+    def wake(self) -> bool:
+        """Wake the connection loop by sending a byte on the wakeup pipe.
+
+        Returns True if the byte was sent successfully, False otherwise.
+        """
+        sock = self._write_sock
+        if sock is None:
+            return False
+        try:
+            sock.send(b"\0")
+            return True
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+
+    def _drain_wakeup(self) -> None:
+        """Drain all bytes from the non-blocking wakeup pipe."""
+        sock = self._read_sock
+        if sock is None:
+            return
+        while True:
+            try:
+                chunk = sock.recv(4096)
+                if not chunk or not isinstance(chunk, (bytes, bytearray)):
+                    break
+            except (BlockingIOError, OSError):
+                break
+
+    def _release_wakeup(self) -> None:
+        """Unregister the wakeup socket and discard pending wake bytes.
+
+        The wakeup socket is registered only while a connection attempt
+        is selecting. _setup_selector registers it for each attempt; this
+        releases it when a wake byte has nothing to interrupt: outside a
+        session, at the end of every attempt, when the connection routine
+        exits and in stop(). The bytes carry no information; the routine
+        reads the state machine and the request queue itself.
+
+        This must not be left to the next select(). A selector may keep
+        watching a registered socket between select() calls. gevent's
+        does, and a wake byte that arrives while the routine sleeps in
+        the retry back-off, or after it has returned, then makes the hub
+        loop spin until the next select() or until close().
+        """
+        self._update_io_interest(0, "wakeup")
+        self._drain_wakeup()
+
     def _server_pinger(self) -> RWPinger:
         """Returns a server pinger iterable, that will ping the next
         server in the list, and apply a back-off between attempts."""
         return RWPinger(
             self.client.hosts,
             self.handler.create_connection,
-            self._socket_error_handling,
         )
 
-    def _read_header(
-        self, timeout: float | None
-    ) -> tuple[ReplyHeader, bytes, int]:
-        b = self._read(4, timeout)
-        length = int_struct.unpack(b)[0]
-        b = self._read(length, timeout)
-        header, offset = ReplyHeader.deserialize(b, 0)
-        return header, b, offset
+    def _read_packet(self, timeout: float | None) -> ServerPacket:
+        """Read and decode the next typed server packet via FrameDecoder."""
+        packet = self._frame_decoder.pop_packet()
+        if packet is not None:
+            return packet
 
-    def _read(self, length: int, timeout: float | None) -> bytes:
-        msgparts = []
-        remaining = length
         # We know that self._socket is not None here because we only call
         # this method when we have set up the connection and the read socket.
         # But mypy doesn't understand that.
-        with self._socket_error_handling():
-            while remaining > 0:
-                # Because of SSL framing, a select may not return when using
-                # an SSL socket because the underlying physical socket may not
-                # have anything to select, but the wrapped object may still
-                # have something to read as it has previously gotten enough
-                # data from the underlying socket.
-                if (
-                    hasattr(self._socket, "pending")
-                    and self._socket.pending() > 0  # type: ignore[union-attr]
-                ):
-                    pass
-                else:
-                    s = self.handler.select(
-                        [cast("Socket", self._socket)], [], [], timeout
-                    )[0]
-                    if not s:  # pragma: nocover
-                        # If the read list is empty, we got a timeout. We don't
-                        # have to check wlist and xlist as we don't set any
-                        raise self.handler.timeout_exception(
-                            "socket time-out during read"
-                        )
-                try:
-                    chunk = self._socket.recv(  # type: ignore[union-attr]
-                        remaining
-                    )
-                except ssl.SSLError as e:
-                    if e.errno in (
-                        ssl.SSL_ERROR_WANT_READ,
-                        ssl.SSL_ERROR_WANT_WRITE,
-                    ):
-                        continue
-                    else:
-                        raise
-                if chunk == b"":
-                    raise ConnectionDropped("socket connection broken")
-                msgparts.append(chunk)
-                remaining -= len(chunk)
-            return b"".join(msgparts)
-
-    @overload
-    def _invoke(
-        self, timeout: float | None, request: Connect
-    ) -> tuple[Connect, int | None]: ...
-
-    @overload
-    def _invoke(
-        self, timeout: float | None, request: Auth, xid: int
-    ) -> int | None: ...
-
-    def _invoke(
-        self,
-        timeout: float | None,
-        request: Auth | Connect,
-        xid: int | None = None,
-    ) -> tuple[Connect, int | None] | int | None:
-        """A special writer used during connection establishment
-        only"""
-        self._submit(request, timeout, xid)
-        zxid = None
-        if xid:
-            header, buffer, offset = self._read_header(timeout)
-            if header.xid != xid:
-                raise RuntimeError(
-                    "xids do not match, expected %r received %r",
-                    xid,
-                    header.xid,
-                )
-            if header.zxid > 0:
-                zxid = header.zxid
-            if header.err:
-                callback_exception = EXCEPTIONS[header.err]()
-                self.logger.debug(
-                    "Received error(xid=%s) %r", xid, callback_exception
-                )
-                raise callback_exception
-            return zxid
-
-        msg = self._read(4, timeout)
-        length = int_struct.unpack(msg)[0]
-        msg = self._read(length, timeout)
-
-        if hasattr(request, "deserialize"):
+        while True:
+            buf = self._frame_decoder.get_buffer()
+            nbytes = 0
+            got_data = False
             try:
-                # This is a bit of an annoying ignore as I've just done a
-                # hasattr...
-                obj, _ = request.deserialize(  # type: ignore[union-attr]
-                    msg, 0
+                nbytes = self._socket.recv_into(  # type: ignore[union-attr]
+                    buf
                 )
-            except Exception:
-                self.logger.exception(
-                    "Exception raised during deserialization of request: %s",
-                    request,
+                got_data = True
+            except BlockingIOError:
+                pass
+            except ssl.SSLError as e:
+                if e.errno not in (
+                    ssl.SSL_ERROR_WANT_READ,
+                    ssl.SSL_ERROR_WANT_WRITE,
+                ):
+                    raise
+
+            if got_data:
+                if nbytes == 0:
+                    self._frame_decoder.reset()
+                    raise ConnectionDropped("socket connection broken")
+                self._frame_decoder.buffer_updated(nbytes)
+                packet = self._frame_decoder.pop_packet()
+                if packet is not None:
+                    return packet
+                continue
+
+            # Because of SSL framing, a select may not return when using
+            # an SSL socket because the underlying physical socket may not
+            # have anything to select, but the wrapped object may still
+            # have something to read as it has previously gotten enough
+            # data from the underlying socket.
+            if (
+                self._socket_is_ssl
+                and cast(ssl.SSLSocket, self._socket).pending() > 0
+            ):
+                continue
+
+            # The timeout applies to each wait for more bytes, not to the
+            # whole packet: a large reply that keeps arriving is not a
+            # dead connection.
+            s = self.handler.select(
+                [cast("Socket", self._socket)], [], [], timeout
+            )[0]
+            if not s:
+                # If the read list is empty, we got a timeout. We don't
+                # have to check wlist and xlist as we don't set any
+                raise self.handler.timeout_exception(
+                    "socket time-out during read"
                 )
-
-                # raise ConnectionDropped so connect loop will retry
-                raise ConnectionDropped("invalid server response")
-            self.logger.log(BLATHER, "Read response %s", obj)
-            return obj, zxid
-
-        return zxid
 
     def _submit(
         self,
@@ -402,141 +927,145 @@ class ConnectionHandler:
     ) -> None:
         """Submit a request object with a timeout value and optional
         xid"""
-        b = bytearray()
-        if xid:
-            b.extend(int_struct.pack(xid))
-        if request.type:
-            b.extend(int_struct.pack(request.type))
-        b += request.serialize()
         self.logger.log(
             (BLATHER if isinstance(request, Ping) else logging.DEBUG),
             "Sending request(xid=%s): %s",
             xid,
             request,
         )
-        self._write(int_struct.pack(len(b)) + b, timeout)
+        self._write(FrameDecoder.encode_request(request, xid), timeout)
 
-    def _write(self, msg: bytes, timeout: float | None) -> None:
-        """Write a raw msg to the socket"""
+    def _write(self, msg: bytes, timeout: float | None = None) -> None:
+        """Write raw bytes to the socket.
+
+        Attempts an optimistic non-blocking send first for the fast-path.
+        If a partial send occurs or socket buffer is full, drains the
+        remainder using handler.select bounded by timeout.
+        """
+        if self._socket is None:
+            raise ConnectionDropped("socket closed")
+
         sent = 0
         msg_length = len(msg)
-        # Note: The casts/type: ignore are because mypy can't work out
-        # self._socket is not None, and I don't want to change any code.
-        with self._socket_error_handling():
-            while sent < msg_length:
-                s = self.handler.select(
-                    [], [cast("Socket", self._socket)], [], timeout
-                )[1]
-                if not s:  # pragma: nocover
-                    # If the write list is empty, we got a timeout. We don't
-                    # have to check rlist and xlist as we don't set any
-                    raise self.handler.timeout_exception(
-                        "socket time-out during write"
-                    )
-                msg_slice = buffer(msg, sent)
-                try:
-                    bytes_sent = self._socket.send(  # type: ignore[union-attr]
-                        msg_slice
-                    )
-                except ssl.SSLError as e:
-                    if e.errno in (
-                        ssl.SSL_ERROR_WANT_READ,
-                        ssl.SSL_ERROR_WANT_WRITE,
-                    ):
-                        continue
-                    else:
-                        raise
-                if not bytes_sent:
-                    raise ConnectionDropped("socket connection broken")
-                sent += bytes_sent
+        view = memoryview(msg)
+
+        # Fast-path: optimistic direct non-blocking send
+        try:
+            bytes_sent = self._socket.send(view)
+            if not bytes_sent:
+                raise ConnectionDropped("socket connection broken")
+            if bytes_sent >= msg_length:
+                return
+            sent = bytes_sent
+        except BlockingIOError:
+            pass
+        except ssl.SSLError as e:
+            if e.errno not in (
+                ssl.SSL_ERROR_WANT_READ,
+                ssl.SSL_ERROR_WANT_WRITE,
+            ):
+                raise
+        except OSError as e:
+            raise ConnectionDropped(f"socket connection error: {e}") from e
+
+        # Slow-path: partial write or buffer full, drain bounded by timeout
+        eff_timeout = self._connect_timeout if timeout is None else timeout
+        deadline = time.monotonic() + eff_timeout
+
+        while sent < msg_length:
+            rem_timeout = max(0.0, deadline - time.monotonic())
+            s = self.handler.select([], [self._socket], [], rem_timeout)[1]
+            if not s:
+                raise self.handler.timeout_exception(
+                    "socket time-out during write"
+                )
+            try:
+                bytes_sent = self._socket.send(view[sent:])
+            except BlockingIOError:
+                continue
+            except ssl.SSLError as e:
+                if e.errno in (
+                    ssl.SSL_ERROR_WANT_READ,
+                    ssl.SSL_ERROR_WANT_WRITE,
+                ):
+                    continue
+                else:
+                    raise
+            except OSError as e:
+                raise ConnectionDropped(f"socket connection error: {e}") from e
+            if not bytes_sent:
+                raise ConnectionDropped("socket connection broken")
+            sent += bytes_sent
 
     def _find_persistent_recursive_watchers(
         self, path: str
     ) -> list[WatchFunc]:
-        watchers: list[WatchFunc] = []
-        candidates = ["/"]
-        stripped = path.strip("/")
-        if stripped:
-            parts = stripped.split("/")
-            candidates.extend(
-                "/" + "/".join(parts[: i + 1]) for i in range(len(parts))
-            )
-        for candidate in candidates:
-            watchers.extend(
-                self.client._persistent_recursive_watchers.get(candidate, [])
-            )
-        return watchers
+        return self._watchers.find_persistent_recursive(path)
 
     def _read_watch_event(
         self,
-        buffer: bytes,
-        offset: int,
+        watch: Watch,
         zxid: int = WatchedEvent.NO_ZXID,
     ) -> None:
         client = self.client
-        watch, offset = Watch.deserialize(buffer, offset)
         path = watch.path
 
         self.logger.debug("Received EVENT: %s", watch)
 
-        watchers: list[WatchFunc] = []
-
-        if watch.type in (CREATED_EVENT, CHANGED_EVENT):
-            watchers.extend(client._data_watchers.pop(path, []))
-            watchers.extend(client._persistent_watchers.get(path, []))
-            watchers.extend(self._find_persistent_recursive_watchers(path))
-        elif watch.type == DELETED_EVENT:
-            watchers.extend(client._data_watchers.pop(path, []))
-            watchers.extend(client._child_watchers.pop(path, []))
-            watchers.extend(client._persistent_watchers.get(path, []))
-            watchers.extend(self._find_persistent_recursive_watchers(path))
-        elif watch.type == CHILD_EVENT:
-            watchers.extend(client._child_watchers.pop(path, []))
-            watchers.extend(client._persistent_watchers.get(path, []))
-        else:
+        watchers = self._watchers.collect_for_event(watch.type, path)
+        if watchers is None:
             self.logger.warn("Received unknown event %r", watch.type)
             return
 
         # Strip the chroot if needed
         path = client.unchroot(path)
         ev = WatchedEvent(
-            EVENT_TYPE_MAP[watch.type], client._state, path, zxid
+            EVENT_TYPE_MAP[watch.type], client.client_state, path, zxid
         )
 
-        # Last check to ignore watches if we've been stopped
-        if client._stopped.is_set():
+        # Last check to ignore watches if we've been stopped or terminated
+        if self._is_terminal:
             return
 
         # Dump the watchers to the watch thread
         for watch1 in watchers:
             client.handler.dispatch_callback(Callback("watch", watch1, (ev,)))
 
-    def _read_response(
-        self,
-        header: ReplyHeader,
-        buffer: bytes,
-        offset: int,
-    ) -> object | None:
+    def _update_watchers_for_response(self, request: Any) -> None:
+        """Register or remove client watchers after a successful response."""
+        self._watchers.update_for_response(request)
+
+    def _read_response(self, packet: ResponsePacket) -> object | None:
         client = self.client
-        request, async_object, xid = client._pending.popleft()
+        header = packet.header
+        request = packet.request
+        async_object = packet.async_object
+        xid = header.xid
         if header.zxid and header.zxid > 0:
             client.last_zxid = header.zxid
-        if header.xid != xid:
-            exc = RuntimeError(
-                "xids do not match, expected %r received %r",
-                xid,
-                header.xid,
-            )
-            async_object.set_exception(exc)
-            raise exc
+
+        if packet.error is not None:
+            if isinstance(packet.error, ReplyTooLargeError):
+                self.logger.debug(
+                    "Received error(xid=%s) %r", xid, packet.error
+                )
+            else:
+                self.logger.error(
+                    "Exception raised during deserialization of request: %s",
+                    request,
+                    exc_info=packet.error,
+                )
+            if async_object is not None:
+                async_object.set_exception(packet.error)
+            if isinstance(request, Close):
+                self.logger.log(BLATHER, "Read close response")
+                self._emit_event(SessionClosedEvent())
+                return CLOSE_RESPONSE
+            return None
 
         # Determine if its an exists request and a no node error
         exists_error = (
-            # NoNodeError does actually have a code. It's added by a decorator,
-            # which could possibly be better done via inheritance but this is
-            # less invasive to the existing code.
-            header.err == NoNodeError.code  # type: ignore[attr-defined]
-            and request.type == Exists.type
+            header.err == NoNodeError.code and request.type == Exists.type
         )
 
         # Set the exception if its not an exists error
@@ -553,16 +1082,7 @@ class ConnectionHandler:
                 # request
                 response = None
             else:
-                try:
-                    response = request.deserialize(buffer, offset)
-                except Exception as exc:
-                    self.logger.exception(
-                        "Exception raised during deserialization "
-                        "of request: %s",
-                        request,
-                    )
-                    async_object.set_exception(exc)
-                    return None
+                response = packet.response
                 self.logger.debug(
                     "Received response(xid=%s): %r", xid, response
                 )
@@ -572,126 +1092,120 @@ class ConnectionHandler:
                     response = Transaction.unchroot(client, response)
 
             # Determine if watchers should be registered or unregistered
-            if not client._stopped.is_set():
-                watcher = getattr(request, "watcher", None)
-                if watcher:
-                    if isinstance(request, AddWatch):
-                        if request.mode == AddWatchMode.PERSISTENT:
-                            client._persistent_watchers[request.path].add(
-                                watcher
-                            )
-                        elif request.mode == AddWatchMode.PERSISTENT_RECURSIVE:
-                            client._persistent_recursive_watchers[
-                                request.path
-                            ].add(watcher)
-                        else:
-                            raise ValueError(
-                                f"Unexpected AddWatchMode: {request.mode}"
-                            )
-                    elif isinstance(request, (GetChildren, GetChildren2)):
-                        client._child_watchers[request.path].add(watcher)
-                    else:
-                        client._data_watchers[request.path].add(watcher)
-                if isinstance(request, RemoveWatches):
-                    if request.watcher_type == WatcherType.CHILDREN:
-                        client._child_watchers.pop(request.path, None)
-                    elif request.watcher_type == WatcherType.DATA:
-                        client._data_watchers.pop(request.path, None)
-                    elif request.watcher_type == WatcherType.ANY:
-                        client._child_watchers.pop(request.path, None)
-                        client._data_watchers.pop(request.path, None)
-                        client._persistent_watchers.pop(request.path, None)
-                        client._persistent_recursive_watchers.pop(
-                            request.path, None
-                        )
-                    else:
-                        raise ValueError(
-                            f"Unexpected WatcherType: {request.watcher_type}"
-                        )
+            if not self._is_terminal:
+                self._update_watchers_for_response(request)
 
             async_object.set(response)
 
         if isinstance(request, Close):
             self.logger.log(BLATHER, "Read close response")
+            self._emit_event(SessionClosedEvent())
             return CLOSE_RESPONSE
         return None
 
-    def _read_socket(self, read_timeout: float) -> object | None:
-        """Called when there's something to read on the socket"""
+    def _process_packet(self, packet: ServerPacket) -> object | None:
+        """Process a decoded ServerPacket from FrameDecoder."""
         client = self.client
-
-        header, buffer, offset = self._read_header(read_timeout)
-        if header.xid == PING_XID:
-            self.logger.log(BLATHER, "Received Ping")
-            self.ping_outstanding.clear()
-        elif header.xid == AUTH_XID:
-            self.logger.log(BLATHER, "Received AUTH")
-
-            request, async_object, xid = client._pending.popleft()
-            if header.err:
-                async_object.set_exception(AuthFailedError())
-                client._session_callback(KeeperState.AUTH_FAILED)
-            else:
-                async_object.set(True)
-        elif header.xid == WATCH_XID:
-            self._read_watch_event(buffer, offset, header.zxid)
-        else:
-            self.logger.log(BLATHER, "Reading for header %r", header)
-
-            return self._read_response(header, buffer, offset)
+        match packet:
+            case Connect():
+                self._emit_event(
+                    ConnectResponseReceived(connect_result=packet)
+                )
+            case PingResponse():
+                self.logger.log(BLATHER, "Received Ping")
+                self._emit_event(PING_RECEIVED)
+            case AuthResponse(zxid=zxid, err=err_code):
+                self.logger.log(BLATHER, "Received AUTH")
+                if zxid and zxid > 0:
+                    client.last_zxid = zxid
+                async_object = self._requests.pop_auth_pending(
+                    ReservedXID.AUTH
+                )
+                if err_code:
+                    err = (
+                        EXCEPTIONS[err_code]()
+                        if err_code in EXCEPTIONS
+                        else AuthFailedError()
+                    )
+                    if async_object is not None:
+                        async_object.set_exception(err)
+                    self._emit_event(AuthFailedEvent(error=err))
+                else:
+                    if async_object is not None:
+                        async_object.set(True)
+                    self._emit_event(AuthPacketCompleted())
+            case WatchPacket(zxid=zxid, watch=watch):
+                self._read_watch_event(watch, zxid)
+            case SASLResponse(
+                xid=xid, zxid=zxid, err=err_code, challenge=challenge
+            ):
+                if zxid > 0:
+                    client.last_zxid = zxid
+                if err_code:
+                    callback_exception = EXCEPTIONS[err_code]()
+                    self.logger.debug(
+                        "Received error(xid=%s) %r",
+                        xid,
+                        callback_exception,
+                    )
+                    raise callback_exception
+                self._emit_event(SASLChallengeReceived(challenge=challenge))
+            case ResponsePacket():
+                self.logger.log(
+                    BLATHER, "Reading for header %r", packet.header
+                )
+                return self._read_response(packet)
         return None
+
+    def _read_socket(
+        self,
+        read_timeout: float | None = None,
+    ) -> object | None:
+        """Called when there's something to read on the socket"""
+        eff_timeout = (
+            self._read_timeout if read_timeout is None else read_timeout
+        )
+        packet = self._read_packet(eff_timeout)
+        return self._process_packet(packet)
 
     def _send_request(
         self,
         read_timeout: float,
         connect_timeout: float,
     ) -> None:
-        """Called when we have something to send out on the socket"""
-        client = self.client
-        try:
-            request, async_object = client._queue[0]
-        except IndexError:
-            # Not actually something on the queue, this can occur if
-            # something happens to cancel the request such that we
-            # don't clear the socket below after sending
+        """Called when we have something to send out on the socket.
+
+        When terminal (e.g. during client.stop()), all queued requests bypass
+        the concurrent request limit window so that shutdown completes promptly
+        without waiting behind a saturated pipeline.
+        """
+        limit = self.client.concurrent_request_limit
+        terminal = self._is_terminal
+        while terminal or self._requests.has_send_capacity(limit):
             try:
-                # Clear possible inconsistence (no request in the queue
-                # but have data in the read socket), which causes cpu to spin.
-                #
-                # We know _read_sock is not None because we only call this
-                # method when we have set up the connection and the read
-                # socket, but mypy doesn't understand that.
-                self._read_sock.recv(1)  # type: ignore[union-attr]
-            except OSError:
-                pass
-            return
+                request, _ = self._requests.peek_queued()
+            except IndexError:
+                return
 
-        # Special case for testing, if this is a _SessionExpire object
-        # then throw a SessionExpiration error as if we were dropped
-        if request is _SESSION_EXPIRED:
-            raise SessionExpiredError("Session expired: Testing")
-        if request is _CONNECTION_DROP:
-            raise ConnectionDropped("Connection dropped: Testing")
+            # Special case for testing, if this is a _SessionExpire object
+            # then throw a SessionExpiration error as if we were dropped
+            if request is _SESSION_EXPIRED:
+                raise SessionExpiredError("Session expired: Testing")
+            if request is _CONNECTION_DROP:
+                raise ConnectionDropped("Connection dropped: Testing")
 
-        # Special case for auth packets
-        if request.type == Auth.type:
-            xid = AUTH_XID
-        else:
-            # We must have initialised the xid counter by now
-            # Might want to consider initialising it to 0 instead of none?
-            self._xid = (self._xid % 2147483647) + 1  # type: ignore[operator]
-            xid = self._xid
+            # Special case for auth packets
+            if request.type == Auth.type:
+                xid: int = ReservedXID.AUTH
+            else:
+                xid = self._requests.next_xid()
 
-        self._submit(request, connect_timeout, xid)
-        client._queue.popleft()
-        # _read_sock should never be None here as we only call this method
-        # when we have set up the connection and the read socket.
-        self._read_sock.recv(1)  # type: ignore[union-attr]
-        client._pending.append((request, async_object, xid))
+            self._requests.dequeue_to_pending(xid)
+            self._submit(request, connect_timeout, xid)
+            self._last_send = time.monotonic()
 
     def _send_ping(self, connect_timeout: float) -> None:
-        self.ping_outstanding.set()
-        self._submit(PingInstance, connect_timeout, PING_XID)
+        self._submit(_PingInstance, connect_timeout, ReservedXID.PING)
 
         # Determine if we need to check for a r/w server
         if self._ro_mode:
@@ -708,7 +1222,7 @@ class ConnectionHandler:
 
         retry = self.retry_sleeper.copy()
         try:
-            while not self.client._stopped.is_set():
+            while not self._is_terminal:
                 # If the connect_loop returns STOP_CONNECTING, stop retrying
                 if retry(self._connect_loop, retry) is STOP_CONNECTING:
                     break
@@ -719,8 +1233,13 @@ class ConnectionHandler:
             )
         finally:
             self.connection_stopped.set()
-            if self.client._state not in CLOSED_STATES:
-                self.client._session_callback(KeeperState.CLOSED)
+            if not isinstance(
+                self.client.state_machine, (Inactive, AuthFailed)
+            ):
+                self._emit_event(SessionClosedEvent())
+            # StopConnectionLoop registered the wakeup socket and wrote
+            # a byte to it; nothing selects after this routine returns.
+            self._release_wakeup()
             self.logger.log(BLATHER, "Connection stopped")
 
     def _expand_client_hosts(self) -> list[tuple[str, str, int]]:
@@ -763,7 +1282,7 @@ class ConnectionHandler:
             raise ForceRetryError("No host resolved. Reconnecting")
 
         for host, hostip, port in host_ports:
-            if self.client._stopped.is_set():
+            if self._is_terminal:
                 status = STOP_CONNECTING
                 break
             status = self._connect_attempt(host, hostip, port, retry)
@@ -775,6 +1294,116 @@ class ConnectionHandler:
         else:
             raise ForceRetryError("Reconnecting")
 
+    def _compute_poll_timeout(self) -> tuple[float, float | None]:
+        """Compute the selector timeout and optional heartbeat deadline."""
+        if not self._is_session_active:
+            return self._connect_timeout, None
+
+        jitter_time = random.randint(1, 40) / 100.0
+        deadline = self._last_send + self._read_timeout / 2.0 - jitter_time
+        timeout = max(deadline - time.monotonic(), jitter_time)
+        return timeout, deadline
+
+    def _update_send_capacity(self) -> None:
+        """Evaluate request queuing interest and notify state machine."""
+        state = self.client._state_machine.state
+        can_send = (
+            state.is_terminal
+            or not state.is_connecting_allowed
+            or self._requests.has_send_capacity(
+                self.client.concurrent_request_limit
+            )
+        )
+        # While connected the machine changes state only when can_send
+        # differs from wakeup_interested, so skip the event otherwise.
+        if can_send == state.wakeup_interested:
+            return
+        self._emit_event(
+            UPDATE_SEND_CAPACITY_TRUE
+            if can_send
+            else UPDATE_SEND_CAPACITY_FALSE
+        )
+
+    def _dispatch_ready_events(
+        self, ready: set[str], deadline: float | None
+    ) -> bool:
+        """Translate ready selector handles into state machine events.
+
+        Returns True if processing should immediately skip to the next
+        iteration.
+        """
+        if not ready:
+            self._emit_event(POLL_TIMEOUT_EXPIRED)
+        else:
+            if "zk_socket" in ready:
+                if self._is_session_active:
+                    self._read_socket()
+                    # Spelled out for mypy; see _check_is_terminal.
+                    if not self.client._state_machine.state.is_connected:
+                        return False
+                else:
+                    self._emit_event(SOCKET_READABLE)
+                    if isinstance(
+                        self.client._state_machine.state,
+                        (Inactive, AuthFailed),
+                    ):
+                        return False
+
+            # Check if any requests need sending before proceeding
+            # to process more responses. Otherwise the responses
+            # may choke out the requests. See PR#633.
+            if "wakeup" in ready and self._wakeup_registered:
+                self._drain_wakeup()
+                if self._is_session_active:
+                    self._send_request(
+                        self._read_timeout, self._connect_timeout
+                    )
+                    return True
+                else:
+                    self._emit_event(WAKEUP_SIGNALED)
+                    return True
+
+        if (
+            self._is_session_active
+            and deadline is not None
+            and time.monotonic() >= deadline
+        ):
+            self._emit_event(HEARTBEAT_DEADLINE_REACHED)
+
+        return False
+
+    def _poll_step(self) -> None:
+        """Execute a single cycle of the selector I/O loop."""
+        timeout, deadline = self._compute_poll_timeout()
+
+        if self._is_session_active:
+            self._update_send_capacity()
+            if self._requests.queue and self._requests.has_send_capacity(
+                self.client.concurrent_request_limit
+            ):
+                self._send_request(self._read_timeout, self._connect_timeout)
+
+        if self._frame_decoder.frame_ready:
+            self._replies_since_select += 1
+            if self._replies_since_select >= self._REPLIES_PER_YIELD:
+                self._replies_since_select = 0
+                self._yield_control()
+            ready: set[str] = {"zk_socket"}
+        else:
+            self._replies_since_select = 0
+            ready = self._select(timeout)
+        self._dispatch_ready_events(ready, deadline)
+
+    def _run_io_loop(self) -> None:
+        """Drive selector loop until terminal state or socket closed."""
+        while (
+            not isinstance(
+                self.client._state_machine.state, (Inactive, AuthFailed)
+            )
+            and self._socket is not None
+        ):
+            self._poll_step()
+
     def _connect_attempt(
         self,
         host: str,
@@ -785,7 +1414,12 @@ class ConnectionHandler:
         client = self.client
         KazooTimeoutError = self.handler.timeout_exception
 
+        if self._is_terminal:
+            return STOP_CONNECTING
+
         self._socket = None
+        self._frame_decoder.reset()
+        self._current_retry = retry
 
         # Were we given a r/w server? If so, use that instead
         if self._rw_server:
@@ -795,302 +1429,105 @@ class ConnectionHandler:
             host, port = self._rw_server
             self._rw_server = None
 
-        if client._state != KeeperState.CONNECTING:
-            client._session_callback(KeeperState.CONNECTING)
+        self._emit_event(ConnectAttemptStarted(host=host, port=port))
 
         try:
-            self._xid = 0
-            read_timeout, connect_timeout = self._connect(
-                host, hostip, port, timeout=retry.cur_delay
+            self._requests.reset_xid(0)
+            self.logger.info(
+                "Connecting to %s(%s):%s, use_ssl: %r",
+                host,
+                hostip,
+                port,
+                client.use_ssl,
             )
-            # I think the above implies self._socket can't be none, and
-            # self._read_sock is set up in start but mypy can't tell that.
-            # Hence the casting.
-            read_timeout = read_timeout / 1000.0
-            connect_timeout = connect_timeout / 1000.0
-            retry.reset()
-            self.ping_outstanding.clear()
-            last_send = time.monotonic()
-            with self._socket_error_handling():
-                while True:
-                    # Watch for something to read or send
-                    jitter_time = random.randint(1, 40) / 100.0
-                    deadline = last_send + read_timeout / 2.0 - jitter_time
-                    # Ensure our timeout is positive
-                    timeout = max([deadline - time.monotonic(), jitter_time])
-                    read_list = [cast("Socket", self._socket)]
-                    if (
-                        self.client.concurrent_request_limit is None
-                        or len(self.client._pending)
-                        < self.client.concurrent_request_limit
-                    ):
-                        read_list.append(cast("Socket", self._read_sock))
-
-                    s = self.handler.select(
-                        read_list,
-                        [],
-                        [],
-                        timeout,
-                    )[0]
-
-                    if not s:
-                        if self.ping_outstanding.is_set():
-                            self.ping_outstanding.clear()
-                            raise ConnectionDropped(
-                                "outstanding heartbeat ping not received"
-                            )
-                    else:
-                        if cast("Socket", self._socket) in s:
-                            response = self._read_socket(read_timeout)
-                            if response == CLOSE_RESPONSE:
-                                break
-                        # Check if any requests need sending before proceeding
-                        # to process more responses.  Otherwise the responses
-                        # may choke out the requests.  See PR#633.
-                        if cast("Socket", self._read_sock) in s:
-                            self._send_request(read_timeout, connect_timeout)
-                            # Requests act as implicit pings.
-                            last_send = time.monotonic()
-                            continue
-
-                    if time.monotonic() >= deadline:
-                        self._send_ping(connect_timeout)
-                        last_send = time.monotonic()
-            self.logger.info("Closing connection to %s:%s", host, port)
-            client._session_callback(KeeperState.CLOSED)
-            return STOP_CONNECTING
-        except (ConnectionDropped, KazooTimeoutError) as e:
-            if isinstance(e, ConnectionDropped):
-                self.logger.warning("Connection dropped: %s", e)
-            else:
-                self.logger.warning("Connection time-out: %s", e)
-            if client._state != KeeperState.CONNECTING:
-                self.logger.warning("Transition to CONNECTING")
-                client._session_callback(KeeperState.CONNECTING)
-        except (AuthFailedError, SASLException) as err:
-            retry.reset()
-            self.logger.warning("AUTH_FAILED closing: %s", err)
-            self.client._auth_error = err
-            client._session_callback(KeeperState.AUTH_FAILED)
-            return STOP_CONNECTING
-        except SessionClosedRequireSaslError as err:
-            retry.reset()
-            self.logger.warning(
-                "AUTH_FAILED closing (server requires SASL auth): %s", err
+            passwd_hex = (
+                hexlify(client._session_passwd)
+                if client._session_passwd
+                else b""
             )
-            self.client._auth_error = err
-            client._session_callback(KeeperState.AUTH_FAILED)
-            return STOP_CONNECTING
-        except SessionExpiredError:
-            retry.reset()
-            self.logger.warning("Session has expired")
-            client._session_callback(KeeperState.EXPIRED_SESSION)
-        except RWServerAvailable:
-            retry.reset()
-            self.logger.warning("Found a RW server, dropping connection")
-            client._session_callback(KeeperState.CONNECTING)
+            self.logger.log(
+                BLATHER,
+                "    Using session_id: %r session_passwd: %s",
+                client._session_id,
+                passwd_hex,
+            )
+
+            session_timeout = client._session_timeout
+            num_hosts = max(len(client.hosts), 1)
+
+            self._socket = self.handler.create_connection(
+                address=(hostip, port),
+                hostname=host,
+                timeout=retry.cur_delay,
+                use_ssl=client.use_ssl,
+                keyfile=client.keyfile,
+                certfile=client.certfile,
+                ca=client.ca,
+                keyfile_password=client.keyfile_password,
+                verify_certs=client.verify_certs,
+                check_hostname=client.check_hostname,
+            )
+            self._socket.setblocking(False)
+            self._socket_is_ssl = hasattr(self._socket, "pending")
+            if self._check_is_terminal():
+                return STOP_CONNECTING
+            self._setup_selector()
+
+            has_sasl = self.sasl_config is not None
+            auth_tuple = tuple(client.auth_data)
+
+            self._emit_event(
+                SocketConnected(
+                    host=host,
+                    port=port,
+                    num_hosts=num_hosts,
+                    session_id=client._session_id or 0,
+                    session_passwd=client._session_passwd,
+                    session_timeout=session_timeout,
+                    last_zxid=client.last_zxid,
+                    read_only=bool(client.read_only),
+                    has_sasl=has_sasl,
+                    auth_data=auth_tuple,
+                )
+            )
+
+            self._run_io_loop()
+
+            if self._check_is_terminal():
+                self.logger.info("Closing connection to %s:%s", host, port)
+                return STOP_CONNECTING
+        except (
+            OSError,
+            ConnectionDropped,
+            KazooTimeoutError,
+            AuthFailedError,
+            SASLException,
+            SessionClosedRequireSaslError,
+            SessionExpiredError,
+            RWServerAvailable,
+        ) as exc:
+            mapped = _exception_to_event(
+                exc,
+                KazooTimeoutError,
+                client._session_id,
+                self._rw_server,
+                self.logger,
+            )
+            assert mapped is not None
+            event, reset_retry, stop_connecting = mapped
+            if reset_retry:
+                retry.reset()
+            self._emit_event(event)
+            if stop_connecting or self._is_terminal:
+                return STOP_CONNECTING
         except Exception:
             self.logger.exception("Unhandled exception in connection loop")
             raise
         finally:
-            if self._socket is not None:
-                # I think this is a bug in mypy, as the socket does get set up
-                # in self._connect, but it doesn't seem to be able to track
-                # that.
-                self._socket.close()  # type: ignore[unreachable]
+            self._current_retry = None
+            self._dispose_sasl()
+            self._close_socket()
+            # The retry back-off sleep and the next connect do not
+            # select; _setup_selector registers the wakeup socket again.
+            self._release_wakeup()
         return None
-
-    def _connect(
-        self,
-        host: str,
-        hostip: str,
-        port: int,
-        timeout: float | None = None,
-    ) -> tuple[float, float]:
-        client = self.client
-        self.logger.info(
-            "Connecting to %s(%s):%s, use_ssl: %r",
-            host,
-            hostip,
-            port,
-            self.client.use_ssl,
-        )
-
-        self.logger.log(
-            BLATHER,
-            "    Using session_id: %r session_passwd: %s",
-            client._session_id,
-            hexlify(client._session_passwd),
-        )
-
-        with self._socket_error_handling():
-            self._socket = self.handler.create_connection(
-                address=(hostip, port),
-                hostname=host,
-                timeout=(
-                    client._session_timeout / 1000.0
-                    if timeout is None
-                    else timeout
-                ),
-                use_ssl=self.client.use_ssl,
-                keyfile=self.client.keyfile,
-                certfile=self.client.certfile,
-                ca=self.client.ca,
-                keyfile_password=self.client.keyfile_password,
-                verify_certs=self.client.verify_certs,
-                check_hostname=self.client.check_hostname,
-            )
-
-        self._socket.setblocking(0)  # type: ignore[arg-type]
-
-        connect = Connect(
-            0,
-            client.last_zxid,
-            client._session_timeout,
-            client._session_id or 0,
-            client._session_passwd,
-            client.read_only,
-        )
-
-        connect_result, zxid = self._invoke(
-            client._session_timeout / 1000.0 / len(client.hosts), connect
-        )
-
-        if connect_result.time_out <= 0:
-            raise SessionExpiredError("Session has expired")
-
-        if zxid:
-            client.last_zxid = zxid
-
-        # Load return values
-        client._session_id = connect_result.session_id
-        client._protocol_version = connect_result.protocol_version
-        negotiated_session_timeout = connect_result.time_out
-        connect_timeout = negotiated_session_timeout / len(client.hosts)
-        read_timeout = negotiated_session_timeout * 2.0 / 3.0
-        client._session_passwd = connect_result.passwd
-
-        self.logger.log(
-            BLATHER,
-            "Session created, session_id: %r session_passwd: %s\n"
-            "    negotiated session timeout: %s\n"
-            "    connect timeout: %s\n"
-            "    read timeout: %s",
-            client._session_id,
-            hexlify(client._session_passwd),
-            negotiated_session_timeout,
-            connect_timeout,
-            read_timeout,
-        )
-
-        if self.sasl_options is not None:
-            self._authenticate_with_sasl(host, connect_timeout / 1000.0)
-
-        # Get a copy of the auth data before iterating, in case it is
-        # changed.
-        client_auth_data_copy = copy.copy(client.auth_data)
-
-        for scheme, auth in client_auth_data_copy:
-            ap = Auth(0, scheme, auth)
-            zxid = self._invoke(connect_timeout / 1000.0, ap, xid=AUTH_XID)
-            if zxid:
-                client.last_zxid = zxid
-
-        if connect_result.read_only:
-            client._session_callback(KeeperState.CONNECTED_RO)
-            self._ro_mode = iter(self._server_pinger())
-        else:
-            client._session_callback(KeeperState.CONNECTED)
-            self._ro_mode = None
-
-        return read_timeout, connect_timeout
-
-    def _authenticate_with_sasl(self, host: str, timeout: float) -> None:
-        """Establish a SASL authenticated connection to the server."""
-        if not PURESASL_AVAILABLE:
-            raise SASLException("Missing SASL support")
-
-        # Although this can only be called if sasl_options is not None, we
-        # really should just have make self.sasl_options into an empty dict
-        # in the constructor. However, I want to avoid code changes in as
-        # much as possible.
-        if "service" not in self.sasl_options:  # type: ignore[operator]
-            self.sasl_options["service"] = "zookeeper"  # type: ignore[index]
-
-        # NOTE: Zookeeper hardcoded the domain for Digest authentication
-        # instead of using the hostname. See
-        # zookeeper/util/SecurityUtils.java#L74 and Server/Client
-        # initializations.
-        if (
-            self.sasl_options["mechanism"]  # type: ignore[index]
-            == "DIGEST-MD5"
-        ):
-            host = "zk-sasl-md5"
-
-        # I don't think the client.sasl_cli attribute is actually used
-        # anywhere else, so not sure why we need to set it on the client,
-        # but again, I want to avoid code changes as much as possible.
-        sasl_cli = self.client.sasl_cli = (  # type: ignore[attr-defined]
-            puresasl.client.SASLClient(  # type: ignore[no-untyped-call]
-                host=host,
-                **self.sasl_options,  # type: ignore[arg-type]
-            )
-        )
-
-        # Initialize the process with an empty challenge token
-        challenge = None
-        xid = 0
-
-        while True:
-            if sasl_cli.complete:
-                break
-
-            try:
-                response = sasl_cli.process(challenge=challenge)
-            except puresasl.SASLError as err:
-                raise SASLException("library error") from err
-            except puresasl.SASLProtocolException as exc:
-                raise AuthFailedError("protocol error") from exc
-            except Exception as exc:
-                raise AuthFailedError("Unknown error") from exc
-
-            if sasl_cli.complete and not response:
-                break
-            elif response is None:
-                response = b""
-
-            xid = (xid % 2147483647) + 1
-
-            request = SASL(response)
-            self._submit(request, timeout, xid)
-
-            try:
-                header, buffer, offset = self._read_header(timeout)
-            except ConnectionDropped as exc:
-                # If connection dropped during SASL handshake (e.g. server
-                # node died or restart in progress), raise ConnectionDropped
-                # so the connect loop retries other hosts.
-                raise ConnectionDropped("Connection dropped in SASL") from exc
-
-            if header.xid != xid:
-                raise RuntimeError(
-                    "xids do not match, expected %r received %r",
-                    xid,
-                    header.xid,
-                )
-
-            if header.zxid > 0:
-                self.client.last_zxid = header.zxid
-
-            if header.err:
-                callback_exception = EXCEPTIONS[header.err]()
-                self.logger.debug(
-                    "Received error(xid=%s) %r", xid, callback_exception
-                )
-                raise callback_exception
-
-            challenge, _ = SASL.deserialize(buffer, offset)
-
-        # If we made it here, authentication is ok, and we are connected.
-        # Remove sensible information from the object.
-        sasl_cli.dispose()
