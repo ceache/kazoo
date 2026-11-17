@@ -157,6 +157,13 @@ class SequentialGeventHandler:
             **kwargs,  # type: ignore[misc]
         )
 
+    def create_selector(self) -> Any:
+        return gevent.selectors.DefaultSelector()
+
+    def yield_control(self) -> None:
+        """Yield to the gevent hub so sibling greenlets can make progress."""
+        gevent.sleep(0)
+
     def socket(self) -> Socket:
         return utils.create_tcp_socket(socket)
 

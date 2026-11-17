@@ -16,6 +16,7 @@ from __future__ import annotations
 import atexit
 import logging
 import queue
+import selectors
 import socket
 import threading
 import time
@@ -186,6 +187,9 @@ class SequentialThreadingHandler(IHandler):
         self, *args: Any, **kwargs: Any
     ) -> tuple[Iterable[FdLike], Iterable[FdLike], Iterable[FdLike]]:
         return selector_select(*args, **kwargs)
+
+    def create_selector(self) -> selectors.BaseSelector:
+        return selectors.DefaultSelector()
 
     def socket(self) -> Socket:
         return utils.create_tcp_socket(socket)

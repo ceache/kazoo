@@ -10,8 +10,11 @@
 
 from __future__ import annotations
 
+import selectors
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
+
+from typing_extensions import Buffer
 
 if TYPE_CHECKING:
     import queue
@@ -28,7 +31,7 @@ class HasFileNo(Protocol):
     def fileno(self) -> int: ...
 
 
-FdLike = int | HasFileNo
+FdLike: TypeAlias = int | HasFileNo
 
 
 class Socket(HasFileNo, Protocol):
@@ -49,6 +52,10 @@ class Socket(HasFileNo, Protocol):
     def getsockname(self) -> tuple[str, int]: ...
 
     def recv(self, bufsize: int, flags: int = 0) -> bytes: ...
+
+    def recv_into(
+        self, buffer: Buffer, nbytes: int = 0, flags: int = 0
+    ) -> int: ...
 
     def send(self, data: bytes | memoryview, flags: int = 0) -> int: ...
 
@@ -186,6 +193,20 @@ class IHandler(Protocol):
     ) -> tuple[Iterable[FdLike], Iterable[FdLike], Iterable[FdLike]]:
         """A select method that implements Python's select.select
         API"""
+
+    def create_selector(self) -> selectors.BaseSelector:
+        """Return a new selector instance appropriate for this handler."""
+        return selectors.DefaultSelector()
+
+    def yield_control(self) -> None:
+        """Yield execution briefly to sibling coroutines/threads when draining
+        large response bursts without returning to the selector.
+
+        Cooperative greenlet handlers (gevent, eventlet) override this to
+        yield to their hub without introducing wall-clock timer sleep. The
+        default implementation is a no-op suitable for OS-thread handlers.
+        """
+        return
 
     def socket(self) -> Socket:
         """A socket method that implements Python's socket.socket API"""
