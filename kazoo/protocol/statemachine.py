@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+import selectors
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
-import logging
-import selectors
-from typing import Any, Literal, TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 from kazoo.exceptions import (
     AuthFailedError,

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
-import warnings
 
 from kazoo.exceptions import (
     AuthFailedError,
@@ -14,8 +14,8 @@ from kazoo.exceptions import (
 )
 
 try:
-    import puresasl  # type: ignore[import-untyped,import-not-found]
-    import puresasl.client  # type: ignore[import-untyped,import-not-found]
+    import puresasl
+    import puresasl.client
 
     PURESASL_AVAILABLE = True
 except ImportError:
