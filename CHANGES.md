@@ -1,10 +1,51 @@
 <a name="unreleased"></a>
 ## Unreleased
 
+#### Breaking Changes
+
+* **python:**
+  * Python 3.9 support is dropped (`requires-python >= 3.10`) to adopt structural pattern matching (`match`/`case`) in the protocol state machine.
+* **security:**
+  * `ACL` and `Id` are no longer tuples; they are now slotted frozen dataclasses. Direct attribute access (`.scheme`, `.id`, `.perms`) should be used. Tuple indexing, length, and iteration are deprecated and emit `DeprecationWarning`. `bool(acl)` and `bool(id)` explicitly return `True` without warning.
+  * `ACL` and `Id` no longer compare equal to plain tuples (`ACL(perms, id) == (perms, id)` is now `False`), `isinstance(acl, tuple)` is `False`, and the `NamedTuple` helpers (`_asdict`, `_replace`, `_fields`) are gone.
+  * `ACL.acl_list` is deprecated and emits `DeprecationWarning`; inspect `.perms` with `Permissions` flags instead.
+  * `Permissions` is now an `enum.IntFlag`.
+* **client:**
+  * `KazooClient.state` is now a snapshot derived from the internal state machine rather than an independently stored mutable attribute. It may already show the new state before listeners are called; rely on state change listeners, not on polling `state`, for ordering.
+  * Replies larger than `max_buffer + 88` bytes (`1,048,663` bytes by default with `JUTE_MAX_BUFFER = 0xFFFFF`) now skip the remainder of the frame and fail that request with `ReplyTooLargeError` (without resetting the session), while oversize non-request/control frames (`xid <= 0`) and oversize SASL replies raise `ConnectionDropped` instead of allocating beyond the fixed receive buffer. Pass a larger `max_buffer` to `KazooClient` to match a server configured with a larger `jute.maxbuffer`.
+* **protocol:**
+  * Every `deserialize(buffer, offset)` classmethod in `kazoo.protocol.serialization` now returns `(value, end_offset)` instead of the bare value.
+  * A reply whose fields do not exactly span its frame now fails that request with `MarshallingError` (the session stays up); a connect, watch, or SASL frame that is malformed or does not exactly span its frame raises `ConnectionDropped`.
+  * Wire packet dataclasses in `kazoo.protocol.serialization` are `@dataclass(slots=True)` decorated with `@typing_extensions.dataclass_transform(frozen_default=True)` instead of `frozen=True`: static type checkers (`mypy`) still reject mutation, while at runtime packet instances are mutable and unhashable.
+* **handlers:**
+  * `IHandler.create_selector()` is a new required method for custom `IHandler` implementations. The base `IHandler` interface provides a fallback default returning `selectors.DefaultSelector()`.
+  * `Socket.recv_into()` is now required on custom `Socket` implementations; replies are read directly into the decoder's buffer. `IHandler.yield_control()` is a new cooperative-yield hook called every 64 buffered replies when draining coalesced receive bursts. The base `IHandler` interface provides a no-op default suitable for thread-based handlers; a custom handler that does not subclass `IHandler` must define it (`gevent.sleep(0)` and `eventlet.sleep(0)` for the built-in greenlet handlers).
+  * gevent/eventlet: the connection loop reads and writes optimistically and yields to the hub only when the socket would block (or via `yield_control()`/`sleep(0)` every 64 buffered replies instead of via `select` after every reply). Watch callbacks and other greenlets may run later relative to request completion than in 2.11; code or tests that relied on a callback having run by the time a request returns must wait for it explicitly.
+
+#### Features
+
+* **client:**
+  * Add `max_buffer` (default `JUTE_MAX_BUFFER = 0xFFFFF`) to `KazooClient` and `ConnectionHandler`, along with `ReplyTooLargeError` in `kazoo.exceptions`.
+* **protocol:**
+  * extract a typed `SASLConfig` and a sans-I/O `SASLExchange` from the connection handler.
+  * SASL negotiation requests share the unified client XID counter.
+  * unexpected exceptions raised by the SASL mechanism are reported as `AuthFailedError('Authentication failed')` caused by `SASLException('SASL step failed')` (was `AuthFailedError('Unknown error')`).
+  * the `BLATHER` `Session created` log line no longer includes the session password; connect and read timeouts are reported in seconds.
+  * `FrameDecoder` now allocates a fixed linear receive buffer (`READ_WINDOW + 4 + max_buffer + REPLY_OVERHEAD` = `1,310,811` bytes at the default `JUTE_MAX_BUFFER`, reused across reconnects) fed directly via `recv_into()`, dispatches replies uniformly by `xid` (no `is_connect`/`is_sasl` flags), deserializes normal responses in-decoder into `ResponsePacket` (releasing the frame `memoryview` slice immediately without lent-view tracking), and unpacks `Transaction` multi-headers directly without constructing temporary `MultiHeader` objects.
+
 #### Bug Fixes
 
 * **protocol:**
   * handle `SASLException` and `SessionClosedRequireSaslError` cleanly as `AUTH_FAILED` in `_connect_attempt` (addresses #594)
+  * connection dropped during SASL negotiation retries connecting/suspending instead of failing permanently as `AUTH_FAILED` (restores #594)
+* **client:**
+  * wake connection unconditionally on request enqueue to eliminate lost-wakeup race condition
+  * make state change listener notifications idempotent and deduplicate against `_last_notified_state` rather than asserting
+
+#### Test
+
+* **integ:**
+  * persistent watch tests wait for callbacks with a handler-aware poll instead of fixed sleeps
 
 
 <a name="2.11.0"></a>
