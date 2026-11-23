@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 import random
 import time
-from typing import Any, Callable, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 from kazoo.exceptions import (
     ConnectionClosedError,
@@ -114,6 +115,10 @@ class KazooRetry:
         )
         obj.retry_exceptions = self.retry_exceptions
         return obj
+
+    @property
+    def cur_delay(self) -> float:
+        return self._cur_delay
 
     def __call__(
         self,

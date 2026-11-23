@@ -13,11 +13,23 @@ from __future__ import annotations
 # FOR A PARTICULAR PURPOSE.
 #
 ##############################################################################
-
 import logging
+import os
 import time
+from collections.abc import Callable
+from typing import Any
 
-from typing import Any, Callable, Type
+CI = os.environ.get("CI", False)
+CI_ZK_VERSION: tuple[int, ...] = tuple()
+if CI:
+    has_version = os.environ.get("ZOOKEEPER_VERSION", "")
+    if has_version:
+        if "-" in has_version:
+            # Ignore pre-release markers like -alpha
+            has_version = has_version.split("-")[0]
+        CI_ZK_VERSION = tuple(
+            [int(n) for n in has_version.split(".") if n.isdigit()]
+        )
 
 
 class Handler(logging.Handler):
@@ -89,7 +101,7 @@ class Wait:
         self,
         timeout: int | None = None,
         wait: float | None = None,
-        exception: Type[Exception] = TimeOutWaitingFor,
+        exception: type[Exception] = TimeOutWaitingFor,
         getnow: Callable[[], Callable[[], float]] = (lambda: time.monotonic),
         getsleep: Callable[[], Callable[[float], None]] = (lambda: time.sleep),
     ):

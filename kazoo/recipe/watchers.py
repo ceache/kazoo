@@ -13,22 +13,16 @@
 
 from __future__ import annotations
 
-from functools import partial, wraps
 import logging
 import time
 import warnings
-from typing import (
-    Any,
-    List,
-    Callable,
-    Optional,
-    Union,
-    TYPE_CHECKING,
-    overload,
-)
+from collections.abc import Callable
+from functools import partial, wraps
+from typing import TYPE_CHECKING, Any, overload
+
 from typing_extensions import ParamSpec, deprecated
 
-from kazoo.exceptions import ConnectionClosedError, NoNodeError, KazooException
+from kazoo.exceptions import ConnectionClosedError, KazooException, NoNodeError
 from kazoo.protocol.states import KazooState, WatchedEvent, ZnodeStat
 from kazoo.retry import KazooRetry
 
@@ -57,13 +51,12 @@ def _ignore_closed(
     return wrapper
 
 
-DataWatchFunc = Union[
-    Callable[[Optional[bytes], Optional[ZnodeStat]], Optional[bool]],
-    Callable[
-        [Optional[bytes], Optional[ZnodeStat], Optional[WatchedEvent]],
-        Optional[bool],
-    ],
-]
+DataWatchFunc = (
+    Callable[[bytes | None, ZnodeStat | None], bool | None]
+    | Callable[
+        [bytes | None, ZnodeStat | None, WatchedEvent | None], bool | None
+    ]
+)
 
 
 class DataWatch:
@@ -119,10 +112,7 @@ class DataWatch:
 
     @overload
     def __init__(
-        self,
-        client: KazooClient,
-        path: str,
-        func: DataWatchFunc | None = None,
+        self, client: KazooClient, path: str, func: DataWatchFunc | None = None
     ): ...
 
     @overload
@@ -131,7 +121,7 @@ class DataWatch:
         "ignore_missing_node is now assumed to be True by default, and the "
         "event will be sent if the function can handle receiving it"
     )
-    def __init__(  # type: ignore[misc]
+    def __init__(
         self,
         client: KazooClient,
         path: str,
@@ -140,7 +130,7 @@ class DataWatch:
         **kwargs: Any,
     ): ...
 
-    def __init__(  # type: ignore[misc]
+    def __init__(
         self,
         client: KazooClient,
         path: str,
@@ -294,10 +284,80 @@ class DataWatch:
             self._client.handler.spawn(self._get_data)
 
 
-ChildrenWatchFunc = Union[
-    Callable[[List[str]], Optional[bool]],
-    Callable[[List[str], Optional[WatchedEvent]], Optional[bool]],
-]
+class ExistingDataWatch(DataWatch):
+    """Watches a node for data updates and calls the specified
+    function each time it changes
+
+    Similar to :class:`~kazoo.recipes.watchers.DataWatch`, but it does
+    not operate on nodes which do not exist.
+
+    The function will also be called the very first time its
+    registered to get the data.
+
+    Returning `False` from the registered function will disable future
+    data change calls. If the client connection is closed (using the
+    close command), the DataWatch will no longer get updates.
+
+    If the function supplied takes three arguments, then the third one
+    will be a :class:`~kazoo.protocol.states.WatchedEvent`. It will
+    only be set if the change to the data occurs as a result of the
+    server notifying the watch that there has been a change. Events
+    like reconnection or the first call will not include an event.
+
+    If the node does not exist on creation then the function will be
+    called with ``None`` for all values and no futher callbacks will
+    occur.  If the node is deleted after the watch is created, the
+    function will be called with the event argument indicating a
+    delete event and no further callbacks will occur.
+    """
+
+    @_ignore_closed
+    def _get_data(self, event: WatchedEvent | None = None) -> None:
+        # Ensure this runs one at a time, possible because the session
+        # watcher may trigger a run
+        with self._run_lock:
+            if self._stopped:
+                return
+
+            initial_version = self._version
+
+            data: bytes | None
+            stat: ZnodeStat | None
+            try:
+                data, stat = self._retry(
+                    self._client.get,
+                    self._path,
+                    self._watcher,
+                )
+            except NoNodeError:
+                data = stat = None
+
+            # No node data, clear out version
+            if stat is None:
+                self._version = None
+            else:
+                self._version = stat.mzxid
+
+            # Call our function if its the first time ever, or if the
+            # version has changed
+            if initial_version != self._version or not self._ever_called:
+                try:
+                    self._log_func_exception(data, stat, event)
+                finally:
+                    if stat is None:
+                        self._stopped = True
+                        self._func = None
+                        self._client.remove_listener(self._session_watcher)
+            elif stat is None:
+                self._stopped = True
+                self._func = None
+                self._client.remove_listener(self._session_watcher)
+
+
+ChildrenWatchFunc = (
+    Callable[[list[str]], bool | None]
+    | Callable[[list[str], WatchedEvent | None], bool | None]
+)
 
 
 class ChildrenWatch:
