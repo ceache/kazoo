@@ -33,6 +33,7 @@ class TestConnectionAuthExceptions:
         handler.timeout_exception = TimeoutError
         client.handler = handler
         client._state = KeeperState.CONNECTING
+        client.concurrent_request_limit = None
         retry = KazooRetry()
         connection = ConnectionHandler(client, retry)
 
@@ -53,6 +54,7 @@ class TestConnectionAuthExceptions:
         handler.timeout_exception = TimeoutError
         client.handler = handler
         client._state = KeeperState.CONNECTING
+        client.concurrent_request_limit = None
         retry = KazooRetry()
         connection = ConnectionHandler(client, retry)
 
@@ -736,6 +738,7 @@ class TestRWServerSelection:
         handler.select.return_value = ([sock], [], [])
         client.handler = handler
         client._state = KeeperState.CONNECTING
+        client.concurrent_request_limit = None
         retry = KazooRetry()
         logger = logging.getLogger("kazoo.test.rw_attempt")
         connection = ConnectionHandler(client, retry, logger=logger)
@@ -778,6 +781,7 @@ class TestRWServerSelection:
         handler.timeout_exception = TimeoutError
         client.handler = handler
         client._state = KeeperState.CONNECTING
+        client.concurrent_request_limit = None
         client.hosts = [
             ("ro.example", 2181),
             ("other.example", 2183),
