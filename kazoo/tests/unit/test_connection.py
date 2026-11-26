@@ -1565,6 +1565,63 @@ class TestConnectionRecvIntoAndBurstScheduling:
             assert mock_send.call_count == 1
             assert conn._frame_decoder.frame_ready is False
 
+    def test_fast_path_send_drains_wakeup_and_unblocks_close(self) -> None:
+        """Fast-path send drains wakeup pipe and bypasses limit for Close."""
+        import socket
+
+        client = KazooClient(
+            hosts="127.0.0.1:2181", concurrent_request_limit=1
+        )
+        conn = client._connection
+        client._state_machine.state = Connected(host="127.0.0.1", port=2181)
+        s_a, s_b = socket.socketpair()
+        try:
+            s_a.setblocking(False)
+            s_b.setblocking(False)
+            conn._read_sock, conn._write_sock = (
+                client.handler.create_socket_pair()
+            )
+            conn._read_sock.setblocking(False)
+            conn._write_sock.setblocking(False)
+            conn._selector = client.handler.create_selector()
+            conn._socket = s_a
+            conn._last_send = time.monotonic()
+            conn._setup_selector()
+
+            # 1. Enqueue + wake(), then _poll_step() must drain wakeup so
+            # _select(0.0) does NOT wake spuriously with {"wakeup"}.
+            conn._requests.enqueue(Ping(), None)
+            conn.wake()
+            conn._connect_timeout = 10.0
+            conn._read_timeout = 10.0
+            with patch.object(
+                conn, "_select", return_value=set()
+            ) as mock_select:
+                conn._poll_step()
+                # The wakeup byte written before _poll_step was already drained
+                assert mock_select.call_count == 1
+                assert len(conn._requests.pending) == 1
+            assert conn._select(0.0) == set()
+
+            # 2. Saturated pipeline (pending == limit=1): CloseRequested sets
+            # is_connecting_allowed=False and enqueues Close(); _poll_step()
+            # must send Close() immediately despite being at limit.
+            client.send_event(CloseRequested())
+            assert len(conn._requests.queue) == 1
+            with patch.object(conn, "_select", return_value=set()):
+                conn._poll_step()
+            assert len(conn._requests.queue) == 0
+            assert len(conn._requests.pending) == 2
+            assert conn._select(0.0) == set()
+        finally:
+            conn._close_selector()
+            s_a.close()
+            s_b.close()
+            if conn._read_sock is not None:
+                conn._read_sock.close()
+            if conn._write_sock is not None:
+                conn._write_sock.close()
+
     def test_replies_per_yield_triggers_yield_control_and_resets(self) -> None:
         client = _make_mock_client(concurrent_request_limit=200)
         client._state_machine.state = Connected()

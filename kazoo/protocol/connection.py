@@ -1371,11 +1371,18 @@ class ConnectionHandler:
         """Execute a single cycle of the selector I/O loop."""
         timeout, deadline = self._compute_poll_timeout()
 
-        if self._is_session_active:
-            if self._requests.queue and self._requests.has_send_capacity(
-                self.client.concurrent_request_limit
-            ):
-                self._send_request(self._read_timeout, self._connect_timeout)
+        if (
+            self._is_session_active
+            and self._requests.queue
+            and (
+                self._is_terminal
+                or self._requests.has_send_capacity(
+                    self.client.concurrent_request_limit
+                )
+            )
+        ):
+            self._drain_wakeup()
+            self._send_request(self._read_timeout, self._connect_timeout)
 
         if self._frame_decoder.frame_ready:
             self._replies_since_select += 1
