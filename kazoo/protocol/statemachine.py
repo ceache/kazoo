@@ -222,7 +222,6 @@ class ConnectResponseReceived:
     """Emitted when Connect response packet is read from the server."""
 
     connect_result: Connect
-    zxid: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -443,12 +442,11 @@ class ReadConnectResponsePacket:
 
 @dataclass(frozen=True, slots=True)
 class UpdateSessionData:
-    """Update client session id, password, protocol version, and zxid."""
+    """Update client session id, password, and protocol version."""
 
     session_id: int
     session_passwd: bytes
     protocol_version: int
-    last_zxid: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -920,7 +918,7 @@ def transition(
                 auth_data=auth_data,
                 num_hosts=num_hosts,
             ),
-            ConnectResponseReceived(connect_result=connect_result, zxid=zxid),
+            ConnectResponseReceived(connect_result=connect_result),
         ):
             if connect_result.time_out <= 0:
                 expired_connect_effects: tuple[SideEffect, ...] = (
@@ -953,7 +951,6 @@ def transition(
                     session_id=conn_session_id,
                     session_passwd=connect_result.passwd,
                     protocol_version=connect_result.protocol_version,
-                    last_zxid=zxid,
                 ),
                 ConfigureTimeouts(
                     read_timeout=read_timeout,
