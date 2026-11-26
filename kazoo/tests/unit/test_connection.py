@@ -1962,3 +1962,27 @@ class TestWakeupOutsideSelect:
             client.stop()
             client.close()
             server.stop()
+
+    def test_stop_timeout_does_not_block_on_unbounded_join(self) -> None:
+        """stop(timeout) returns False without hanging on a stuck routine."""
+        client = KazooClient(hosts="127.0.0.1:2181")
+        conn = client._connection
+        release = threading.Event()
+        stuck_thread = threading.Thread(target=release.wait, daemon=True)
+        stuck_thread.start()
+        try:
+            conn.connection_stopped.clear()
+            conn._connection_routine = stuck_thread
+
+            start = time.monotonic()
+            stopped = conn.stop(timeout=0.05)
+            elapsed = time.monotonic() - start
+
+            assert stopped is False
+            assert elapsed < 0.5
+            assert conn._connection_routine is stuck_thread
+        finally:
+            release.set()
+            stuck_thread.join(timeout=2.0)
+            conn.connection_stopped.set()
+            conn._connection_routine = None

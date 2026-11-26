@@ -788,14 +788,15 @@ class ConnectionHandler:
 
     def stop(self, timeout: float | None = None) -> bool:
         """Ensure the writer has stopped, wait to see if it does."""
-        self.connection_stopped.wait(timeout)
+        if not self.connection_stopped.wait(timeout):
+            return False
         if self._connection_routine:
             self._connection_routine.join()
             self._connection_routine = None
         # client.stop() runs StopConnectionLoop on this thread. When the
         # routine had already returned, nothing consumed that wake-up.
         self._release_wakeup()
-        return self.connection_stopped.is_set()
+        return True
 
     def close(self) -> None:
         """Release resources held by the connection

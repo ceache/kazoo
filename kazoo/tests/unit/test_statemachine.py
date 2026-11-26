@@ -1213,6 +1213,67 @@ class TestClientStateMachineDriver:
         assert client.state == KazooState.SUSPENDED
         assert not client.connected
 
+    def test_cross_thread_close_waits_and_survives_effect_exception(
+        self,
+    ) -> None:
+        """Cross-thread CloseRequested waits for effect and is not lost."""
+        import threading
+
+        handler = SequentialThreadingHandler()
+        entered_effect = threading.Event()
+        release_effect = threading.Event()
+        events_executed: list[str] = []
+
+        def executor(effect: SideEffect) -> None:
+            if isinstance(effect, SendHeartbeatPing):
+                events_executed.append("ping_start")
+                entered_effect.set()
+                release_effect.wait(timeout=2.0)
+                raise ConnectionDropped("ping failed")
+            if isinstance(effect, EnqueueCloseRequest):
+                events_executed.append("close_enqueued")
+
+        driver = StateMachineDriver(
+            handler,
+            executor,
+            initial_state=Connected(host="127.0.0.1", port=2181),
+        )
+
+        ping_exc: list[BaseException] = []
+
+        def run_ping() -> None:
+            try:
+                driver.send_event(HeartbeatDeadlineReached())
+            except BaseException as exc:
+                ping_exc.append(exc)
+
+        t_ping = threading.Thread(target=run_ping)
+        t_ping.start()
+        assert entered_effect.wait(timeout=2.0)
+
+        close_done = threading.Event()
+
+        def run_close() -> None:
+            driver.send_event(CloseRequested())
+            close_done.set()
+
+        t_close = threading.Thread(target=run_close)
+        t_close.start()
+
+        # Cross-thread CloseRequested must block until active effect finishes
+        assert not close_done.wait(timeout=0.05)
+
+        release_effect.set()
+        t_ping.join(timeout=2.0)
+        t_close.join(timeout=2.0)
+
+        assert len(ping_exc) == 1
+        assert isinstance(ping_exc[0], ConnectionDropped)
+        assert close_done.is_set()
+        assert events_executed == ["ping_start", "close_enqueued"]
+        assert isinstance(driver.state, Connected)
+        assert driver.state.is_connecting_allowed is False
+
     def test_selector_interest_updates_via_client_events(self) -> None:
         client = KazooClient(concurrent_request_limit=1)
         conn = client._connection
