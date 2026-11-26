@@ -549,6 +549,7 @@ class ConnectionHandler:
 
         self._connection_routine: Threadlike | None = None
         self._last_send: float = 0.0
+        self._last_recv: float = 0.0
         self._read_timeout: float = 10.0
         self._connect_timeout: float = 10.0
         self._phase_deadline: float | None = None
@@ -790,7 +791,9 @@ class ConnectionHandler:
             ):
                 self._read_timeout = r_timeout
                 self._connect_timeout = c_timeout
-                self._last_send = time.monotonic()
+                now = time.monotonic()
+                self._last_send = now
+                self._last_recv = now
 
             case ConfigureReadOnlyMode(read_only=ro_enabled):
                 if ro_enabled:
@@ -979,6 +982,7 @@ class ConnectionHandler:
             if nbytes == 0:
                 self._frame_decoder.reset()
                 raise ConnectionDropped("socket connection broken")
+            self._last_recv = time.monotonic()
             self._frame_decoder.buffer_updated(nbytes)
             packet = self._frame_decoder.pop_packet()
             if packet is not None:
@@ -1414,10 +1418,54 @@ class ConnectionHandler:
                 return rem, None
             return self._connect_timeout, None
 
+        now = time.monotonic()
         jitter_time = random.randint(1, 40) / 100.0
-        deadline = self._last_send + self._read_timeout / 2.0 - jitter_time
-        timeout = max(deadline - time.monotonic(), jitter_time)
+        ref_time = (
+            min(self._last_send, self._last_recv)
+            if self._last_recv > 0.0
+            else self._last_send
+        )
+        deadline = ref_time + self._read_timeout / 2.0 - jitter_time
+        timeout = max(deadline - now, jitter_time)
+        state = self.client._state_machine.state
+        if (
+            self._last_recv > 0.0
+            and isinstance(state, (Connected, ConnectedReadOnly))
+            and (
+                state.ping_outstanding
+                or self._requests.pending
+                or self._requests.auth_pending
+            )
+        ):
+            recv_rem = max(0.0, (self._last_recv + self._read_timeout) - now)
+            if recv_rem < timeout:
+                timeout = recv_rem
         return timeout, deadline
+
+    def _check_session_health(self, deadline: float | None) -> None:
+        """Send heartbeat pings and drop half-open connections past timeout."""
+        state = self.client._state_machine.state
+        if not isinstance(state, (Connected, ConnectedReadOnly)):
+            return
+        now = time.monotonic()
+        if (
+            self._last_recv > 0.0
+            and (
+                state.ping_outstanding
+                or self._requests.pending
+                or self._requests.auth_pending
+            )
+            and now - self._last_recv >= self._read_timeout
+        ):
+            raise self.handler.timeout_exception(
+                "socket time-out: no response from server"
+            )
+        if (
+            not state.ping_outstanding
+            and deadline is not None
+            and now >= deadline
+        ):
+            self._emit_event(HEARTBEAT_DEADLINE_REACHED)
 
     def _dispatch_ready_events(
         self, ready: set[str], deadline: float | None
@@ -1453,20 +1501,16 @@ class ConnectionHandler:
                     self._send_request(
                         self._read_timeout, self._connect_timeout
                     )
+                    self._check_session_health(deadline)
                     return True
                 else:
                     self._emit_event(WAKEUP_SIGNALED)
                     return True
 
-        if (
-            self._is_session_active
-            and deadline is not None
-            and time.monotonic() >= deadline
-        ):
-            self._emit_event(HEARTBEAT_DEADLINE_REACHED)
+        if self._is_session_active:
+            self._check_session_health(deadline)
         elif (
-            not self._is_session_active
-            and self._phase_deadline is not None
+            self._phase_deadline is not None
             and time.monotonic() >= self._phase_deadline
         ):
             self._emit_event(POLL_TIMEOUT_EXPIRED)

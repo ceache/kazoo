@@ -2347,3 +2347,33 @@ class TestWakeupOutsideSelect:
         assert auth_res.get_nowait() is True
         assert len(conn._requests.pending) == 0
         assert len(conn._requests.auth_pending) == 0
+
+    def test_outbound_wakeups_do_not_starve_heartbeat_or_dead_peer_timeout(
+        self,
+    ) -> None:
+        """Continuous outbound requests still ping and time out silent peer."""
+        client = KazooClient(hosts="127.0.0.1:2181")
+        conn = client._connection
+        client._state_machine.state = Connected(host="127.0.0.1", port=2181)
+        conn._socket = Mock()
+        conn._socket.send.side_effect = lambda v: len(v)
+        conn._read_timeout = 10.0
+        conn._last_send = 100.0
+        conn._last_recv = 100.0
+
+        # At t=106 (past read_timeout/2) with continuous wakeup sends advancing
+        # _last_send, heartbeat ping must still be emitted.
+        conn._requests.enqueue(GetData("/a", None), Mock())
+        with patch("time.monotonic", return_value=106.0):
+            _, deadline = conn._compute_poll_timeout()
+            conn._dispatch_ready_events({"wakeup"}, deadline)
+        assert isinstance(client.state_machine, Connected)
+        assert client.state_machine.ping_outstanding is True
+
+        # At t=111 (past read_timeout since _last_recv=100) even with wakeup
+        # ready, connection must raise timeout_exception.
+        conn._requests.enqueue(GetData("/b", None), Mock())
+        with patch("time.monotonic", return_value=111.0):
+            _, deadline = conn._compute_poll_timeout()
+            with pytest.raises(client.handler.timeout_exception):
+                conn._dispatch_ready_events({"wakeup"}, deadline)
