@@ -100,14 +100,18 @@ class TestACL:
         assert acl2.perms == Permissions.ADMIN
 
     def test_acl_unpacking(self) -> None:
+        import pytest
+
         from kazoo.security import Id
 
         acl = ACL(Permissions.READ, Id("world", "anyone"))
-        perms, ident = acl
+        with pytest.deprecated_call():
+            perms, ident = acl
         assert perms == Permissions.READ
         assert ident == Id("world", "anyone")
 
-        scheme, id_str = ident
+        with pytest.deprecated_call():
+            scheme, id_str = ident
         assert scheme == "world"
         assert id_str == "anyone"
 
@@ -117,25 +121,39 @@ class TestACL:
         from kazoo.security import Id
 
         ident = Id("world", "anyone")
-        assert len(ident) == 2
-        assert ident[0] == "world"
-        assert ident[1] == "anyone"
-        assert ident[-1] == "anyone"
-        assert ident[-2] == "world"
-        assert ident[:] == ("world", "anyone")
-        assert ident[::-1] == ("anyone", "world")
-        with pytest.raises(IndexError):
+        with pytest.deprecated_call():
+            assert len(ident) == 2
+        with pytest.deprecated_call():
+            assert ident[0] == "world"
+        with pytest.deprecated_call():
+            assert ident[1] == "anyone"
+        with pytest.deprecated_call():
+            assert ident[-1] == "anyone"
+        with pytest.deprecated_call():
+            assert ident[-2] == "world"
+        with pytest.deprecated_call():
+            assert ident[:] == ("world", "anyone")
+        with pytest.deprecated_call():
+            assert ident[::-1] == ("anyone", "world")
+        with pytest.deprecated_call(), pytest.raises(IndexError):
             _ = ident[2]
 
         acl = ACL(Permissions.READ, ident)
-        assert len(acl) == 2
-        assert acl[0] == Permissions.READ
-        assert acl[1] == ident
-        assert acl[-1] == ident
-        assert acl[-2] == Permissions.READ
-        assert acl[:] == (Permissions.READ, ident)
-        assert acl[::-1] == (ident, Permissions.READ)
-        with pytest.raises(IndexError):
+        with pytest.deprecated_call():
+            assert len(acl) == 2
+        with pytest.deprecated_call():
+            assert acl[0] == Permissions.READ
+        with pytest.deprecated_call():
+            assert acl[1] == ident
+        with pytest.deprecated_call():
+            assert acl[-1] == ident
+        with pytest.deprecated_call():
+            assert acl[-2] == Permissions.READ
+        with pytest.deprecated_call():
+            assert acl[:] == (Permissions.READ, ident)
+        with pytest.deprecated_call():
+            assert acl[::-1] == (ident, Permissions.READ)
+        with pytest.deprecated_call(), pytest.raises(IndexError):
             _ = acl[2]
 
     def test_bool_truthiness(self) -> None:
