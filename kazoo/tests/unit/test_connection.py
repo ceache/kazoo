@@ -8,7 +8,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -1738,7 +1738,7 @@ class TestConnectionRecvIntoAndBurstScheduling:
         with pytest.raises(AttributeError, match="yield_control"):
             ConnectionHandler(client, KazooRetry())
 
-    def test_read_packet_timeout_applies_to_each_wait(self) -> None:
+    def test_read_packet_returns_none_on_partial_read(self) -> None:
         client = _make_mock_client()
         conn = ConnectionHandler(client, KazooRetry())
         conn._socket = Mock()
@@ -1746,10 +1746,13 @@ class TestConnectionRecvIntoAndBurstScheduling:
 
         wire = self._make_getdata_wire(7, b"x" * 100)
         pieces = [wire[:10], wire[10:50], wire[50:]]
-        # The socket blocks before each piece: every piece costs one select
-        script: list[bytes | None] = []
-        for piece in pieces:
-            script += [None, piece]
+        script: list[bytes | None] = [
+            pieces[0],
+            None,
+            pieces[1],
+            None,
+            pieces[2],
+        ]
 
         def fake_recv_into(buf: memoryview) -> int:
             piece = script.pop(0)
@@ -1759,47 +1762,106 @@ class TestConnectionRecvIntoAndBurstScheduling:
             return len(piece)
 
         conn._socket.recv_into.side_effect = fake_recv_into
-        client.handler.select.return_value = ([conn._socket], [], [])
 
+        assert conn._read_packet(timeout=2.5) is None
+        assert conn._read_packet(timeout=2.5) is None
         pkt = conn._read_packet(timeout=2.5)
 
         assert isinstance(pkt, ResponsePacket)
         assert pkt.header.xid == 7
         assert pkt.response[0] == b"x" * 100
-        # A slow reply is not cut short by the time already spent on it
-        assert client.handler.select.call_args_list == [
-            call([conn._socket], [], [], 2.5)
-        ] * len(pieces)
+        client.handler.select.assert_not_called()
 
-    def test_read_packet_raises_timeout_when_socket_stays_silent(
-        self,
-    ) -> None:
+    def test_read_packet_ssl_want_read_returns_none(self) -> None:
+        import ssl
+
         client = _make_mock_client()
         conn = ConnectionHandler(client, KazooRetry())
         conn._socket = Mock()
-
-        wire = self._make_getdata_wire(7, b"x" * 100)
-        script: list[bytes | None] = [wire[:10], None]
-
-        def fake_recv_into(buf: memoryview) -> int:
-            piece = script.pop(0)
-            if piece is None:
-                raise BlockingIOError()
-            buf[: len(piece)] = piece
-            return len(piece)
-
-        conn._socket.recv_into.side_effect = fake_recv_into
-        client.handler.select.return_value = ([], [], [])
-
-        with pytest.raises(
-            client.handler.timeout_exception,
-            match="socket time-out during read",
-        ):
-            conn._read_packet(timeout=2.5)
-
-        client.handler.select.assert_called_once_with(
-            [conn._socket], [], [], 2.5
+        conn._socket_is_ssl = True
+        conn._socket.pending.return_value = 0
+        conn._socket.recv_into.side_effect = ssl.SSLWantReadError(
+            ssl.SSL_ERROR_WANT_READ, "want read"
         )
+
+        assert conn._read_packet(timeout=2.5) is None
+        client.handler.select.assert_not_called()
+
+    def test_oversize_reply_over_read_window_drains_without_blocking(
+        self,
+    ) -> None:
+        """Oversize reply > READ_WINDOW drains _skip across _poll_step()."""
+        import socket
+
+        from kazoo.protocol.serialization import READ_WINDOW
+
+        client = KazooClient(hosts="127.0.0.1:2181")
+        conn = client._connection
+        client._state_machine.state = Connected(
+            host="127.0.0.1", port=2181, session_id=123
+        )
+        s_client, s_server = socket.socketpair()
+        try:
+            s_client.setblocking(False)
+            s_server.setblocking(False)
+            conn._selector = client.handler.create_selector()
+            conn._read_sock, conn._write_sock = (
+                client.handler.create_socket_pair()
+            )
+            conn._read_sock.setblocking(False)
+            conn._write_sock.setblocking(False)
+            conn._socket = s_client
+            conn._read_timeout = 1.0
+            conn._last_send = time.monotonic()
+            conn._setup_selector()
+
+            # Oversize reply larger than default max_buffer + REPLY_OVERHEAD
+            # AND larger than READ_WINDOW (256 KiB), with no trailing frame.
+            oversize_payload = b"A" * (JUTE_MAX_BUFFER + 1024)
+            oversize_wire = self._make_getdata_wire(1, oversize_payload)
+            assert len(oversize_wire) > READ_WINDOW
+
+            res1 = client.handler.async_result()
+            conn._requests.pending.append((GetData("/big", None), res1, 1))
+
+            # Stream oversize_wire from a background thread while _poll_step
+            # drains the socket without ever blocking in _read_packet().
+            sent_all = threading.Event()
+
+            def send_all() -> None:
+                s_server.setblocking(True)
+                s_server.sendall(oversize_wire)
+                sent_all.set()
+
+            sender = threading.Thread(target=send_all, daemon=True)
+            sender.start()
+
+            deadline = time.monotonic() + 5.0
+            while not (sent_all.is_set() and conn._frame_decoder._skip == 0):
+                assert time.monotonic() < deadline
+                conn._poll_step()
+            sender.join(timeout=2.0)
+
+            assert res1.ready()
+            assert isinstance(res1.exception, ReplyTooLargeError)
+            assert isinstance(client.state_machine, Connected)
+
+            # Follow-up reply succeeds on the same session without stall.
+            res2 = client.handler.async_result()
+            conn._requests.pending.append((GetData("/ok", None), res2, 2))
+            s_server.sendall(self._make_getdata_wire(2, b"ok"))
+            conn._poll_step()
+            assert res2.ready()
+            assert res2.get_nowait()[0] == b"ok"
+            assert isinstance(client.state_machine, Connected)
+        finally:
+            conn._close_selector()
+            s_client.close()
+            s_server.close()
+            if conn._read_sock is not None:
+                conn._read_sock.close()
+            if conn._write_sock is not None:
+                conn._write_sock.close()
 
     def test_read_response_error_and_max_buffer_plumbing(self) -> None:
         assert issubclass(ReplyTooLargeError, KazooException)

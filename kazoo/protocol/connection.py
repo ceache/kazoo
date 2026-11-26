@@ -902,66 +902,56 @@ class ConnectionHandler:
             logger=self.logger,
         )
 
-    def _read_packet(self, timeout: float | None) -> ServerPacket:
-        """Read and decode the next typed server packet via FrameDecoder."""
+    def _read_packet(
+        self, timeout: float | None = None
+    ) -> ServerPacket | None:
+        """Read and decode the next typed server packet via FrameDecoder.
+
+        Non-blocking: returns ``None`` when the socket would block before a
+        complete frame is available so all waiting happens in the unified
+        selector loop (including oversize-frame skipping and TLS control
+        records).
+        """
         packet = self._frame_decoder.pop_packet()
         if packet is not None:
             return packet
 
-        # We know that self._socket is not None here because we only call
-        # this method when we have set up the connection and the read socket.
-        # But mypy doesn't understand that.
         while True:
             buf = self._frame_decoder.get_buffer()
-            nbytes = 0
-            got_data = False
             try:
                 nbytes = self._socket.recv_into(  # type: ignore[union-attr]
                     buf
                 )
-                got_data = True
             except BlockingIOError:
-                pass
-            except ssl.SSLError as e:
-                if e.errno not in (
-                    ssl.SSL_ERROR_WANT_READ,
-                    ssl.SSL_ERROR_WANT_WRITE,
+                if (
+                    self._socket_is_ssl
+                    and cast(ssl.SSLSocket, self._socket).pending() > 0
                 ):
-                    raise
+                    continue
+                return None
+            except ssl.SSLError as e:
+                if e.errno == ssl.SSL_ERROR_WANT_READ:
+                    if cast(ssl.SSLSocket, self._socket).pending() > 0:
+                        continue
+                    return None
+                if e.errno == ssl.SSL_ERROR_WANT_WRITE:
+                    eff = self._read_timeout if timeout is None else timeout
+                    if not self.handler.select(
+                        [], [cast("Socket", self._socket)], [], eff
+                    )[1]:
+                        raise self.handler.timeout_exception(
+                            "socket time-out during read"
+                        )
+                    continue
+                raise
 
-            if got_data:
-                if nbytes == 0:
-                    self._frame_decoder.reset()
-                    raise ConnectionDropped("socket connection broken")
-                self._frame_decoder.buffer_updated(nbytes)
-                packet = self._frame_decoder.pop_packet()
-                if packet is not None:
-                    return packet
-                continue
-
-            # Because of SSL framing, a select may not return when using
-            # an SSL socket because the underlying physical socket may not
-            # have anything to select, but the wrapped object may still
-            # have something to read as it has previously gotten enough
-            # data from the underlying socket.
-            if (
-                self._socket_is_ssl
-                and cast(ssl.SSLSocket, self._socket).pending() > 0
-            ):
-                continue
-
-            # The timeout applies to each wait for more bytes, not to the
-            # whole packet: a large reply that keeps arriving is not a
-            # dead connection.
-            s = self.handler.select(
-                [cast("Socket", self._socket)], [], [], timeout
-            )[0]
-            if not s:
-                # If the read list is empty, we got a timeout. We don't
-                # have to check wlist and xlist as we don't set any
-                raise self.handler.timeout_exception(
-                    "socket time-out during read"
-                )
+            if nbytes == 0:
+                self._frame_decoder.reset()
+                raise ConnectionDropped("socket connection broken")
+            self._frame_decoder.buffer_updated(nbytes)
+            packet = self._frame_decoder.pop_packet()
+            if packet is not None:
+                return packet
 
     def _submit(
         self,
@@ -1206,6 +1196,8 @@ class ConnectionHandler:
             self._read_timeout if read_timeout is None else read_timeout
         )
         packet = self._read_packet(eff_timeout)
+        if packet is None:
+            return None
         return self._process_packet(packet)
 
     def _send_request(
