@@ -1377,7 +1377,7 @@ class StateMachineDriver:
         self.state: ClientState = initial_state or Inactive()
         self._effect_executor = effect_executor
         self._event_queue: deque[ClientEvent] = deque()
-        self._dispatch_lock = handler.lock_object()
+        self._dispatch_lock = handler.rlock_object()
         self._processing_events = False
 
     def send_event(self, event: ClientEvent) -> None:
@@ -1385,9 +1385,12 @@ class StateMachineDriver:
 
         The machine state is updated *before* the transition's effects execute,
         so an effect that inspects self.state sees the post-transition state.
-        If an effect raises, the remaining effects of that transition and every
-        event queued by re-entrant send_event calls are discarded; the caller
-        is expected to drop the connection.
+        Holding an RLock across the outermost dispatch ensures cross-thread
+        callers wait synchronously rather than returning early or having their
+        events cleared on exception, while same-thread re-entrant calls queue
+        onto ``_event_queue``. If an effect raises, the remaining effects of
+        that transition and any same-thread re-entrant events are discarded;
+        the caller is expected to drop the connection.
         """
         with self._dispatch_lock:
             if self._processing_events:
@@ -1395,22 +1398,19 @@ class StateMachineDriver:
                 return
             self._processing_events = True
 
-        try:
             current_event: ClientEvent | None = event
-            while current_event is not None:
-                next_state, effects = transition(self.state, current_event)
-                self.state = next_state
-                for effect in effects:
-                    self._effect_executor(effect)
+            try:
+                while current_event is not None:
+                    next_state, effects = transition(self.state, current_event)
+                    self.state = next_state
+                    for effect in effects:
+                        self._effect_executor(effect)
 
-                with self._dispatch_lock:
                     if self._event_queue:
                         current_event = self._event_queue.popleft()
                     else:
-                        self._processing_events = False
                         current_event = None
-        finally:
-            with self._dispatch_lock:
+            finally:
                 if current_event is not None:
                     self._event_queue.clear()
-                    self._processing_events = False
+                self._processing_events = False
