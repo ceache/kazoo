@@ -37,6 +37,7 @@ from kazoo.exceptions import (
     SessionExpiredError,
     SessionMovedError,
     ThrottledOpError,
+    _error_for_code,
 )
 from kazoo.loggingsupport import BLATHER
 from kazoo.protocol.sasl import (
@@ -1112,7 +1113,7 @@ class ConnectionHandler:
 
         # Set the exception if its not an exists error
         if header.err and not exists_error:
-            callback_exception = EXCEPTIONS[header.err]()
+            callback_exception = _error_for_code(header.err)
             self.logger.debug(
                 "Received error(xid=%s) %r", xid, callback_exception
             )

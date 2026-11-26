@@ -1956,3 +1956,72 @@ class TestDataclassPacketsAndFrameDecoder:
 
         with pytest.raises(ConnectionDropped, match="Oversize frame length"):
             dec.pop_packet()
+
+    def test_malformed_wire_fields_and_null_counts(self) -> None:
+        """Negative lengths, null watch paths, counts, and bad multiheaders."""
+        from kazoo.exceptions import MarshallingError, SystemZookeeperError
+
+        stat_bytes = _stat_struct.pack(1, 2, 3, 4, 1, 0, 0, 0, 0, 0, 0)
+        dec = serialization.FrameDecoder(max_buffer=4096)
+
+        # 1. WatchPacket with path length -1 or -2 -> ConnectionDropped
+        for bad_len in (-1, -2):
+            watch_body = serialization.watch_header_struct.pack(
+                -1, 5, 0, 1, 3
+            ) + _int_struct.pack(bad_len)
+            dec.feed(_int_struct.pack(len(watch_body)) + watch_body)
+            with pytest.raises(
+                ConnectionDropped, match="invalid server watch packet"
+            ):
+                dec.pop_packet()
+
+        # 2. GetACL & GetChildren2 with count == -1 unpack stat -> ([], stat)
+        acls_res, end = serialization.GetACL.deserialize(
+            _int_struct.pack(-1) + stat_bytes, 0
+        )
+        assert isinstance(acls_res, tuple)
+        assert acls_res[0] == []
+        assert acls_res[1].czxid == 1
+        assert end == 4 + len(stat_bytes)
+
+        ch2_res, end2 = serialization.GetChildren2.deserialize(
+            _int_struct.pack(-1) + stat_bytes, 0
+        )
+        assert isinstance(ch2_res, tuple)
+        assert ch2_res[0] == []
+        assert ch2_res[1].czxid == 1
+        assert end2 == 4 + len(stat_bytes)
+
+        # count == -2 raises MarshallingError
+        for cls in (
+            serialization.GetACL,
+            serialization.GetChildren,
+            serialization.GetChildren2,
+        ):
+            with pytest.raises(MarshallingError):
+                cls.deserialize(_int_struct.pack(-2) + stat_bytes, 0)
+
+        # 3. Transaction: "" path kept, unknown err -> SystemZookeeperError,
+        # done=2 and unknown op_type -> MarshallingError
+        tx_ok = (
+            serialization.multiheader_struct.pack(
+                serialization.Create.type, 0, -1
+            )
+            + _int_struct.pack(0)
+            + serialization.multiheader_struct.pack(-1, 0, -1)
+            + _int_struct.pack(-999)
+            + serialization.multiheader_struct.pack(-1, 1, -1)
+        )
+        results, _ = serialization.Transaction.deserialize(tx_ok, 0)
+        assert results[0] == ""
+        assert isinstance(results[1], SystemZookeeperError)
+
+        tx_bad_done = serialization.multiheader_struct.pack(-1, 2, -1)
+        with pytest.raises(MarshallingError, match="done flag"):
+            serialization.Transaction.deserialize(tx_bad_done, 0)
+
+        tx_bad_op = serialization.multiheader_struct.pack(
+            999, 0, -1
+        ) + serialization.multiheader_struct.pack(-1, 1, -1)
+        with pytest.raises(MarshallingError, match="Unknown transaction"):
+            serialization.Transaction.deserialize(tx_bad_op, 0)

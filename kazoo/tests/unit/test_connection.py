@@ -2287,3 +2287,23 @@ class TestWakeupOutsideSelect:
         ):
             conn._dispatch_ready_events({"zk_socket"}, None)
         assert isinstance(client.state_machine, Connecting)
+
+    def test_unknown_header_error_resolves_async_result_without_crashing(
+        self,
+    ) -> None:
+        """Unknown wire error codes fail request with SystemZookeeperError."""
+        from kazoo.exceptions import SystemZookeeperError
+
+        client = _make_mock_client()
+        conn = ConnectionHandler(client, KazooRetry())
+        async_obj = Mock()
+        pkt = ResponsePacket(
+            header=ReplyHeader(xid=1, zxid=42, err=-999),
+            request=GetData("/x", None),
+            async_object=async_obj,
+        )
+        assert conn._read_response(pkt) is None
+        async_obj.set_exception.assert_called_once()
+        err = async_obj.set_exception.call_args[0][0]
+        assert isinstance(err, SystemZookeeperError)
+        assert "-999" in str(err)

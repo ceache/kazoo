@@ -10,11 +10,11 @@ from typing import TYPE_CHECKING, ClassVar, TypeVar
 from typing_extensions import dataclass_transform
 
 from kazoo.exceptions import (
-    EXCEPTIONS,
     ConnectionDropped,
     MarshallingError,
     ReplyTooLargeError,
     ZookeeperError,
+    _error_for_code,
 )
 from kazoo.protocol.states import ZnodeStat
 from kazoo.security import ACL, Id, Permissions
@@ -94,7 +94,9 @@ def _read_string(buffer: bytes | memoryview, offset: int) -> tuple[str, int]:
     string and the new offset in the buffer"""
     length = int_struct.unpack_from(buffer, offset)[0]
     offset += int_struct.size
-    if length < 0:
+    if length < -1:
+        raise MarshallingError(f"Invalid string length: {length}")
+    if length == -1:
         # A note: write_str sends a length of -1 to indicate a value of None
         # was passed. Not entirely sure where this happens because none of the
         # callers of read_string seem to expect a None value.
@@ -105,11 +107,24 @@ def _read_string(buffer: bytes | memoryview, offset: int) -> tuple[str, int]:
         return str(buffer[index : index + length], "utf-8"), offset
 
 
+def _read_required_string(
+    buffer: bytes | memoryview, offset: int
+) -> tuple[str, int]:
+    """Read a non-null length-prefixed UTF-8 string from ``buffer``."""
+    length = int_struct.unpack_from(buffer, offset)[0]
+    offset += int_struct.size
+    if length < 0:
+        raise MarshallingError(f"Invalid string length: {length}")
+    index = offset
+    offset += length
+    return str(buffer[index : index + length], "utf-8"), offset
+
+
 def _read_acl(bytes: bytes | memoryview, offset: int) -> tuple[ACL, int]:
     perms = int_struct.unpack_from(bytes, offset)[0]
     offset += int_struct.size
-    scheme, offset = _read_string(bytes, offset)
-    id, offset = _read_string(bytes, offset)
+    scheme, offset = _read_required_string(bytes, offset)
+    id, offset = _read_required_string(bytes, offset)
     return ACL(Permissions(perms), Id(scheme, id)), offset
 
 
@@ -139,7 +154,9 @@ def _read_buffer(
 ) -> tuple[bytes | None, int]:
     length = int_struct.unpack_from(buffer, offset)[0]
     offset += int_struct.size
-    if length < 0:
+    if length < -1:
+        raise MarshallingError(f"Invalid buffer length: {length}")
+    if length == -1:
         return None, offset
     else:
         index = offset
@@ -251,7 +268,7 @@ class Create:
     def deserialize(
         cls, bytes: bytes | memoryview, offset: int
     ) -> tuple[str, int]:
-        return _read_string(bytes, offset)
+        return _read_required_string(bytes, offset)
 
 
 @_packet
@@ -353,12 +370,15 @@ class GetACL:
     @classmethod
     def deserialize(
         cls, bytes: bytes | memoryview, offset: int
-    ) -> tuple[tuple[list[ACL], ZnodeStat] | list[ACL], int]:
+    ) -> tuple[tuple[list[ACL], ZnodeStat], int]:
         count = int_struct.unpack_from(bytes, offset)[0]
         offset += int_struct.size
+        if count < -1:
+            raise MarshallingError(f"Invalid ACL count: {count}")
         if count == -1:  # pragma: nocover
             # A null ACL list is still followed by the stat.
-            return [], offset + stat_struct.size
+            stat = ZnodeStat(*stat_struct.unpack_from(bytes, offset))
+            return ([], stat), offset + stat_struct.size
 
         acls = []
         for c in range(count):
@@ -416,12 +436,14 @@ class GetChildren:
     ) -> tuple[list[str], int]:
         count = int_struct.unpack_from(bytes, offset)[0]
         offset += int_struct.size
+        if count < -1:
+            raise MarshallingError(f"Invalid children count: {count}")
         if count == -1:  # pragma: nocover
             return [], offset
 
         children = []
         for c in range(count):
-            child, offset = _read_string(bytes, offset)
+            child, offset = _read_required_string(bytes, offset)
             children.append(child)
         return children, offset
 
@@ -439,7 +461,7 @@ class Sync:
     def deserialize(
         cls, buffer: bytes | memoryview, offset: int
     ) -> tuple[str, int]:
-        return _read_string(buffer, offset)
+        return _read_required_string(buffer, offset)
 
 
 @_packet
@@ -458,16 +480,19 @@ class GetChildren2:
     @classmethod
     def deserialize(
         cls, bytes: bytes | memoryview, offset: int
-    ) -> tuple[tuple[list[str], ZnodeStat] | list[str], int]:
+    ) -> tuple[tuple[list[str], ZnodeStat], int]:
         count = int_struct.unpack_from(bytes, offset)[0]
         offset += int_struct.size
+        if count < -1:
+            raise MarshallingError(f"Invalid children count: {count}")
         if count == -1:  # pragma: nocover
             # A null children list is still followed by the stat.
-            return [], offset + stat_struct.size
+            stat = ZnodeStat(*stat_struct.unpack_from(bytes, offset))
+            return ([], stat), offset + stat_struct.size
 
         children: list[str] = []
         for c in range(count):
-            child, offset = _read_string(bytes, offset)
+            child, offset = _read_required_string(bytes, offset)
             children.append(child)
         stat = ZnodeStat(*stat_struct.unpack_from(bytes, offset))
         return (children, stat), offset + stat_struct.size
@@ -514,7 +539,7 @@ class Create2:
     def deserialize(
         cls, bytes: bytes | memoryview, offset: int
     ) -> tuple[tuple[str, ZnodeStat], int]:
-        path, offset = _read_string(bytes, offset)
+        path, offset = _read_required_string(bytes, offset)
         stat = ZnodeStat(*stat_struct.unpack_from(bytes, offset))
         return (path, stat), offset + stat_struct.size
 
@@ -546,7 +571,7 @@ class CreateContainer:
     def deserialize(
         cls, bytes: bytes | memoryview, offset: int
     ) -> tuple[tuple[str, ZnodeStat], int]:
-        path, offset = _read_string(bytes, offset)
+        path, offset = _read_required_string(bytes, offset)
         stat = ZnodeStat(*stat_struct.unpack_from(bytes, offset))
         return (path, stat), offset + stat_struct.size
 
@@ -580,7 +605,7 @@ class CreateTTL:
     def deserialize(
         cls, bytes: bytes | memoryview, offset: int
     ) -> tuple[tuple[str, ZnodeStat], int]:
-        path, offset = _read_string(bytes, offset)
+        path, offset = _read_required_string(bytes, offset)
         stat = ZnodeStat(*stat_struct.unpack_from(bytes, offset))
         return (path, stat), offset + stat_struct.size
 
@@ -613,16 +638,18 @@ class Transaction:
 
         op_type, done, _ = unpack_hdr(bytes, offset)
         offset += hdr_size
+        if done not in (0, 1):
+            raise MarshallingError(f"Invalid MultiHeader done flag: {done}")
         while not done:
             response: _TransOpsResponse = None
             if op_type == Create.type:
-                response, offset = _read_string(bytes, offset)
+                response, offset = _read_required_string(bytes, offset)
             elif op_type in (
                 Create2.type,
                 CreateContainer.type,
                 CreateTTL.type,
             ):
-                path, offset = _read_string(bytes, offset)
+                path, offset = _read_required_string(bytes, offset)
                 stat = ZnodeStat._make(unpack_stat(bytes, offset))
                 offset += stat_size
                 response = (path, stat)
@@ -634,11 +661,19 @@ class Transaction:
             elif op_type == -1:
                 err = unpack_int(bytes, offset)[0]
                 offset += int_size
-                response = EXCEPTIONS[err]()
-            if response:
+                response = _error_for_code(err)
+            else:
+                raise MarshallingError(
+                    f"Unknown transaction op_type: {op_type}"
+                )
+            if response is not None:
                 results.append(response)
             op_type, done, _ = unpack_hdr(bytes, offset)
             offset += hdr_size
+            if done not in (0, 1):
+                raise MarshallingError(
+                    f"Invalid MultiHeader done flag: {done}"
+                )
         return results, offset
 
     @staticmethod
@@ -855,7 +890,9 @@ class WatchPacket:
         _, zxid, _, watch_type, state = watch_header_struct.unpack_from(
             buffer, offset
         )
-        path, offset = _read_string(buffer, offset + watch_header_struct.size)
+        path, offset = _read_required_string(
+            buffer, offset + watch_header_struct.size
+        )
         return (
             cls(zxid=zxid, type=watch_type, state=state, path=path),
             offset,
@@ -1270,7 +1307,11 @@ class FrameDecoder:
             if xid == ReservedXID.WATCH:
                 try:
                     watch_packet, end = WatchPacket.deserialize(frame, 0)
-                except (struct.error, UnicodeDecodeError) as e:
+                except (
+                    struct.error,
+                    UnicodeDecodeError,
+                    MarshallingError,
+                ) as e:
                     raise ConnectionDropped(
                         "invalid server watch packet"
                     ) from e
@@ -1294,7 +1335,7 @@ class FrameDecoder:
             if not err:
                 try:
                     challenge, end = SASL.deserialize(frame, 16)
-                except struct.error as e:
+                except (struct.error, MarshallingError) as e:
                     raise ConnectionDropped(
                         "invalid server SASL response"
                     ) from e
