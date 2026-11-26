@@ -1074,12 +1074,12 @@ class ConnectionHandler:
         while sent < msg_length:
             rem_timeout = max(0.0, deadline - time.monotonic())
             if write_sel is not None:
-                ready = write_sel.select(rem_timeout)
+                is_ready = bool(write_sel.select(rem_timeout))
             else:
-                ready = self.handler.select(
-                    [], [self._socket], [], rem_timeout
-                )[1]
-            if not ready:
+                is_ready = bool(
+                    self.handler.select([], [self._socket], [], rem_timeout)[1]
+                )
+            if not is_ready:
                 raise self.handler.timeout_exception(
                     "socket time-out during write"
                 )
@@ -1647,8 +1647,8 @@ class ConnectionHandler:
                     should_yield
                     and self.client._state_machine.state.is_connected
                 ):
-                    deadline, _ = self._get_heartbeat_deadline()
-                    self._check_session_health(deadline)
+                    hb_deadline, _ = self._get_heartbeat_deadline()
+                    self._check_session_health(hb_deadline)
             else:
                 self._emit_event(SOCKET_READABLE)
             return
