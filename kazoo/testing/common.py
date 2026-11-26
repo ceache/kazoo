@@ -881,7 +881,8 @@ def _export_krb5_client_env(
     kinit_env.pop("KRB5CCNAME", None)
     kinit_rc = 1
     kinit_err = ""
-    for _ in range(3):
+    for attempt in range(3):
+        ccache.unlink(missing_ok=True)
         kinit_proc = subprocess.run(
             [
                 "kinit",
@@ -899,7 +900,8 @@ def _export_krb5_client_env(
         if kinit_rc == 0:
             break
         kinit_err = getattr(kinit_proc, "stderr", None) or ""
-        time.sleep(0.1)
+        if attempt < 2:
+            time.sleep(0.1)
 
     if kinit_rc != 0:
         err_msg = f": {kinit_err.strip()}" if kinit_err.strip() else ""
