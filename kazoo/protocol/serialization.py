@@ -871,6 +871,7 @@ class WatchPacket:
     def deserialize(
         cls, buffer: bytes | memoryview, offset: int
     ) -> tuple[WatchPacket, int]:
+        """Direct/test helper; bypassed by FrameDecoder._decode_packet()."""
         _, zxid, _, watch_type, state = watch_header_struct.unpack_from(
             buffer, offset
         )
@@ -928,6 +929,22 @@ class ResponsePacket:
 
 class FrameDecoder:
     """Sans-I/O length-prefixed frame codec and server packet decoder."""
+
+    __slots__ = (
+        "_max_buffer",
+        "_max_payload",
+        "_max_frame",
+        "_capacity",
+        "_buf",
+        "_view",
+        "_empty_view",
+        "_head",
+        "_tail",
+        "_scan",
+        "_frame_len",
+        "_skip",
+        "_pop_pending",
+    )
 
     def __init__(
         self,
@@ -1327,7 +1344,10 @@ class FrameDecoder:
                 return connect_result
             if xid == ReservedXID.WATCH:
                 try:
-                    watch_packet, end = WatchPacket.deserialize(frame, 0)
+                    watch_type, state = int_int_struct.unpack_from(frame, 16)
+                    path, end = _read_required_string(
+                        frame, watch_header_struct.size
+                    )
                 except (
                     struct.error,
                     UnicodeDecodeError,
@@ -1341,7 +1361,9 @@ class FrameDecoder:
                         f"invalid server watch packet: parsed {end} "
                         f"of {size} bytes"
                     )
-                return watch_packet
+                return WatchPacket(
+                    zxid=zxid, type=watch_type, state=state, path=path
+                )
             if xid == ReservedXID.PING:
                 return PingResponse(zxid=zxid, err=err)
             if xid == ReservedXID.AUTH:

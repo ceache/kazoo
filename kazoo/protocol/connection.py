@@ -156,6 +156,8 @@ class RequestManager:
     XID sequence generation.
     """
 
+    __slots__ = ("queue", "pending", "auth_pending", "xid")
+
     def __init__(self) -> None:
         self.queue: deque[tuple[Any, IAsyncResult | None]] = deque()
         self.pending: deque[tuple[Any, IAsyncResult | None, int]] = deque()
@@ -274,6 +276,13 @@ class RequestManager:
 class WatcherManager:
     """Encapsulates client data, child, persistent, and recursive watchers."""
 
+    __slots__ = (
+        "child_watchers",
+        "data_watchers",
+        "persistent_watchers",
+        "persistent_recursive_watchers",
+    )
+
     def __init__(self) -> None:
         self.child_watchers: defaultdict[str, set[WatchFunc]] = defaultdict(
             set
@@ -288,6 +297,9 @@ class WatcherManager:
 
     def find_persistent_recursive(self, path: str) -> list[WatchFunc]:
         """Return persistent recursive watchers matching path or ancestors."""
+        pr_watchers = self.persistent_recursive_watchers
+        if not pr_watchers:
+            return []
         watchers: list[WatchFunc] = []
         candidates = ["/"]
         stripped = path.strip("/")
@@ -296,7 +308,6 @@ class WatcherManager:
             candidates.extend(
                 "/" + "/".join(parts[: i + 1]) for i in range(len(parts))
             )
-        pr_watchers = self.persistent_recursive_watchers
         for candidate in candidates:
             watchers.extend(pr_watchers.get(candidate, []))
         return watchers
@@ -1004,12 +1015,14 @@ class ConnectionHandler:
     ) -> None:
         """Submit a request object with a timeout value and optional
         xid"""
-        self.logger.log(
-            (BLATHER if isinstance(request, Ping) else logging.DEBUG),
-            "Sending request(xid=%s): %s",
-            xid,
-            request,
-        )
+        level = BLATHER if isinstance(request, Ping) else logging.DEBUG
+        if self.logger.isEnabledFor(level):
+            self.logger.log(
+                level,
+                "Sending request(xid=%s): %s",
+                xid,
+                request,
+            )
         self._write(FrameDecoder.encode_request(request, xid), timeout)
 
     def _write(
@@ -1097,11 +1110,14 @@ class ConnectionHandler:
         client = self.client
         path = watch.path
 
-        self.logger.debug("Received EVENT: %s", watch)
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("Received EVENT: %s", watch)
 
         watchers = self._watchers.collect_for_event(watch.type, path)
         if watchers is None:
             self.logger.warning("Received unknown event %r", watch.type)
+            return
+        if not watchers:
             return
 
         # Strip the chroot if needed
@@ -1158,9 +1174,10 @@ class ConnectionHandler:
         # Set the exception if its not an exists error
         if header.err and not exists_error:
             callback_exception = _error_for_code(header.err)
-            self.logger.debug(
-                "Received error(xid=%s) %r", xid, callback_exception
-            )
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(
+                    "Received error(xid=%s) %r", xid, callback_exception
+                )
             if async_object:
                 async_object.set_exception(callback_exception)
         elif request and async_object:
@@ -1170,9 +1187,10 @@ class ConnectionHandler:
                 response = None
             else:
                 response = packet.response
-                self.logger.debug(
-                    "Received response(xid=%s): %r", xid, response
-                )
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    self.logger.debug(
+                        "Received response(xid=%s): %r", xid, response
+                    )
 
                 # We special case a Transaction as we have to unchroot things
                 if request.type == Transaction.type:
@@ -1204,7 +1222,8 @@ class ConnectionHandler:
                     raise ConnectionDropped(
                         f"Unexpected PingResponse in {type(state).__name__}"
                     )
-                self.logger.log(BLATHER, "Received Ping")
+                if self.logger.isEnabledFor(BLATHER):
+                    self.logger.log(BLATHER, "Received Ping")
                 self._emit_event(PING_RECEIVED)
             case AuthResponse(zxid=zxid, err=err_code):
                 if not (
@@ -1307,9 +1326,10 @@ class ConnectionHandler:
                     raise ConnectionDropped(
                         f"Unexpected ResponsePacket in {type(state).__name__}"
                     )
-                self.logger.log(
-                    BLATHER, "Reading for header %r", packet.header
-                )
+                if self.logger.isEnabledFor(BLATHER):
+                    self.logger.log(
+                        BLATHER, "Reading for header %r", packet.header
+                    )
                 return self._read_response(packet)
         return None
 
