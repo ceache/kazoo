@@ -83,6 +83,13 @@ EXCEPTIONS: defaultdict[int, type[ZookeeperError]] = defaultdict(
 )
 
 
+def _error_for_code(code: int) -> ZookeeperError:
+    """Return a ZookeeperError instance for a ZooKeeper wire error code."""
+    if code in EXCEPTIONS:
+        return EXCEPTIONS[code]()
+    return SystemZookeeperError(f"Unknown error code: {code}")
+
+
 def _zookeeper_exception(
     code: int,
 ) -> Callable[[type[ZookeeperError]], type[ZookeeperError]]:
