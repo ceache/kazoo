@@ -954,20 +954,29 @@ class FrameDecoder:
             if avail >= 8:
                 msg_len, xid = int_int_struct.unpack_from(buf, s)
                 if msg_len < 16:
-                    raise ConnectionDropped(f"Invalid frame length: {msg_len}")
+                    if s == self._head:
+                        raise ConnectionDropped(
+                            f"Invalid frame length: {msg_len}"
+                        )
+                    break
                 if s == self._head:
                     self._frame_len = msg_len
                 if msg_len > max_payload:
                     if xid <= 0:
-                        raise ConnectionDropped(
-                            f"Oversize frame length {msg_len} for non-request "
-                            f"xid {xid}"
-                        )
+                        if s == self._head:
+                            raise ConnectionDropped(
+                                f"Oversize frame length {msg_len} for "
+                                f"non-request xid {xid}"
+                            )
                     break
             else:
                 msg_len = int_struct.unpack_from(buf, s)[0]
                 if msg_len < 16:
-                    raise ConnectionDropped(f"Invalid frame length: {msg_len}")
+                    if s == self._head:
+                        raise ConnectionDropped(
+                            f"Invalid frame length: {msg_len}"
+                        )
+                    break
                 if s == self._head:
                     self._frame_len = msg_len
                 break
@@ -1039,8 +1048,16 @@ class FrameDecoder:
                 else int_struct.unpack_from(self._buf, s)[0]
             )
             if msg_len < 16:
+                if s > head:
+                    raise BufferError("pop frames before requesting a buffer")
                 raise ConnectionDropped(f"Invalid frame length: {msg_len}")
             if msg_len > self._max_payload:
+                if s > head and avail >= 8:
+                    xid = int_struct.unpack_from(self._buf, s + 4)[0]
+                    if xid <= 0:
+                        raise BufferError(
+                            "pop frames before requesting a buffer"
+                        )
                 if avail >= 20:
                     raise BufferError("pop frames before requesting a buffer")
                 end = s + 20 if s + 20 > READ_WINDOW else READ_WINDOW

@@ -1899,3 +1899,60 @@ class TestDataclassPacketsAndFrameDecoder:
             pass
         dec.reset()
         assert len(dec._buf) == orig_cap
+
+    def test_coalesced_valid_reply_preceding_corrupt_header_is_delivered(
+        self,
+    ) -> None:
+        """Corrupt trailing header does not discard earlier valid reply."""
+        pending: collections.deque[tuple[object, object, int]] = (
+            collections.deque(
+                [
+                    (serialization.Create("/a", b"", [], 0), "res1", 1),
+                    (serialization.Create("/b", b"", [], 0), "res2", 2),
+                ]
+            )
+        )
+        dec = serialization.FrameDecoder(
+            max_buffer=256, pop_pending=pending.popleft
+        )
+
+        # 1. Valid Create reply coalesced with msg_len < 16 corrupt header.
+        valid_body = _reply_header_struct.pack(1, 10, 0) + _write_string("/a")
+        valid_frame = _int_struct.pack(len(valid_body)) + valid_body
+        corrupt_short = _int_struct.pack(4) + b"\x00" * 4
+
+        buf = dec.get_buffer()
+        coalesced = valid_frame + corrupt_short
+        buf[: len(coalesced)] = coalesced
+        dec.buffer_updated(len(coalesced))
+
+        # Requesting a buffer before popping valid frames raises BufferError
+        with pytest.raises(BufferError, match="pop frames"):
+            dec.get_buffer()
+
+        pkt = dec.pop_packet()
+        assert isinstance(pkt, serialization.ResponsePacket)
+        assert pkt.response == "/a"
+        assert pkt.async_object == "res1"
+
+        with pytest.raises(ConnectionDropped, match="Invalid frame length"):
+            dec.pop_packet()
+
+        # 2. Valid Create reply coalesced with oversize non-request xid (-1).
+        dec.reset()
+        valid_body2 = _reply_header_struct.pack(2, 11, 0) + _write_string("/b")
+        valid_frame2 = _int_struct.pack(len(valid_body2)) + valid_body2
+        oversize_watch = _int_struct.pack(1024) + _int_struct.pack(-1)
+
+        buf = dec.get_buffer()
+        coalesced2 = valid_frame2 + oversize_watch
+        buf[: len(coalesced2)] = coalesced2
+        dec.buffer_updated(len(coalesced2))
+
+        pkt2 = dec.pop_packet()
+        assert isinstance(pkt2, serialization.ResponsePacket)
+        assert pkt2.response == "/b"
+        assert pkt2.async_object == "res2"
+
+        with pytest.raises(ConnectionDropped, match="Oversize frame length"):
+            dec.pop_packet()
