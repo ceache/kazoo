@@ -70,9 +70,11 @@ from kazoo.protocol.statemachine import (
     POLL_TIMEOUT_EXPIRED,
     SOCKET_READABLE,
     WAKEUP_SIGNALED,
+    Authenticating,
     AuthFailed,
     AuthFailedEvent,
     AuthPacketCompleted,
+    AuthStage,
     ClientEvent,
     CloseSocket,
     ConfigureReadOnlyMode,
@@ -527,6 +529,7 @@ class ConnectionHandler:
         self._last_send: float = 0.0
         self._read_timeout: float = 10.0
         self._connect_timeout: float = 10.0
+        self._phase_deadline: float | None = None
 
         self.sasl_config: SASLConfig | None = sasl_config
         self._sasl_exchange: SASLExchange | None = None
@@ -599,6 +602,7 @@ class ConnectionHandler:
             self._socket = None
         self._socket_is_ssl = False
         self._replies_since_select = 0
+        self._phase_deadline = None
         self._frame_decoder.reset()
 
     def _update_io_interest(
@@ -692,12 +696,15 @@ class ConnectionHandler:
                 self._last_send = time.monotonic()
 
             case StartSASLHandshake(host=host):
+                self._phase_deadline = time.monotonic() + self._connect_timeout
                 self._start_sasl(host)
 
             case StepSASLHandshake(challenge=challenge):
+                self._phase_deadline = time.monotonic() + self._connect_timeout
                 self._step_sasl(challenge)
 
             case SendAuthPacket(scheme=scheme, credential=credential):
+                self._phase_deadline = time.monotonic() + self._connect_timeout
                 self._submit(
                     Auth(0, scheme, credential),
                     self._connect_timeout,
@@ -713,6 +720,7 @@ class ConnectionHandler:
                 self._close_socket()
 
             case SessionEstablished():
+                self._phase_deadline = None
                 if self._current_retry is not None:
                     self._current_retry.reset()
                 if self._requests.queue:
@@ -728,11 +736,20 @@ class ConnectionHandler:
 
             case SendConnectPacket(connect=connect, timeout=timeout):
                 self._connect_timeout = timeout
+                self._phase_deadline = time.monotonic() + timeout
                 self._submit(connect, timeout)
                 self._last_send = time.monotonic()
 
             case ReadConnectResponsePacket():
-                self._read_socket(self._connect_timeout)
+                packet = self._read_packet(self._connect_timeout)
+                if packet is None:
+                    return
+                if not isinstance(packet, Connect):
+                    raise ConnectionDropped(
+                        "Unexpected packet during handshake: "
+                        f"{type(packet).__name__}"
+                    )
+                self._process_packet(packet)
 
             case UpdateSessionData(
                 session_id=sid,
@@ -1128,15 +1145,30 @@ class ConnectionHandler:
     def _process_packet(self, packet: ServerPacket) -> object | None:
         """Process a decoded ServerPacket from FrameDecoder."""
         client = self.client
+        state = client._state_machine.state
         match packet:
             case Connect():
                 self._emit_event(
                     ConnectResponseReceived(connect_result=packet)
                 )
             case PingResponse():
+                if not self._is_session_active:
+                    raise ConnectionDropped(
+                        f"Unexpected PingResponse in {type(state).__name__}"
+                    )
                 self.logger.log(BLATHER, "Received Ping")
                 self._emit_event(PING_RECEIVED)
             case AuthResponse(zxid=zxid, err=err_code):
+                if not (
+                    self._is_session_active
+                    or (
+                        isinstance(state, Authenticating)
+                        and state.stage == AuthStage.INITIAL_AUTH
+                    )
+                ):
+                    raise ConnectionDropped(
+                        f"Unexpected AuthResponse in {type(state).__name__}"
+                    )
                 self.logger.log(BLATHER, "Received AUTH")
                 if zxid and zxid > 0:
                     client.last_zxid = zxid
@@ -1157,10 +1189,21 @@ class ConnectionHandler:
                         async_object.set(True)
                     self._emit_event(AuthPacketCompleted())
             case WatchPacket():
+                if not self._is_session_active:
+                    raise ConnectionDropped(
+                        f"Unexpected WatchPacket in {type(state).__name__}"
+                    )
                 self._read_watch_event(packet)
             case SASLResponse(
                 xid=xid, zxid=zxid, err=err_code, challenge=challenge
             ):
+                if not (
+                    isinstance(state, Authenticating)
+                    and state.stage == AuthStage.SASL
+                ):
+                    raise ConnectionDropped(
+                        f"Unexpected SASLResponse in {type(state).__name__}"
+                    )
                 if zxid > 0:
                     client.last_zxid = zxid
                 if err_code:
@@ -1198,6 +1241,10 @@ class ConnectionHandler:
                     ) from callback_exception
                 self._emit_event(SASLChallengeReceived(challenge=challenge))
             case ResponsePacket():
+                if not self._is_session_active:
+                    raise ConnectionDropped(
+                        f"Unexpected ResponsePacket in {type(state).__name__}"
+                    )
                 self.logger.log(
                     BLATHER, "Reading for header %r", packet.header
                 )
@@ -1340,6 +1387,9 @@ class ConnectionHandler:
     def _compute_poll_timeout(self) -> tuple[float, float | None]:
         """Compute the selector timeout and optional heartbeat deadline."""
         if not self._is_session_active:
+            if self._phase_deadline is not None:
+                rem = max(0.0, self._phase_deadline - time.monotonic())
+                return rem, None
             return self._connect_timeout, None
 
         jitter_time = random.randint(1, 40) / 100.0
@@ -1392,6 +1442,12 @@ class ConnectionHandler:
             and time.monotonic() >= deadline
         ):
             self._emit_event(HEARTBEAT_DEADLINE_REACHED)
+        elif (
+            not self._is_session_active
+            and self._phase_deadline is not None
+            and time.monotonic() >= self._phase_deadline
+        ):
+            self._emit_event(POLL_TIMEOUT_EXPIRED)
 
         return False
 

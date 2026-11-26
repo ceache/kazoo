@@ -2151,7 +2151,12 @@ class TestWakeupOutsideSelect:
         with pytest.raises(SASLException, match="SASL init failed"):
             SASLExchange(cfg, "127.0.0.1", client_factory=failing_factory)
 
+        from kazoo.protocol.statemachine import Authenticating, AuthStage
+
         client = _make_mock_client()
+        client._state_machine.state = Authenticating(
+            stage=AuthStage.SASL, host="127.0.0.1", port=2181
+        )
         conn = ConnectionHandler(client, KazooRetry())
 
         # Permanent/unknown codes raise AuthFailedError
@@ -2169,3 +2174,72 @@ class TestWakeupOutsideSelect:
             conn._process_packet(
                 SASLResponse(xid=1, zxid=12, err=SessionExpiredError.code)
             )
+
+    def test_pre_session_frames_rejected_and_handshake_deadline_bounded(
+        self,
+    ) -> None:
+        """Pre-session Watch/Ping/Auth frames raise ConnectionDropped."""
+        from kazoo.protocol.serialization import (
+            AuthResponse,
+            PingResponse,
+            WatchPacket,
+        )
+        from kazoo.protocol.statemachine import (
+            Authenticating,
+            AuthStage,
+            Handshaking,
+        )
+
+        client = KazooClient(hosts="127.0.0.1:2181")
+        conn = client._connection
+        watcher = Mock()
+        conn._watchers.data_watchers["/z"].add(watcher)
+        client.last_zxid = 5
+
+        # 1. During Handshaking: WatchPacket, PingResponse, AuthResponse fail
+        # with ConnectionDropped without popping watchers or mutating zxid.
+        client._state_machine.state = Handshaking(host="127.0.0.1", port=2181)
+        for bad_pkt in (
+            WatchPacket(zxid=10, type=1, state=3, path="/z"),
+            PingResponse(zxid=10, err=0),
+            AuthResponse(zxid=99, err=-115),
+            AuthResponse(zxid=99, err=0),
+        ):
+            with patch.object(conn, "_read_packet", return_value=bad_pkt):
+                with pytest.raises(ConnectionDropped):
+                    conn.execute_effect(ReadConnectResponsePacket())
+        assert watcher in conn._watchers.data_watchers["/z"]
+        assert client.last_zxid == 5
+        assert isinstance(client.state_machine, Handshaking)
+
+        # 2. During Authenticating(SASL): Watch/Ping/Auth are rejected.
+        client._state_machine.state = Authenticating(
+            stage=AuthStage.SASL, host="127.0.0.1", port=2181
+        )
+        for bad_pkt in (
+            WatchPacket(zxid=10, type=1, state=3, path="/z"),
+            PingResponse(zxid=10, err=0),
+            AuthResponse(zxid=99, err=-115),
+        ):
+            with pytest.raises(ConnectionDropped):
+                conn._process_packet(bad_pkt)
+        assert watcher in conn._watchers.data_watchers["/z"]
+        assert client.last_zxid == 5
+        assert isinstance(client.state_machine, Authenticating)
+
+        # 3. Handshaking monotonic deadline expires even when trickle reads
+        # return None on ready socket.
+        client._state_machine.state = Handshaking(host="127.0.0.1", port=2181)
+        conn._connect_timeout = 5.0
+        conn._phase_deadline = 100.0
+        with patch("time.monotonic", return_value=98.0):
+            timeout, deadline = conn._compute_poll_timeout()
+            assert timeout == pytest.approx(2.0)
+            assert deadline is None
+
+        with (
+            patch("time.monotonic", return_value=101.0),
+            patch.object(conn, "_read_packet", return_value=None),
+        ):
+            conn._dispatch_ready_events({"zk_socket"}, None)
+        assert isinstance(client.state_machine, Connecting)
