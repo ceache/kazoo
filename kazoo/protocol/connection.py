@@ -163,6 +163,7 @@ class RequestManager:
     def __init__(self) -> None:
         self.queue: deque[tuple[Any, IAsyncResult | None]] = deque()
         self.pending: deque[tuple[Any, IAsyncResult | None, int]] = deque()
+        self.auth_pending: deque[IAsyncResult | None] = deque()
         self.xid: int | None = None
 
     def reset_xid(self, value: int = 0) -> None:
@@ -199,7 +200,10 @@ class RequestManager:
     def dequeue_to_pending(self, xid: int) -> tuple[Any, IAsyncResult | None]:
         """Pop the oldest queued request and record it as pending with xid."""
         request, async_object = self.queue.popleft()
-        self.pending.append((request, async_object, xid))
+        if xid == ReservedXID.AUTH:
+            self.auth_pending.append(async_object)
+        else:
+            self.pending.append((request, async_object, xid))
         return request, async_object
 
     def pop_pending(self) -> tuple[Any, IAsyncResult | None, int]:
@@ -209,7 +213,9 @@ class RequestManager:
     def pop_auth_pending(
         self, auth_xid: int = ReservedXID.AUTH
     ) -> IAsyncResult | None:
-        """Find and remove the first pending Auth request matching auth_xid."""
+        """Pop the oldest pending Auth request (or fallback scan pending)."""
+        if self.auth_pending:
+            return self.auth_pending.popleft()
         pending = self.pending
         for idx, (_, a_obj, xid) in enumerate(pending):
             if xid == auth_xid:
@@ -219,7 +225,9 @@ class RequestManager:
 
     def has_send_capacity(self, limit: int | None) -> bool:
         """Return True if the number of pending requests is below limit."""
-        return limit is None or len(self.pending) < limit
+        return (
+            limit is None or len(self.pending) + len(self.auth_pending) < limit
+        )
 
     def fail_all(self, state: KeeperState) -> None:
         """Fail all pending and queued requests with the state's exception."""
@@ -240,6 +248,15 @@ class RequestManager:
             except IndexError:
                 break
 
+        auth_pending = self.auth_pending
+        while True:
+            try:
+                async_object = auth_pending.popleft()
+                if async_object:
+                    async_object.set_exception(exc)
+            except IndexError:
+                break
+
         queue = self.queue
         while True:
             try:
@@ -255,6 +272,7 @@ class RequestManager:
             self.fail_all(state)
         self.queue = deque()
         self.pending = deque()
+        self.auth_pending = deque()
 
 
 class WatcherManager:

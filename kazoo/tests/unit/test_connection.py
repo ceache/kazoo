@@ -2307,3 +2307,43 @@ class TestWakeupOutsideSelect:
         err = async_obj.set_exception.call_args[0][0]
         assert isinstance(err, SystemZookeeperError)
         assert "-999" in str(err)
+
+    def test_runtime_auth_pending_isolated_from_positive_xid_fifo(
+        self,
+    ) -> None:
+        """Out-of-order GetData reply before AuthResponse does not mismatch."""
+        from kazoo.protocol.serialization import Auth
+
+        client = KazooClient(hosts="127.0.0.1:2181")
+        conn = client._connection
+        client._state_machine.state = Connected(host="127.0.0.1", port=2181)
+        conn._socket = Mock()
+        conn._socket.send.side_effect = lambda v: len(v)
+        conn._requests.reset_xid(0)
+
+        auth_res = client.handler.async_result()
+        get_res = client.handler.async_result()
+        conn._requests.enqueue(Auth(0, "digest", "u:p"), auth_res)
+        conn._requests.enqueue(GetData("/k", None), get_res)
+
+        conn._send_request(10.0, 10.0)
+        assert len(conn._requests.auth_pending) == 1
+        assert len(conn._requests.pending) == 1
+
+        # Server answers GetData (xid=1) BEFORE AuthResponse (xid=-4).
+        getdata_wire = (
+            TestConnectionRecvIntoAndBurstScheduling._make_getdata_wire(
+                1, b"val"
+            )
+        )
+        auth_body = reply_header_struct.pack(-4, 20, 0)
+        auth_wire = int_struct.pack(len(auth_body)) + auth_body
+
+        conn._frame_decoder.feed(getdata_wire + auth_wire)
+        conn._read_socket()
+        conn._read_socket()
+
+        assert get_res.get_nowait()[0] == b"val"
+        assert auth_res.get_nowait() is True
+        assert len(conn._requests.pending) == 0
+        assert len(conn._requests.auth_pending) == 0
