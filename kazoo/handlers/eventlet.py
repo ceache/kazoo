@@ -87,11 +87,13 @@ class _EventletSelector(selectors.BaseSelector):
     def select(
         self, timeout: float | None = None
     ) -> list[tuple[selectors.SelectorKey, int]]:
-        with _yield_before_after():
+        try:
             return cast(
                 "list[tuple[selectors.SelectorKey, int]]",
                 self._selector.select(timeout),
             )
+        finally:
+            eventlet.sleep(0)  # type: ignore[no-untyped-call]
 
     def close(self) -> None:
         self._selector.close()
