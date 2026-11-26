@@ -66,8 +66,6 @@ from kazoo.protocol.statemachine import (
     PING_RECEIVED,
     POLL_TIMEOUT_EXPIRED,
     SOCKET_READABLE,
-    UPDATE_SEND_CAPACITY_FALSE,
-    UPDATE_SEND_CAPACITY_TRUE,
     WAKEUP_SIGNALED,
     AuthFailed,
     AuthFailedEvent,
@@ -100,7 +98,6 @@ from kazoo.protocol.statemachine import (
     StartSASLHandshake,
     StepSASLHandshake,
     StopConnectionLoop,
-    UpdateIOInterest,
     UpdateSessionData,
 )
 from kazoo.protocol.states import (
@@ -506,9 +503,6 @@ class ConnectionHandler:
         self._socket: Socket | None = None
         self._socket_is_ssl: bool = False
         self._selector: selectors.BaseSelector | None = None
-        # _update_io_interest runs on the connection routine and, for
-        # StopConnectionLoop, on the thread that called client.stop().
-        self._selector_lock = client.handler.lock_object()
         self._requests: RequestManager = client._request_manager
         self._watchers: WatcherManager = client._watcher_manager
         self._frame_decoder = FrameDecoder(
@@ -609,26 +603,25 @@ class ConnectionHandler:
     ) -> None:
         """Set the selector registration for the target socket.
 
-        Safe to call from the connection routine and from a thread running
-        a state machine effect at the same time.
+        Called exclusively from the connection routine (and in stop() only
+        after the connection routine has exited).
         """
         sock = self._read_sock if target == "wakeup" else self._socket
-        with self._selector_lock:
-            sel = self._selector
-            if sock is None or sel is None:
-                return
-            if interest_mask:
-                # Usually a transition from unregistered, so register
-                # first: a modify() miss costs more than a register() hit.
-                try:
-                    sel.register(sock, interest_mask, data=target)
-                except KeyError:
-                    sel.modify(sock, interest_mask, data=target)
-            else:
-                try:
-                    sel.unregister(sock)
-                except (KeyError, ValueError):
-                    pass
+        sel = self._selector
+        if sock is None or sel is None:
+            return
+        if interest_mask:
+            # Usually a transition from unregistered, so register
+            # first: a modify() miss costs more than a register() hit.
+            try:
+                sel.register(sock, interest_mask, data=target)
+            except KeyError:
+                sel.modify(sock, interest_mask, data=target)
+        else:
+            try:
+                sel.unregister(sock)
+            except (KeyError, ValueError):
+                pass
 
     def _select(self, timeout: float) -> set[str]:
         """Wait for readable events on the persistent selector."""
@@ -688,11 +681,8 @@ class ConnectionHandler:
             case ReadSocketPacket():
                 self._read_socket(self._read_timeout)
 
-            case UpdateIOInterest(interest_mask=mask, target=target):
-                self._update_io_interest(mask, target)
-
             case DrainWakeupPipe():
-                self._release_wakeup()
+                self._drain_wakeup()
 
             case SendHeartbeatPing():
                 self._send_ping(self._connect_timeout)
@@ -731,7 +721,6 @@ class ConnectionHandler:
                     self._current_retry.reset()
 
             case StopConnectionLoop():
-                self._update_io_interest(selectors.EVENT_READ, "wakeup")
                 self.wake()
 
             case SendConnectPacket(connect=connect, timeout=timeout):
@@ -1330,26 +1319,6 @@ class ConnectionHandler:
         timeout = max(deadline - time.monotonic(), jitter_time)
         return timeout, deadline
 
-    def _update_send_capacity(self) -> None:
-        """Evaluate request queuing interest and notify state machine."""
-        state = self.client._state_machine.state
-        can_send = (
-            state.is_terminal
-            or not state.is_connecting_allowed
-            or self._requests.has_send_capacity(
-                self.client.concurrent_request_limit
-            )
-        )
-        # While connected the machine changes state only when can_send
-        # differs from wakeup_interested, so skip the event otherwise.
-        if can_send == state.wakeup_interested:
-            return
-        self._emit_event(
-            UPDATE_SEND_CAPACITY_TRUE
-            if can_send
-            else UPDATE_SEND_CAPACITY_FALSE
-        )
-
     def _dispatch_ready_events(
         self, ready: set[str], deadline: float | None
     ) -> bool:
@@ -1378,7 +1347,7 @@ class ConnectionHandler:
             # Check if any requests need sending before proceeding
             # to process more responses. Otherwise the responses
             # may choke out the requests. See PR#633.
-            if "wakeup" in ready and self._wakeup_registered:
+            if "wakeup" in ready:
                 self._drain_wakeup()
                 if self._is_session_active:
                     self._send_request(
@@ -1403,7 +1372,6 @@ class ConnectionHandler:
         timeout, deadline = self._compute_poll_timeout()
 
         if self._is_session_active:
-            self._update_send_capacity()
             if self._requests.queue and self._requests.has_send_capacity(
                 self.client.concurrent_request_limit
             ):

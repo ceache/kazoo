@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import collections
 import logging
-import selectors
 import threading
 import time
 from collections.abc import Iterator
@@ -67,9 +66,7 @@ from kazoo.protocol.statemachine import (
     ResetSessionData,
     SendConnectPacket,
     SocketReadable,
-    UpdateSendCapacity,
     WakeUpSignaled,
-    transition,
 )
 from kazoo.protocol.states import KeeperState
 from kazoo.retry import KazooRetry, RetryFailedError
@@ -1004,20 +1001,6 @@ class TestConnectionIOLoopDecomposition:
             assert deadline is not None
             assert timeout > 0
 
-    def test_update_send_capacity(self) -> None:
-        client = _make_mock_client()
-        client.concurrent_request_limit = 5
-        conn = ConnectionHandler(client, KazooRetry())
-        conn._requests.pending = [1, 2]  # type: ignore[assignment]
-
-        events: list[Any] = []
-        conn._emit_event = events.append  # type: ignore[method-assign]
-        conn._update_send_capacity()
-
-        assert len(events) == 1
-        assert isinstance(events[0], UpdateSendCapacity)
-        assert events[0].can_send is True
-
     def test_dispatch_ready_events(self) -> None:
         client = _make_mock_client()
         conn = ConnectionHandler(client, KazooRetry())
@@ -1373,81 +1356,6 @@ class TestConnectionIOLoopDecomposition:
         # by transport)
         assert isinstance(client.state_machine, Connecting)
 
-    def test_update_send_capacity_deduplicates_events(self) -> None:
-        client = _make_mock_client()
-        client.concurrent_request_limit = 1
-        sm = client._state_machine
-        sm.state = Connected(host="127.0.0.1", port=2181)
-        conn = ConnectionHandler(client, KazooRetry())
-        events: list[Any] = []
-
-        def emit(event: Any) -> None:
-            events.append(event)
-            sm.state, _ = transition(sm.state, event)
-
-        conn._emit_event = emit  # type: ignore[method-assign]
-
-        # Connected starts with wakeup interest on and capacity free
-        conn._update_send_capacity()
-        assert events == []
-
-        # Filling capacity emits False once
-        conn._requests.pending.append((Ping(), None, 1))
-        conn._update_send_capacity()
-        conn._update_send_capacity()
-        assert events == [UpdateSendCapacity(can_send=False)]
-
-        # Draining capacity emits True once
-        conn._requests.pending.clear()
-        conn._update_send_capacity()
-        conn._update_send_capacity()
-        assert events == [
-            UpdateSendCapacity(can_send=False),
-            UpdateSendCapacity(can_send=True),
-        ]
-
-        # A requested close keeps wakeup interest on at full capacity
-        sm.state, _ = transition(sm.state, CloseRequested())
-        conn._requests.pending.append((Ping(), None, 2))
-        conn._update_send_capacity()
-        assert len(events) == 2
-        assert sm.state.wakeup_interested is True
-
-    def test_update_io_interest_concurrent_enable(self) -> None:
-        client = KazooClient(hosts="127.0.0.1:2181")
-        conn = client._connection
-        errors: list[BaseException] = []
-
-        def enable(barrier: threading.Barrier) -> None:
-            barrier.wait()
-            try:
-                conn._update_io_interest(selectors.EVENT_READ, "wakeup")
-            except BaseException as exc:
-                errors.append(exc)
-
-        try:
-            with patch.object(client.handler, "spawn", return_value=Mock()):
-                conn.start()
-            # client.stop() and the connection routine can both enable
-            # wakeup interest while it is unregistered.
-            for _ in range(500):
-                conn._update_io_interest(0, "wakeup")
-                barrier = threading.Barrier(2)
-                threads = [
-                    threading.Thread(target=enable, args=(barrier,))
-                    for _ in range(2)
-                ]
-                for t in threads:
-                    t.start()
-                for t in threads:
-                    t.join()
-            assert errors == []
-            assert conn._wakeup_registered is True
-        finally:
-            conn.connection_stopped.set()
-            conn._connection_routine = None
-            conn.close()
-
     def test_exception_to_event_mapping(self) -> None:
         import logging
 
@@ -1571,7 +1479,7 @@ class TestConnectionRecvIntoAndBurstScheduling:
 
     def test_coalesced_burst_replies_bypass_select(self) -> None:
         client = _make_mock_client(concurrent_request_limit=10)
-        client._state_machine.state = Connected(wakeup_interested=True)
+        client._state_machine.state = Connected()
         conn = ConnectionHandler(client, KazooRetry())
         conn._socket = Mock()
 
@@ -1616,7 +1524,7 @@ class TestConnectionRecvIntoAndBurstScheduling:
         self,
     ) -> None:
         client = _make_mock_client(concurrent_request_limit=10)
-        client._state_machine.state = Connected(wakeup_interested=True)
+        client._state_machine.state = Connected()
         conn = ConnectionHandler(client, KazooRetry())
         conn._socket = Mock()
 
@@ -1659,7 +1567,7 @@ class TestConnectionRecvIntoAndBurstScheduling:
 
     def test_replies_per_yield_triggers_yield_control_and_resets(self) -> None:
         client = _make_mock_client(concurrent_request_limit=200)
-        client._state_machine.state = Connected(wakeup_interested=True)
+        client._state_machine.state = Connected()
         conn = ConnectionHandler(client, KazooRetry())
         conn._socket = Mock()
 
@@ -2048,3 +1956,119 @@ class TestWakeupOutsideSelect:
             stuck_thread.join(timeout=2.0)
             conn.connection_stopped.set()
             conn._connection_routine = None
+
+    @pytest.mark.parametrize("backend", ["gevent", "eventlet"])
+    @pytest.mark.parametrize(
+        "phase", ["handshaking", "authenticating", "connected_backpressured"]
+    )
+    def test_greenlet_stop_wakes_in_flight_select(
+        self, backend: str, phase: str
+    ) -> None:
+        """stop() wakes an in-flight select() in <0.5s across greenlets."""
+        from kazoo.protocol.statemachine import (
+            Authenticating,
+            AuthStage,
+            Handshaking,
+        )
+
+        if backend == "gevent":
+            mod = pytest.importorskip("gevent")
+            from kazoo.handlers.gevent import SequentialGeventHandler
+
+            handler: Any = SequentialGeventHandler()
+        else:
+            mod = pytest.importorskip("eventlet")
+            from kazoo.handlers.eventlet import SequentialEventletHandler
+
+            handler = SequentialEventletHandler()
+
+        client = KazooClient(
+            hosts="127.0.0.1:2181",
+            handler=handler,
+            concurrent_request_limit=1,
+            timeout=30.0,
+        )
+        conn = client._connection
+        s_a, s_b = handler.create_socket_pair()
+        try:
+            s_a.setblocking(False)
+            s_b.setblocking(False)
+            conn._read_sock, conn._write_sock = handler.create_socket_pair()
+            conn._read_sock.setblocking(False)
+            conn._write_sock.setblocking(False)
+            conn._selector = handler.create_selector()
+            conn._socket = s_a
+            conn._connect_timeout = 30.0
+            conn._read_timeout = 30.0
+            conn._last_send = time.monotonic()
+            conn._setup_selector()
+            conn.connection_closed.clear()
+            conn.connection_stopped.clear()
+
+            if phase == "handshaking":
+                client._state_machine.state = Handshaking(
+                    host="127.0.0.1", port=2181
+                )
+                # Stray wake during handshaking must drain without
+                # unregistering the wakeup pipe.
+                conn.wake()
+                conn._poll_step()
+                assert conn._wakeup_registered is True
+            elif phase == "authenticating":
+                client._state_machine.state = Authenticating(
+                    stage=AuthStage.SASL, host="127.0.0.1", port=2181
+                )
+            else:
+                client._state_machine.state = Connected(
+                    host="127.0.0.1", port=2181
+                )
+                conn._requests.pending.append((Ping(), None, 1))
+
+            in_select = handler.event_object()
+            loop_done = handler.event_object()
+            orig_select = conn._select
+
+            def tracked_select(timeout: float) -> set[str]:
+                in_select.set()
+                return orig_select(timeout)
+
+            conn._select = tracked_select  # type: ignore[method-assign]
+
+            def run_loop() -> None:
+                try:
+                    conn._run_io_loop()
+                finally:
+                    conn._close_socket()
+                    conn._release_wakeup()
+                    conn.connection_stopped.set()
+                    loop_done.set()
+
+            conn._connection_routine = handler.spawn(run_loop)
+            assert in_select.wait(timeout=2.0)
+            # Let the spawned greenlet enter the blocking select() call.
+            mod.sleep(0.02)
+
+            start = time.monotonic()
+            client.send_event(CloseRequested())
+            if phase == "connected_backpressured":
+                # Connected CloseRequested enqueues Close and wakes the loop;
+                # simulate server closing the socket right after receiving it.
+                mod.sleep(0.02)
+                s_b.close()
+            assert loop_done.wait(timeout=1.0)
+            elapsed = time.monotonic() - start
+            assert elapsed < 0.5
+        finally:
+            conn.connection_stopped.set()
+            conn._connection_routine = None
+            conn._close_socket()
+            conn._release_wakeup()
+            conn.close()
+            try:
+                s_a.close()
+            except Exception:
+                pass
+            try:
+                s_b.close()
+            except Exception:
+                pass

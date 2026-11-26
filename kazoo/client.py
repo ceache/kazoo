@@ -81,7 +81,6 @@ from kazoo.protocol.statemachine import (
     SendHeartbeatPing,
     SideEffect,
     StateMachineDriver,
-    UpdateIOInterest,
 )
 from kazoo.protocol.states import (
     AddWatchMode,
@@ -803,12 +802,7 @@ class KazooClient:
     def _execute_effect(self, effect: SideEffect) -> None:
         """Route and execute descriptive side effects."""
         match effect:
-            case (
-                ReadSocketPacket()
-                | UpdateIOInterest()
-                | DrainWakeupPipe()
-                | SendHeartbeatPing()
-            ):
+            case ReadSocketPacket() | DrainWakeupPipe() | SendHeartbeatPing():
                 self._connection.execute_effect(effect)
 
             case LogStateTransition(level=level, message=message, args=args):

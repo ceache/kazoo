@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import selectors
 import socket
 import types
 from dataclasses import FrozenInstanceError
@@ -102,8 +101,6 @@ from kazoo.protocol.statemachine import (
     StepSASLHandshake,
     StopConnectionLoop,
     Suspended,
-    UpdateIOInterest,
-    UpdateSendCapacity,
     UpdateSessionData,
     WakeUpSignaled,
     transition,
@@ -214,7 +211,6 @@ class TestPureTransitionMatrix:
             auth_data=(),
             num_hosts=2,
             kazoo_state=KazooState.LOST,
-            wakeup_interested=False,
         )
         expected_connect = Connect(0, 50, 10000, 123, b"pass", False)
         assert effects == [
@@ -254,7 +250,6 @@ class TestPureTransitionMatrix:
             session_id=999,
             read_timeout=20.0,
             connect_timeout=15.0,
-            wakeup_interested=True,
         )
         assert effects == [
             UpdateSessionData(
@@ -268,9 +263,6 @@ class TestPureTransitionMatrix:
                 connect_timeout=15.0,
             ),
             ConfigureReadOnlyMode(read_only=False),
-            UpdateIOInterest(
-                interest_mask=selectors.EVENT_READ, target="wakeup"
-            ),
             LogStateTransition(
                 logging.INFO,
                 "Zookeeper connection established, state: %s",
@@ -380,7 +372,6 @@ class TestPureTransitionMatrix:
             connect_timeout=15.0,
             read_only=False,
             pending_auth=(("digest", "u:p"),),
-            wakeup_interested=False,
         )
         assert effects == [
             UpdateSessionData(
@@ -391,7 +382,6 @@ class TestPureTransitionMatrix:
             ),
             ConfigureTimeouts(read_timeout=10.0, connect_timeout=15.0),
             ConfigureReadOnlyMode(read_only=False),
-            UpdateIOInterest(interest_mask=0, target="wakeup"),
             StartSASLHandshake(host="127.0.0.1"),
         ]
 
@@ -423,7 +413,6 @@ class TestPureTransitionMatrix:
             connect_timeout=15.0,
             read_only=False,
             pending_auth=(("digest", "u2:p2"),),
-            wakeup_interested=False,
         )
         assert effects == [
             UpdateSessionData(
@@ -434,7 +423,6 @@ class TestPureTransitionMatrix:
             ),
             ConfigureTimeouts(read_timeout=10.0, connect_timeout=15.0),
             ConfigureReadOnlyMode(read_only=False),
-            UpdateIOInterest(interest_mask=0, target="wakeup"),
             SendAuthPacket(scheme="digest", credential="u1:p1"),
         ]
 
@@ -462,7 +450,6 @@ class TestPureTransitionMatrix:
             session_id=1,
             attempt=1,
             kazoo_state=KazooState.LOST,
-            wakeup_interested=False,
         )
         next_state, effects = transition(
             state, ConnectionLostEvent(reason="drop")
@@ -498,7 +485,6 @@ class TestPureTransitionMatrix:
             connect_timeout=9.0,
             read_only=False,
             pending_auth=(("digest", "u1:p1"), ("digest", "u2:p2")),
-            wakeup_interested=False,
         )
         assert eff1 == [
             UpdateSessionData(
@@ -509,7 +495,6 @@ class TestPureTransitionMatrix:
             ),
             ConfigureTimeouts(read_timeout=6.0, connect_timeout=9.0),
             ConfigureReadOnlyMode(read_only=False),
-            UpdateIOInterest(interest_mask=0, target="wakeup"),
             StartSASLHandshake(host="127.0.0.1"),
         ]
 
@@ -540,12 +525,8 @@ class TestPureTransitionMatrix:
             session_id=999,
             read_timeout=6.0,
             connect_timeout=9.0,
-            wakeup_interested=True,
         )
         assert eff5 == [
-            UpdateIOInterest(
-                interest_mask=selectors.EVENT_READ, target="wakeup"
-            ),
             LogStateTransition(
                 logging.INFO,
                 "Zookeeper connection established, state: %s",
@@ -563,35 +544,10 @@ class TestPureTransitionMatrix:
             SessionEstablished(),
         ]
 
-    def test_connected_to_suspended_on_connection_lost_disables_wakeup(
+    def test_connected_to_suspended_on_connection_lost(
         self,
     ) -> None:
-        state = Connected(
-            host="127.0.0.1", port=2181, session_id=42, wakeup_interested=True
-        )
-        next_state, effects = transition(
-            state, ConnectionLostEvent(reason="socket broken")
-        )
-        assert next_state == Suspended(
-            host="127.0.0.1", port=2181, session_id=42, attempt=1
-        )
-        assert effects == [
-            UpdateIOInterest(interest_mask=0, target="wakeup"),
-            LogStateTransition(logging.INFO, "Zookeeper connection lost"),
-            FailPendingRequests(KeeperState.CONNECTING),
-            EmitKazooStateChange(KazooState.SUSPENDED),
-            InvalidateWatchers(),
-        ]
-
-    def test_connected_to_suspended_skips_wakeup_disable_if_already_disabled(
-        self,
-    ) -> None:
-        state = Connected(
-            host="127.0.0.1",
-            port=2181,
-            session_id=42,
-            wakeup_interested=False,
-        )
+        state = Connected(host="127.0.0.1", port=2181, session_id=42)
         next_state, effects = transition(
             state, ConnectionLostEvent(reason="socket broken")
         )
@@ -606,9 +562,7 @@ class TestPureTransitionMatrix:
         ]
 
     def test_connected_ro_to_suspended_on_rw_server_found(self) -> None:
-        state = ConnectedReadOnly(
-            host="127.0.0.1", port=2181, session_id=42, wakeup_interested=True
-        )
+        state = ConnectedReadOnly(host="127.0.0.1", port=2181, session_id=42)
         next_state, effects = transition(
             state, RWServerFoundEvent(server=("127.0.0.2", 2181))
         )
@@ -616,7 +570,6 @@ class TestPureTransitionMatrix:
             host="127.0.0.2", port=2181, session_id=42, attempt=1
         )
         assert effects == [
-            UpdateIOInterest(interest_mask=0, target="wakeup"),
             LogStateTransition(logging.INFO, "Zookeeper connection lost"),
             FailPendingRequests(KeeperState.CONNECTING),
             EmitKazooStateChange(KazooState.SUSPENDED),
@@ -632,7 +585,6 @@ class TestPureTransitionMatrix:
                 port=2181,
                 session_id=1,
                 kazoo_state=KazooState.LOST,
-                wakeup_interested=False,
             )
             next_s1, eff1 = transition(
                 s_lost, ConnectAttemptStarted(host="127.0.0.2", port=2182)
@@ -649,7 +601,6 @@ class TestPureTransitionMatrix:
                 port=2181,
                 session_id=1,
                 kazoo_state=KazooState.SUSPENDED,
-                wakeup_interested=False,
             )
             next_s2, eff2 = transition(
                 s_susp, ConnectAttemptStarted(host="127.0.0.2", port=2182)
@@ -722,7 +673,6 @@ class TestPureTransitionMatrix:
             port=2181,
             session_id=1,
             kazoo_state=KazooState.LOST,
-            wakeup_interested=False,
         )
         next_s1, eff1 = transition(
             state_lost, ConnectionLostEvent(reason="network drop")
@@ -736,7 +686,6 @@ class TestPureTransitionMatrix:
             port=2181,
             session_id=1,
             kazoo_state=KazooState.SUSPENDED,
-            wakeup_interested=False,
         )
         next_s2, eff2 = transition(
             state_susp, ConnectionLostEvent(reason="network drop")
@@ -835,27 +784,11 @@ class TestPureTransitionMatrix:
             host="127.0.0.1",
             port=2181,
             session_id=42,
-            wakeup_interested=False,
         )
         s1, eff1 = transition(state, CloseRequested())
         assert isinstance(s1, Connected)
         assert s1.is_connecting_allowed is False
-        assert s1.wakeup_interested is True
-        assert eff1 == [
-            EnqueueCloseRequest(),
-            UpdateIOInterest(
-                interest_mask=selectors.EVENT_READ, target="wakeup"
-            ),
-        ]
-
-        state_wakeup = Connected(
-            host="127.0.0.1",
-            port=2181,
-            session_id=42,
-            wakeup_interested=True,
-        )
-        s1w, eff1w = transition(state_wakeup, CloseRequested())
-        assert eff1w == [EnqueueCloseRequest()]
+        assert eff1 == [EnqueueCloseRequest()]
 
         # Second CloseRequested while closing must be a no-op (I-2 idempotency)
         s1_again, eff_again = transition(s1, CloseRequested())
@@ -910,35 +843,10 @@ class TestPureTransitionMatrix:
                 "Connection dropped: %s",
                 ("outstanding heartbeat ping not received",),
             ),
-            UpdateIOInterest(interest_mask=0, target="wakeup"),
             LogStateTransition(logging.INFO, "Zookeeper connection lost"),
             FailPendingRequests(KeeperState.CONNECTING),
             EmitKazooStateChange(KazooState.SUSPENDED),
             InvalidateWatchers(),
-        ]
-
-    def test_update_send_capacity_toggles_io_interest(self) -> None:
-        state = Connected(wakeup_interested=True)
-
-        # Same capacity -> no-op
-        s1, eff1 = transition(state, UpdateSendCapacity(can_send=True))
-        assert s1 == state
-        assert eff1 == []
-
-        # Capacity exhausted -> unregister wakeup read interest (mask=0)
-        s2, eff2 = transition(state, UpdateSendCapacity(can_send=False))
-        assert isinstance(s2, Connected)
-        assert s2.wakeup_interested is False
-        assert eff2 == [UpdateIOInterest(interest_mask=0, target="wakeup")]
-
-        # Capacity restored -> re-register wakeup read interest (EVENT_READ)
-        s3, eff3 = transition(s2, UpdateSendCapacity(can_send=True))
-        assert isinstance(s3, Connected)
-        assert s3.wakeup_interested is True
-        assert eff3 == [
-            UpdateIOInterest(
-                interest_mask=selectors.EVENT_READ, target="wakeup"
-            )
         ]
 
     def test_socket_polling_events_drain_during_terminal_state_shutdown(
@@ -1274,55 +1182,9 @@ class TestClientStateMachineDriver:
         assert isinstance(driver.state, Connected)
         assert driver.state.is_connecting_allowed is False
 
-    def test_selector_interest_updates_via_client_events(self) -> None:
-        client = KazooClient(concurrent_request_limit=1)
-        conn = client._connection
-        s_zk_a, s_zk_b = socket.socketpair()
-        s_wk_a, s_wk_b = socket.socketpair()
-        try:
-            s_wk_a.setblocking(False)
-            conn._selector = client.handler.create_selector()
-            conn._socket = s_zk_a
-            conn._read_sock = s_wk_a
-            conn._write_sock = s_wk_b
-            conn._setup_selector()
-            assert conn._selector is not None
-            assert conn._wakeup_registered is True
-
-            client.send_event(StartRequested())
-            client.send_event(SocketConnected(host="127.0.0.1", port=2181))
-            client.send_event(
-                ConnectResponseReceived(
-                    connect_result=Connect(0, 0, 10000, 1, b"pwd", False),
-                    zxid=1,
-                )
-            )
-            assert isinstance(client.state_machine, Connected)
-            assert conn._wakeup_registered is True
-
-            # Gate sending via state machine event
-            client.send_event(UpdateSendCapacity(can_send=False))
-            assert conn._wakeup_registered is False
-
-            # Write a wakeup byte; since wakeup is unregistered, poll ignores
-            s_wk_b.send(b"\0")
-            ready = conn._select(timeout=0.0)
-            assert ready == set()
-
-            # Ungate sending via state machine event
-            client.send_event(UpdateSendCapacity(can_send=True))
-            assert conn._wakeup_registered is True
-
-            ready = conn._select(timeout=0.0)
-            assert ready == {"wakeup"}
-        finally:
-            conn._close_selector()
-            s_zk_a.close()
-            s_zk_b.close()
-            s_wk_a.close()
-            s_wk_b.close()
-
-    def test_wakeup_pipe_does_not_spin_during_handshaking(self) -> None:
+    def test_wakeup_stays_registered_and_drains_during_handshaking(
+        self,
+    ) -> None:
         client = KazooClient()
         conn = client._connection
         s_zk_a, s_zk_b = socket.socketpair()
@@ -1339,15 +1201,13 @@ class TestClientStateMachineDriver:
             client.send_event(
                 ConnectAttemptStarted(host="127.0.0.1", port=2181)
             )
-            # Even if wakeup was registered before, WakeUpSignaled drains/masks
-            conn._update_io_interest(selectors.EVENT_READ, "wakeup")
             s_wk_b.send(b"\0")
             assert conn._select(timeout=0.0) == {"wakeup"}
 
-            # Emitting WakeUpSignaled in Connecting unregisters wakeup and
-            # drains the stray byte so the next _select(0.0) does not spin!
+            # Emitting WakeUpSignaled drains the stray byte while keeping
+            # wakeup registered so client.stop() can always interrupt select().
             client.send_event(WakeUpSignaled())
-            assert conn._wakeup_registered is False
+            assert conn._wakeup_registered is True
             assert conn._select(timeout=0.0) == set()
         finally:
             conn._close_selector()
@@ -1875,21 +1735,18 @@ _MATRIX_EVENTS: list[tuple[str, ClientEvent]] = [
     ("PollTimeoutExpired", PollTimeoutExpired()),
     ("HeartbeatDeadlineReached", HeartbeatDeadlineReached()),
     ("PingReceived", PingReceived()),
-    ("UpdateSendCapacity", UpdateSendCapacity(can_send=True)),
 ]
 
 _SAME = "_SAME"
 _RAISE = "_RAISE"
 
 _EFF_SUSPEND = (
-    UpdateIOInterest,
     LogStateTransition,
     FailPendingRequests,
     EmitKazooStateChange,
     InvalidateWatchers,
 )
 _EFF_FINALIZE = (
-    UpdateIOInterest,
     LogStateTransition,
     LogStateTransition,
     ResolveConnectResult,
@@ -2207,21 +2064,6 @@ _EXPECTED_MATRIX: dict[
         "ExpiredSession": (_SAME, ()),
         "AuthFailed": (_SAME, ()),
     },
-    "UpdateSendCapacity": {
-        "Inactive": (_SAME, ()),
-        "Connecting": (_SAME, ()),
-        "Handshaking": (_SAME, ()),
-        "Handshaking[SUSPENDED]": (_SAME, ()),
-        "Authenticating.SASL": (_SAME, ()),
-        "Authenticating.SASL[SUSPENDED]": (_SAME, ()),
-        "Authenticating.INITIAL_AUTH": (_SAME, ()),
-        "Authenticating.INITIAL_AUTH[SUSPENDED]": (_SAME, ()),
-        "Connected": (_SAME, ()),
-        "ConnectedReadOnly": (_SAME, ()),
-        "Suspended": (_SAME, ()),
-        "ExpiredSession": (_SAME, ()),
-        "AuthFailed": (_SAME, ()),
-    },
 }
 
 
@@ -2233,7 +2075,7 @@ class TestExhaustiveTransitionMatrix:
 
         event_types = {type(e) for _, e in _MATRIX_EVENTS}
         assert event_types == set(get_args(ClientEvent))
-        assert len(_MATRIX_EVENTS) == 19
+        assert len(_MATRIX_EVENTS) == 18
 
         assert set(_EXPECTED_MATRIX.keys()) == {n for n, _ in _MATRIX_EVENTS}
         state_names = {n for n, _ in _MATRIX_STATES}
@@ -2285,15 +2127,6 @@ class TestExhaustiveTransitionMatrix:
         assert "ConnectResponseReceived" in str(exc_info.value)
         assert "Connected" in str(exc_info.value)
 
-        # UpdateSendCapacity edge toggles wakeup interest on Connected
-        s_off, eff_off = transition(
-            Connected(host="127.0.0.1", port=2181, wakeup_interested=True),
-            UpdateSendCapacity(can_send=False),
-        )
-        assert isinstance(s_off, Connected)
-        assert s_off.wakeup_interested is False
-        assert eff_off == [UpdateIOInterest(interest_mask=0, target="wakeup")]
-
         # PollTimeoutExpired with ping_outstanding=True drops session
         s_drop, eff_drop = transition(
             Connected(host="127.0.0.1", port=2181, ping_outstanding=True),
@@ -2303,7 +2136,6 @@ class TestExhaustiveTransitionMatrix:
         assert [type(e) for e in eff_drop] == [
             CloseSocket,
             LogStateTransition,
-            UpdateIOInterest,
             LogStateTransition,
             FailPendingRequests,
             EmitKazooStateChange,
@@ -2352,7 +2184,6 @@ class TestExhaustiveTransitionMatrix:
             PingReceived(),
             ReadSocketPacket(),
             EnqueueCloseRequest(),
-            UpdateIOInterest(interest_mask=1, target="wakeup"),
             DrainWakeupPipe(),
             SendHeartbeatPing(),
             SASLConfig(mechanism="DIGEST-MD5"),
