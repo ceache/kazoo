@@ -122,6 +122,8 @@ class TestACL:
         assert ident[1] == "anyone"
         assert ident[-1] == "anyone"
         assert ident[-2] == "world"
+        assert ident[:] == ("world", "anyone")
+        assert ident[::-1] == ("anyone", "world")
         with pytest.raises(IndexError):
             _ = ident[2]
 
@@ -131,6 +133,8 @@ class TestACL:
         assert acl[1] == ident
         assert acl[-1] == ident
         assert acl[-2] == Permissions.READ
+        assert acl[:] == (Permissions.READ, ident)
+        assert acl[::-1] == (ident, Permissions.READ)
         with pytest.raises(IndexError):
             _ = acl[2]
 

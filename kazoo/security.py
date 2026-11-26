@@ -50,12 +50,8 @@ class Id:
         "Tuple indexing is deprecated; access attributes directly via "
         ".scheme and .id instead."
     )
-    def __getitem__(self, index: int) -> str:
-        if index in (0, -2):
-            return self.scheme
-        if index in (1, -1):
-            return self.id
-        raise IndexError("tuple index out of range")
+    def __getitem__(self, index: int | slice) -> Any:
+        return (self.scheme, self.id)[index]
 
     @deprecated(
         "len() on Id is deprecated; access attributes directly via "
@@ -97,12 +93,8 @@ class ACL:
         "Tuple indexing is deprecated; access attributes directly via "
         ".perms and .id instead."
     )
-    def __getitem__(self, index: int) -> Any:
-        if index in (0, -2):
-            return self.perms
-        if index in (1, -1):
-            return self.id
-        raise IndexError("tuple index out of range")
+    def __getitem__(self, index: int | slice) -> Any:
+        return (self.perms, self.id)[index]
 
     @deprecated(
         "len() on ACL is deprecated; access attributes directly via "
