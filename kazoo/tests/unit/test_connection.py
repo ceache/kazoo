@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections
 import logging
+import selectors
 import threading
 import time
 from collections.abc import Iterator
@@ -1693,10 +1694,15 @@ class TestConnectionRecvIntoAndBurstScheduling:
 
         conn._socket.recv_into.side_effect = fake_recv_into
 
-        with patch.object(conn, "_select", return_value={"zk_socket"}):
+        with (
+            patch.object(conn, "_select", return_value={"zk_socket"}),
+            patch("random.randint", return_value=20) as mock_randint,
+        ):
             for _ in range(count):
                 conn._poll_step()
 
+        # Burst drain skips _compute_poll_timeout and caches heartbeat jitter.
+        assert mock_randint.call_count == 1
         assert client.handler.yield_control.call_count == 1
         assert conn._replies_since_select == 1
 
@@ -1709,6 +1715,30 @@ class TestConnectionRecvIntoAndBurstScheduling:
         conn._replies_since_select = 17
         conn._close_socket()
         assert conn._replies_since_select == 0
+
+    def test_write_reuses_lazy_write_selector_and_closes_it(self) -> None:
+        """_write() slow path reuses a lazy write selector across chunks."""
+        client = _make_mock_client()
+        conn = ConnectionHandler(client, KazooRetry())
+        mock_sock = Mock()
+        conn._socket = mock_sock
+        conn._selector = Mock()
+        mock_wsel = Mock()
+        mock_wsel.select.return_value = [(Mock(), selectors.EVENT_WRITE)]
+        client.handler.create_selector = Mock(return_value=mock_wsel)
+
+        mock_sock.send.side_effect = [5, 5, 5, 5]
+        conn._write(b"0123456789")
+        conn._write(b"abcdefghij")
+
+        client.handler.create_selector.assert_called_once()
+        mock_wsel.register.assert_called_once_with(
+            mock_sock, selectors.EVENT_WRITE
+        )
+        assert mock_wsel.select.call_count == 2
+        conn._close_socket()
+        mock_wsel.close.assert_called_once()
+        assert conn._write_selector is None
 
     def test_eof_with_partial_frame_resets_decoder(self) -> None:
         client = _make_mock_client()

@@ -526,6 +526,7 @@ class ConnectionHandler:
         self._socket: Socket | None = None
         self._socket_is_ssl: bool = False
         self._selector: selectors.BaseSelector | None = None
+        self._write_selector: selectors.BaseSelector | None = None
         self._requests: RequestManager = client._request_manager
         self._watchers: WatcherManager = client._watcher_manager
         self._frame_decoder = FrameDecoder(
@@ -549,6 +550,9 @@ class ConnectionHandler:
         self._read_timeout: float = 10.0
         self._connect_timeout: float = 10.0
         self._phase_deadline: float | None = None
+        self._heartbeat_deadline: float | None = None
+        self._heartbeat_jitter: float = 0.0
+        self._heartbeat_cache_key: tuple[float, float] | None = None
 
         self.sasl_config: SASLConfig | None = sasl_config
         self._sasl_exchange: SASLExchange | None = None
@@ -601,8 +605,18 @@ class ConnectionHandler:
         self._update_io_interest(selectors.EVENT_READ, "zk_socket")
         self._update_io_interest(selectors.EVENT_READ, "wakeup")
 
+    def _close_write_selector(self) -> None:
+        """Close the lazy write-readiness selector if active."""
+        if self._write_selector is not None:
+            try:
+                self._write_selector.close()
+            except Exception:
+                pass
+            self._write_selector = None
+
     def _close_selector(self) -> None:
         """Close the persistent selector if active."""
+        self._close_write_selector()
         if self._selector is not None:
             try:
                 self._selector.close()
@@ -612,6 +626,7 @@ class ConnectionHandler:
 
     def _close_socket(self) -> None:
         """Unregister and close the active transport socket."""
+        self._close_write_selector()
         self._update_io_interest(0, "zk_socket")
         if self._socket is not None:
             try:
@@ -622,6 +637,8 @@ class ConnectionHandler:
         self._socket_is_ssl = False
         self._replies_since_select = 0
         self._phase_deadline = None
+        self._heartbeat_deadline = None
+        self._heartbeat_cache_key = None
         self._frame_decoder.reset()
 
     def _update_io_interest(
@@ -1032,11 +1049,23 @@ class ConnectionHandler:
         # Slow-path: partial write or buffer full, drain bounded by timeout
         eff_timeout = self._connect_timeout if timeout is None else timeout
         deadline = time.monotonic() + eff_timeout
+        write_sel: selectors.BaseSelector | None = None
+        if self._selector is not None:
+            if self._write_selector is None:
+                wsel = self.handler.create_selector()
+                wsel.register(self._socket, selectors.EVENT_WRITE)
+                self._write_selector = wsel
+            write_sel = self._write_selector
 
         while sent < msg_length:
             rem_timeout = max(0.0, deadline - time.monotonic())
-            s = self.handler.select([], [self._socket], [], rem_timeout)[1]
-            if not s:
+            if write_sel is not None:
+                ready = write_sel.select(rem_timeout)
+            else:
+                ready = self.handler.select(
+                    [], [self._socket], [], rem_timeout
+                )[1]
+            if not ready:
                 raise self.handler.timeout_exception(
                     "socket time-out during write"
                 )
@@ -1449,6 +1478,26 @@ class ConnectionHandler:
         else:
             raise ForceRetryError("Reconnecting")
 
+    def _get_heartbeat_deadline(self) -> tuple[float, float]:
+        """Return cached ``(deadline, jitter)`` for the current activity."""
+        ref_time = (
+            min(self._last_send, self._last_recv)
+            if self._last_recv > 0.0
+            else self._last_send
+        )
+        key = (ref_time, self._read_timeout)
+        if (
+            self._heartbeat_cache_key != key
+            or self._heartbeat_deadline is None
+        ):
+            jitter = random.randint(1, 40) / 100.0
+            self._heartbeat_jitter = jitter
+            self._heartbeat_deadline = (
+                ref_time + self._read_timeout / 2.0 - jitter
+            )
+            self._heartbeat_cache_key = key
+        return self._heartbeat_deadline, self._heartbeat_jitter
+
     def _compute_poll_timeout(self) -> tuple[float, float | None]:
         """Compute the selector timeout and optional heartbeat deadline."""
         if not self._is_session_active:
@@ -1458,13 +1507,7 @@ class ConnectionHandler:
             return self._connect_timeout, None
 
         now = time.monotonic()
-        jitter_time = random.randint(1, 40) / 100.0
-        ref_time = (
-            min(self._last_send, self._last_recv)
-            if self._last_recv > 0.0
-            else self._last_send
-        )
-        deadline = ref_time + self._read_timeout / 2.0 - jitter_time
+        deadline, jitter_time = self._get_heartbeat_deadline()
         timeout = max(deadline - now, jitter_time)
         state = self.client._state_machine.state
         if (
@@ -1556,8 +1599,6 @@ class ConnectionHandler:
 
     def _poll_step(self) -> None:
         """Execute a single cycle of the selector I/O loop."""
-        timeout, deadline = self._compute_poll_timeout()
-
         if (
             self._is_session_active
             and self._requests.queue
@@ -1573,13 +1614,27 @@ class ConnectionHandler:
 
         if self._frame_decoder.frame_ready:
             self._replies_since_select += 1
-            if self._replies_since_select >= self._REPLIES_PER_YIELD:
+            should_yield = (
+                self._replies_since_select >= self._REPLIES_PER_YIELD
+            )
+            if should_yield:
                 self._replies_since_select = 0
                 self._yield_control()
-            ready: set[str] = {"zk_socket"}
-        else:
-            self._replies_since_select = 0
-            ready = self._select(timeout)
+            if self._is_session_active:
+                self._read_socket()
+                if (
+                    should_yield
+                    and self.client._state_machine.state.is_connected
+                ):
+                    deadline, _ = self._get_heartbeat_deadline()
+                    self._check_session_health(deadline)
+            else:
+                self._emit_event(SOCKET_READABLE)
+            return
+
+        self._replies_since_select = 0
+        timeout, deadline = self._compute_poll_timeout()
+        ready = self._select(timeout)
         self._dispatch_ready_events(ready, deadline)
 
     def _run_io_loop(self) -> None:
