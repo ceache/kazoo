@@ -126,3 +126,43 @@ def test_client_lifecycle_properties() -> None:
     assert client.is_stopped is True
     client.stop()
     assert client.is_stopped is True
+
+
+def test_start_async_during_expired_and_post_connect_suspended() -> None:
+    """start_async() reuses/attaches result during reconnects without hang."""
+    from kazoo.protocol.statemachine import (
+        Connected,
+        ExpiredSession,
+        Suspended,
+    )
+
+    client = KazooClient(hosts="127.0.0.1:2181")
+    conn = client._connection
+
+    # 1. Duplicate start_async() during ExpiredSession while _conn_result is
+    # still pending returns the existing _conn_result without stopping.
+    pending = client.handler.async_result()
+    client._conn_result = pending
+    client._state_machine.state = ExpiredSession(session_id=1)
+    conn.connection_stopped.clear()
+    try:
+        assert client.start_async() is pending
+
+        # 2. Previously connected client (ready _conn_result) now reconnecting
+        # in Suspended attaches a fresh pending result instead of calling
+        # _safe_close() without CloseRequested().
+        pending.set(True)
+        client._state_machine.state = Suspended(
+            host="127.0.0.1", port=2181, session_id=1
+        )
+        reattached = client.start_async()
+        assert reattached is not pending
+        assert not reattached.ready()
+
+        # When connection re-establishes, the reattached result resolves.
+        client._state_machine.state = Connected(
+            host="127.0.0.1", port=2181, session_id=1
+        )
+        assert client.start_async().get_nowait() is True
+    finally:
+        conn.connection_stopped.set()

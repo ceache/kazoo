@@ -59,19 +59,16 @@ from kazoo.protocol.serialization import (
     Transaction,
 )
 from kazoo.protocol.statemachine import (
-    Authenticating,
     AuthFailed,
     ClientEvent,
     ClientState,
     CloseRequested,
     Connected,
     ConnectedReadOnly,
-    Connecting,
     DrainWakeupPipe,
     EmitKazooStateChange,
     ExpiredSession,
     FailPendingRequests,
-    Handshaking,
     Inactive,
     InvalidateWatchers,
     LogStateTransition,
@@ -942,11 +939,27 @@ class KazooClient:
             return self._conn_result
 
         state = self._state_machine.state
-        if isinstance(state, (Connecting, Handshaking, Authenticating)):
+        if (
+            state.is_connecting_allowed
+            and not self._connection.connection_stopped.is_set()
+        ):
             if self._conn_result is not None and not self._conn_result.ready():
                 return self._conn_result
+            with self._state_machine._dispatch_lock:
+                if self.connected:
+                    result = self.handler.async_result()
+                    result.set(True)
+                    return result
+                if (
+                    self._state_machine.state.is_connecting_allowed
+                    and not self._connection.connection_stopped.is_set()
+                ):
+                    self._conn_result = self.handler.async_result()
+                    return self._conn_result
 
         # Make sure we're safely closed before starting
+        if not self.is_stopped:
+            self.send_event(CloseRequested())
         self._safe_close()
         self._conn_result = self.handler.async_result()
 
