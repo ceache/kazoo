@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import logging
-import selectors
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 from kazoo.exceptions import (
     AuthFailedError,
@@ -41,7 +40,6 @@ class Inactive:
 
     keeper_state: KeeperState = KeeperState.CLOSED
     kazoo_state: KazooState = KazooState.LOST
-    wakeup_interested: bool = False
     is_terminal: bool = False
     is_connected: bool = False
     is_connecting_allowed: bool = False
@@ -56,7 +54,6 @@ class Connecting:
     attempt: int = 0
     keeper_state: KeeperState = KeeperState.CONNECTING
     kazoo_state: KazooState = KazooState.LOST
-    wakeup_interested: bool = False
     is_terminal: bool = False
     is_connected: bool = False
     is_connecting_allowed: bool = True
@@ -76,7 +73,6 @@ class Handshaking:
     num_hosts: int = 1
     keeper_state: KeeperState = KeeperState.CONNECTING
     kazoo_state: KazooState = KazooState.LOST
-    wakeup_interested: bool = False
     is_terminal: bool = False
     is_connected: bool = False
     is_connecting_allowed: bool = True
@@ -96,7 +92,6 @@ class Authenticating:
     pending_auth: tuple[tuple[str, str], ...] = ()
     keeper_state: KeeperState = KeeperState.CONNECTING
     kazoo_state: KazooState = KazooState.LOST
-    wakeup_interested: bool = False
     is_terminal: bool = False
     is_connected: bool = False
     is_connecting_allowed: bool = True
@@ -112,7 +107,6 @@ class Connected:
     read_timeout: float = 10.0
     connect_timeout: float = 10.0
     ping_outstanding: bool = False
-    wakeup_interested: bool = True
     keeper_state: KeeperState = KeeperState.CONNECTED
     kazoo_state: KazooState = KazooState.CONNECTED
     is_terminal: bool = False
@@ -130,7 +124,6 @@ class ConnectedReadOnly:
     read_timeout: float = 10.0
     connect_timeout: float = 10.0
     ping_outstanding: bool = False
-    wakeup_interested: bool = True
     keeper_state: KeeperState = KeeperState.CONNECTED_RO
     kazoo_state: KazooState = KazooState.CONNECTED
     is_terminal: bool = False
@@ -148,7 +141,6 @@ class Suspended:
     attempt: int = 0
     keeper_state: KeeperState = KeeperState.CONNECTING
     kazoo_state: KazooState = KazooState.SUSPENDED
-    wakeup_interested: bool = False
     is_terminal: bool = False
     is_connected: bool = False
     is_connecting_allowed: bool = True
@@ -161,7 +153,6 @@ class ExpiredSession:
     session_id: int | None = None
     keeper_state: KeeperState = KeeperState.EXPIRED_SESSION
     kazoo_state: KazooState = KazooState.LOST
-    wakeup_interested: bool = False
     is_terminal: bool = False
     is_connected: bool = False
     is_connecting_allowed: bool = True
@@ -174,7 +165,6 @@ class AuthFailed:
     error: Exception | None = None
     keeper_state: KeeperState = KeeperState.AUTH_FAILED
     kazoo_state: KazooState = KazooState.LOST
-    wakeup_interested: bool = False
     is_terminal: bool = True
     is_connected: bool = False
     is_connecting_allowed: bool = False
@@ -316,13 +306,6 @@ class PingReceived:
     """Emitted when an XID.PING response header is read from the server."""
 
 
-@dataclass(frozen=True, slots=True)
-class UpdateSendCapacity:
-    """Emitted before polling to update wakeup pipe interest."""
-
-    can_send: bool
-
-
 ClientEvent: TypeAlias = (
     StartRequested
     | ConnectAttemptStarted
@@ -342,7 +325,6 @@ ClientEvent: TypeAlias = (
     | PollTimeoutExpired
     | HeartbeatDeadlineReached
     | PingReceived
-    | UpdateSendCapacity
 )
 
 
@@ -393,16 +375,8 @@ class ResetSessionData:
 
 
 @dataclass(frozen=True, slots=True)
-class UpdateIOInterest:
-    """Update the selector interest mask for a registered file object."""
-
-    interest_mask: int
-    target: Literal["zk_socket", "wakeup"] = "wakeup"
-
-
-@dataclass(frozen=True, slots=True)
 class DrainWakeupPipe:
-    """Disable wakeup pipe selector interest and drain stray wakeup bytes."""
+    """Drain stray wakeup bytes from the wakeup pipe without unregistering."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -504,7 +478,6 @@ SideEffect: TypeAlias = (
     | FailPendingRequests
     | InvalidateWatchers
     | ResetSessionData
-    | UpdateIOInterest
     | DrainWakeupPipe
     | StartSASLHandshake
     | StepSASLHandshake
@@ -529,25 +502,17 @@ WAKEUP_SIGNALED = WakeUpSignaled()
 POLL_TIMEOUT_EXPIRED = PollTimeoutExpired()
 HEARTBEAT_DEADLINE_REACHED = HeartbeatDeadlineReached()
 PING_RECEIVED = PingReceived()
-UPDATE_SEND_CAPACITY_TRUE = UpdateSendCapacity(can_send=True)
-UPDATE_SEND_CAPACITY_FALSE = UpdateSendCapacity(can_send=False)
 
 _READ_SOCKET_PACKET = ReadSocketPacket()
 _READ_CONNECT_RESPONSE_PACKET = ReadConnectResponsePacket()
 _DRAIN_WAKEUP_PIPE = DrainWakeupPipe()
 _SEND_HEARTBEAT_PING = SendHeartbeatPing()
 _ENQUEUE_CLOSE_REQUEST = EnqueueCloseRequest()
-_WAKEUP_INTEREST_READ = UpdateIOInterest(
-    interest_mask=selectors.EVENT_READ, target="wakeup"
-)
-_WAKEUP_INTEREST_NONE = UpdateIOInterest(interest_mask=0, target="wakeup")
 
 _EFFECTS_READ_SOCKET: list[SideEffect] = [_READ_SOCKET_PACKET]
 _EFFECTS_READ_CONNECT: list[SideEffect] = [_READ_CONNECT_RESPONSE_PACKET]
 _EFFECTS_DRAIN_WAKEUP: list[SideEffect] = [_DRAIN_WAKEUP_PIPE]
 _EFFECTS_SEND_PING: list[SideEffect] = [_SEND_HEARTBEAT_PING]
-_EFFECTS_ENABLE_WAKEUP: list[SideEffect] = [_WAKEUP_INTEREST_READ]
-_EFFECTS_DISABLE_WAKEUP: list[SideEffect] = [_WAKEUP_INTEREST_NONE]
 _NO_EFFECTS: list[SideEffect] = []
 
 
@@ -567,18 +532,12 @@ def _build_auth_exception(error: Exception | None) -> AuthFailedError:
 
 def _suspend_effects(
     keeper_state: KeeperState,
-    disable_wakeup: bool = False,
     emit_kazoo_change: bool = True,
 ) -> list[SideEffect]:
-    effects: list[SideEffect] = []
-    if disable_wakeup:
-        effects.append(UpdateIOInterest(interest_mask=0, target="wakeup"))
-    effects.extend(
-        [
-            LogStateTransition(logging.INFO, "Zookeeper connection lost"),
-            FailPendingRequests(keeper_state),
-        ]
-    )
+    effects: list[SideEffect] = [
+        LogStateTransition(logging.INFO, "Zookeeper connection lost"),
+        FailPendingRequests(keeper_state),
+    ]
     if emit_kazoo_change:
         effects.append(EmitKazooStateChange(KazooState.SUSPENDED))
     effects.append(InvalidateWatchers())
@@ -633,7 +592,6 @@ def _finalize_connected(
             connect_timeout=connect_timeout,
         )
     effects: list[SideEffect] = [
-        UpdateIOInterest(interest_mask=selectors.EVENT_READ, target="wakeup"),
         LogStateTransition(
             logging.INFO,
             "Zookeeper connection established, state: %s",
@@ -688,34 +646,6 @@ def transition(
             WakeUpSignaled(),
         ):
             return state, _EFFECTS_DRAIN_WAKEUP
-
-        case (
-            Connected(wakeup_interested=wakeup_interested)
-            | ConnectedReadOnly(wakeup_interested=wakeup_interested),
-            UpdateSendCapacity(can_send=can_send),
-        ):
-            if can_send == wakeup_interested:
-                return state, _NO_EFFECTS
-            return (
-                replace(state, wakeup_interested=can_send),
-                (
-                    _EFFECTS_ENABLE_WAKEUP
-                    if can_send
-                    else _EFFECTS_DISABLE_WAKEUP
-                ),
-            )
-
-        case (
-            Inactive()
-            | Connecting()
-            | Handshaking()
-            | Authenticating()
-            | Suspended()
-            | ExpiredSession()
-            | AuthFailed(),
-            UpdateSendCapacity(),
-        ):
-            return state, _NO_EFFECTS
 
         case (
             Connected() | ConnectedReadOnly(),
@@ -773,10 +703,7 @@ def transition(
                         "Connection dropped: %s",
                         ("outstanding heartbeat ping not received",),
                     ),
-                    *_suspend_effects(
-                        KeeperState.CONNECTING,
-                        disable_wakeup=True,
-                    ),
+                    *_suspend_effects(KeeperState.CONNECTING),
                 ],
             )
 
@@ -896,12 +823,10 @@ def transition(
         case (
             Connected(
                 session_id=session_id,
-                wakeup_interested=wakeup_interested,
                 is_connecting_allowed=allowing,
             )
             | ConnectedReadOnly(
                 session_id=session_id,
-                wakeup_interested=wakeup_interested,
                 is_connecting_allowed=allowing,
             ),
             ConnectAttemptStarted(host=host, port=port),
@@ -913,10 +838,7 @@ def transition(
                 attempt=1,
                 is_connecting_allowed=allowing,
             )
-            return next_state, _suspend_effects(
-                KeeperState.CONNECTING,
-                disable_wakeup=wakeup_interested,
-            )
+            return next_state, _suspend_effects(KeeperState.CONNECTING)
 
         case (
             Authenticating() | Handshaking(),
@@ -970,7 +892,6 @@ def transition(
                 auth_data=auth_data,
                 num_hosts=num_hosts,
                 kazoo_state=state.kazoo_state,
-                wakeup_interested=False,
             )
             return next_state, [
                 SendConnectPacket(
@@ -1043,13 +964,8 @@ def transition(
                         read_only=eff_ro,
                         pending_auth=auth_data,
                         kazoo_state=state.kazoo_state,
-                        wakeup_interested=False,
                     ),
-                    common_effects
-                    + [
-                        UpdateIOInterest(interest_mask=0, target="wakeup"),
-                        StartSASLHandshake(host=host),
-                    ],
+                    common_effects + [StartSASLHandshake(host=host)],
                 )
 
             if auth_data:
@@ -1065,11 +981,9 @@ def transition(
                         read_only=eff_ro,
                         pending_auth=auth_data[1:],
                         kazoo_state=state.kazoo_state,
-                        wakeup_interested=False,
                     ),
                     common_effects
                     + [
-                        UpdateIOInterest(interest_mask=0, target="wakeup"),
                         SendAuthPacket(
                             scheme=first_scheme, credential=first_cred
                         ),
@@ -1215,24 +1129,12 @@ def transition(
             return state, []
 
         case (
-            Connected(wakeup_interested=wakeup_interested)
-            | ConnectedReadOnly(wakeup_interested=wakeup_interested),
+            Connected() | ConnectedReadOnly(),
             CloseRequested(),
         ):
-            close_req_effects: list[SideEffect] = [_ENQUEUE_CLOSE_REQUEST]
-            if not wakeup_interested:
-                close_req_effects.append(
-                    UpdateIOInterest(
-                        interest_mask=selectors.EVENT_READ, target="wakeup"
-                    )
-                )
             return (
-                replace(
-                    state,
-                    is_connecting_allowed=False,
-                    wakeup_interested=True,
-                ),
-                close_req_effects,
+                replace(state, is_connecting_allowed=False),
+                [_ENQUEUE_CLOSE_REQUEST],
             )
 
         case (_, SessionClosedEvent() | CloseRequested()):
@@ -1258,14 +1160,12 @@ def transition(
                 host=host,
                 port=port,
                 session_id=session_id,
-                wakeup_interested=wakeup_interested,
                 is_connecting_allowed=allowing,
             )
             | ConnectedReadOnly(
                 host=host,
                 port=port,
                 session_id=session_id,
-                wakeup_interested=wakeup_interested,
                 is_connecting_allowed=allowing,
             ),
             ConnectionLostEvent(keeper_state=k_state),
@@ -1278,9 +1178,7 @@ def transition(
                 keeper_state=k_state,
                 is_connecting_allowed=allowing,
             )
-            return next_state, _suspend_effects(
-                k_state, disable_wakeup=wakeup_interested
-            )
+            return next_state, _suspend_effects(k_state)
 
         case (
             Authenticating(stage=AuthStage.SASL),
@@ -1301,14 +1199,8 @@ def transition(
             return _reconnect_after_drop(state, k_state), []
 
         case (
-            Connected(
-                session_id=session_id,
-                wakeup_interested=wakeup_interested,
-            )
-            | ConnectedReadOnly(
-                session_id=session_id,
-                wakeup_interested=wakeup_interested,
-            ),
+            Connected(session_id=session_id)
+            | ConnectedReadOnly(session_id=session_id),
             RWServerFoundEvent(server=server),
         ):
             rw_host = server[0] if server else None
@@ -1319,9 +1211,7 @@ def transition(
                 session_id=session_id,
                 attempt=1,
             )
-            return next_state, _suspend_effects(
-                KeeperState.CONNECTING, disable_wakeup=wakeup_interested
-            )
+            return next_state, _suspend_effects(KeeperState.CONNECTING)
 
         case (
             Connecting()
