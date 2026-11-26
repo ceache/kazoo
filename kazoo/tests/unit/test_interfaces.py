@@ -66,3 +66,12 @@ def test_yield_control_eventlet_switches_greenlets() -> None:
         assert ran == ["eventlet"]
     finally:
         g.wait()
+
+
+def test_eventlet_selector_subclasses_base_selector() -> None:
+    pytest.importorskip("eventlet")
+    from kazoo.handlers.eventlet import SequentialEventletHandler
+
+    handler = SequentialEventletHandler()
+    with handler.create_selector() as sel:
+        assert isinstance(sel, selectors.BaseSelector)

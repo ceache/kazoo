@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import logging
+import selectors
 from collections.abc import Generator
 from typing import TYPE_CHECKING, Any, cast
 
@@ -50,30 +51,47 @@ def _yield_before_after() -> Generator[None, None, None]:
         eventlet.sleep(0)  # type: ignore[no-untyped-call]
 
 
-class _EventletSelector:
+class _EventletSelector(selectors.BaseSelector):
     """Green selector wrapper that yields cooperatively around select()."""
 
     def __init__(self) -> None:
         self._selector = green_selectors.DefaultSelector()
 
-    def register(self, fileobj: Any, events: int, data: Any = None) -> Any:
-        return self._selector.register(fileobj, events, data)
+    def register(
+        self, fileobj: Any, events: int, data: Any = None
+    ) -> selectors.SelectorKey:
+        return cast(
+            "selectors.SelectorKey",
+            self._selector.register(fileobj, events, data),
+        )
 
-    def unregister(self, fileobj: Any) -> Any:
-        return self._selector.unregister(fileobj)
+    def unregister(self, fileobj: Any) -> selectors.SelectorKey:
+        return cast(
+            "selectors.SelectorKey", self._selector.unregister(fileobj)
+        )
 
-    def modify(self, fileobj: Any, events: int, data: Any = None) -> Any:
-        return self._selector.modify(fileobj, events, data)
+    def modify(
+        self, fileobj: Any, events: int, data: Any = None
+    ) -> selectors.SelectorKey:
+        return cast(
+            "selectors.SelectorKey",
+            self._selector.modify(fileobj, events, data),
+        )
 
-    def get_key(self, fileobj: Any) -> Any:
-        return self._selector.get_key(fileobj)
+    def get_key(self, fileobj: Any) -> selectors.SelectorKey:
+        return cast("selectors.SelectorKey", self._selector.get_key(fileobj))
 
     def get_map(self) -> Any:
         return self._selector.get_map()
 
-    def select(self, timeout: float | None = None) -> Any:
+    def select(
+        self, timeout: float | None = None
+    ) -> list[tuple[selectors.SelectorKey, int]]:
         with _yield_before_after():
-            return self._selector.select(timeout)
+            return cast(
+                "list[tuple[selectors.SelectorKey, int]]",
+                self._selector.select(timeout),
+            )
 
     def close(self) -> None:
         self._selector.close()
@@ -248,7 +266,7 @@ class SequentialEventletHandler:
                 **kwargs,
             )
 
-    def create_selector(self) -> Any:
+    def create_selector(self) -> selectors.BaseSelector:
         return _EventletSelector()
 
     def yield_control(self) -> None:
