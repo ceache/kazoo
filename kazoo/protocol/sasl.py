@@ -76,26 +76,19 @@ class SASLConfig:
     @classmethod
     def from_dict(cls, options: Mapping[str, Any]) -> SASLConfig:
         """Construct a :class:`SASLConfig` from a raw options mapping."""
-        if "mechanism" not in options:
+        if "mechanism" not in options or not str(options["mechanism"]).strip():
             raise ConfigurationError("SASL options must specify a mechanism")
-        mechanism = str(options["mechanism"]).upper()
-        if mechanism not in ("DIGEST-MD5", "GSSAPI", "PLAIN"):
-            raise ConfigurationError(
-                "SASL mechanism must be DIGEST-MD5, GSSAPI, or PLAIN, "
-                f"got {mechanism}"
-            )
-        if mechanism in ("DIGEST-MD5", "PLAIN") and not options.get(
-            "username"
-        ):
-            raise ConfigurationError(
-                f"SASL mechanism {mechanism} requires a username"
-            )
-        if mechanism in ("DIGEST-MD5", "PLAIN") and not options.get(
-            "password"
-        ):
-            raise ConfigurationError(
-                f"SASL mechanism {mechanism} requires a password"
-            )
+        mechanism = str(options["mechanism"]).strip().upper()
+        has_callback = options.get("callback") is not None
+        if mechanism in ("DIGEST-MD5", "PLAIN") and not has_callback:
+            if not options.get("username"):
+                raise ConfigurationError(
+                    f"SASL mechanism {mechanism} requires a username"
+                )
+            if options.get("password") is None:
+                raise ConfigurationError(
+                    f"SASL mechanism {mechanism} requires a password"
+                )
         known_keys = {
             "mechanism",
             "service",
@@ -129,7 +122,7 @@ class SASLConfig:
             if scheme != "sasl":
                 filtered_auth.add((scheme, auth))
                 continue
-            if sasl_options or legacy_config is not None:
+            if sasl_options is not None or legacy_config is not None:
                 raise ConfigurationError(
                     "Multiple SASL configurations provided"
                 )
@@ -140,7 +133,12 @@ class SASLConfig:
                 DeprecationWarning,
                 stacklevel=3,
             )
-            username, password = auth.split(":")
+            username, sep, password = auth.partition(":")
+            if not sep:
+                raise ConfigurationError(
+                    "Legacy SASL auth_data credential must be "
+                    "'username:password'"
+                )
             legacy_config = cls(
                 mechanism="DIGEST-MD5",
                 service="zookeeper",
@@ -155,8 +153,6 @@ class SASLConfig:
             return None, filtered_auth
         if isinstance(sasl_options, SASLConfig):
             return sasl_options, filtered_auth
-        if not sasl_options:
-            return None, filtered_auth
         return cls.from_dict(sasl_options), filtered_auth
 
 
