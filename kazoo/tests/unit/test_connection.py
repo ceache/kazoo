@@ -1740,6 +1740,28 @@ class TestConnectionRecvIntoAndBurstScheduling:
         mock_wsel.close.assert_called_once()
         assert conn._write_selector is None
 
+    def test_frame_decoder_buffer_lazy_init_and_released_on_close(
+        self,
+    ) -> None:
+        """KazooClient does not allocate FrameDecoder._buf until I/O."""
+        client = KazooClient(hosts="127.0.0.1:2181")
+        dec = client._connection._frame_decoder
+        assert len(dec._buf) == 0
+        assert dec._view is None
+
+        # First get_buffer allocates full capacity; close() frees it.
+        dec.get_buffer()
+        assert len(dec._buf) == dec._capacity
+        client.close()
+        assert len(dec._buf) == 0
+        assert dec._view is None
+
+        # Decoder reallocates cleanly on subsequent use (e.g., restart).
+        dec.get_buffer()
+        assert len(dec._buf) == dec._capacity
+        client.close()
+        assert len(dec._buf) == 0
+
     def test_eof_with_partial_frame_resets_decoder(self) -> None:
         client = _make_mock_client()
         conn = ConnectionHandler(client, KazooRetry())

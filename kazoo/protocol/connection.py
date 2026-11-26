@@ -848,6 +848,7 @@ class ConnectionHandler:
             raise Exception("Cannot close connection until it is stopped")
         self.connection_closed.set()
         self._close_selector()
+        self._frame_decoder.release()
         ws, rs = self._write_sock, self._read_sock
         self._write_sock = self._read_sock = None
         if ws is not None:

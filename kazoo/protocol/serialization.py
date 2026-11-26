@@ -941,9 +941,9 @@ class FrameDecoder:
         self._max_payload = max_buffer + REPLY_OVERHEAD
         self._max_frame = 4 + self._max_payload
         self._capacity = READ_WINDOW + self._max_frame
-        self._buf = bytearray(self._capacity)
-        self._view = memoryview(self._buf)
-        self._empty_view = self._view[:READ_WINDOW]
+        self._buf = bytearray()
+        self._view: memoryview | None = None
+        self._empty_view: memoryview | None = None
         self._head = 0
         self._tail = 0
         self._scan = 0
@@ -954,6 +954,14 @@ class FrameDecoder:
         self._skip = 0
         self._pop_pending = pop_pending
 
+    def _ensure_buffer(self) -> memoryview:
+        """Lazily allocate the fixed frame buffer and its cached views."""
+        if self._view is None:
+            self._buf = bytearray(self._capacity)
+            self._view = memoryview(self._buf)
+            self._empty_view = self._view[:READ_WINDOW]
+        return self._view
+
     def reset(self) -> None:
         """Clear buffered bytes and any pending oversize skip count."""
         self._head = 0
@@ -961,6 +969,21 @@ class FrameDecoder:
         self._scan = 0
         self._frame_len = -1
         self._skip = 0
+
+    def release(self) -> None:
+        """Release cached views and free the backing buffer.
+
+        The decoder may be reused afterward; the next :meth:`get_buffer`
+        call allocates a fresh buffer.
+        """
+        self.reset()
+        if self._empty_view is not None:
+            self._empty_view.release()
+            self._empty_view = None
+        if self._view is not None:
+            self._view.release()
+            self._view = None
+        self._buf = bytearray()
 
     def _advance_scan(self) -> None:
         """Advance ``_scan`` past complete normal frames and check headers."""
@@ -1041,8 +1064,11 @@ class FrameDecoder:
             :meth:`reset` does not recover it.
         """
         del sizehint
+        view = self._ensure_buffer()
+        empty_view = self._empty_view
+        assert empty_view is not None
         if self._skip > 0:
-            return self._empty_view
+            return empty_view
 
         head = self._head
         tail = self._tail
@@ -1051,7 +1077,7 @@ class FrameDecoder:
             self._head = 0
             self._tail = 0
             self._scan = 0
-            return self._empty_view
+            return empty_view
 
         end = READ_WINDOW
         msg_len = -1
@@ -1094,7 +1120,7 @@ class FrameDecoder:
 
         p = tail - head
         if end - tail < MOVE_MAX and p <= MOVE_MAX:
-            self._view[:p] = self._view[head:tail]
+            view[:p] = view[head:tail]
             s -= head
             self._head = 0
             self._tail = p
@@ -1111,7 +1137,7 @@ class FrameDecoder:
 
         if end <= tail:
             raise BufferError("pop frames before requesting a buffer")
-        return self._view[tail:end]
+        return view[tail:end]
 
     def buffer_updated(self, nbytes: int) -> None:
         """Advance the write cursor after ``recv_into`` writes ``nbytes``."""
@@ -1250,6 +1276,7 @@ class FrameDecoder:
         if end > self._tail:
             return None
 
+        assert self._view is not None
         frame_view = self._view[start:end]
         # Consume the frame before decoding it, so the cursors are
         # consistent even when decoding raises.

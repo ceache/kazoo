@@ -1022,7 +1022,7 @@ class TestDataclassPacketsAndFrameDecoder:
             out: list[object] = []
             pos = 0
             src = memoryview(stream)
-            main = dec._buf
+            main: bytearray | None = None
             while pos < len(src):
                 if not lazy_pop:
                     assert not dec.frame_ready
@@ -1032,6 +1032,8 @@ class TestDataclassPacketsAndFrameDecoder:
                     assert lazy_pop and dec.frame_ready
                     drain(dec, out, rng, always=True)
                     continue
+                if main is None:
+                    main = dec._buf
                 take = min(
                     len(buf),
                     len(src) - pos,
@@ -1322,6 +1324,7 @@ class TestDataclassPacketsAndFrameDecoder:
 
     def test_frame_decoder_move_rule_and_window_sizing(self) -> None:
         dec = serialization.FrameDecoder()
+        dec._ensure_buffer()
         L = serialization.READ_WINDOW
 
         # Small partial frame near L (<= MOVE_MAX) is moved to 0
@@ -1551,6 +1554,12 @@ class TestDataclassPacketsAndFrameDecoder:
             collections.deque()
         )
         dec = serialization.FrameDecoder(pop_pending=pending.popleft)
+        # Backing buffer is allocated lazily on first get_buffer()
+        assert len(dec._buf) == 0
+        assert dec._view is None
+        assert dec.pop_packet() is None
+        dec.get_buffer()
+        assert len(dec._buf) == dec._capacity
         buf_id = id(dec._buf)
 
         def make_reply_wire(xid: int) -> bytes:
@@ -1579,6 +1588,15 @@ class TestDataclassPacketsAndFrameDecoder:
         dec._feed(_int_struct.pack(len(ping_b)) + ping_b)
         assert isinstance(dec.pop_packet(), serialization.PingResponse)
         assert id(dec._buf) == buf_id
+
+        # release() frees the backing buffer and views; decoder remains usable
+        dec.release()
+        assert len(dec._buf) == 0
+        assert dec._view is None
+        assert dec._empty_view is None
+        dec._feed(_int_struct.pack(len(ping_b)) + ping_b)
+        assert len(dec._buf) == dec._capacity
+        assert isinstance(dec.pop_packet(), serialization.PingResponse)
 
     def test_frame_decoder_short_or_negative_length_rejected(self) -> None:
         for bad_len in (-1, 0, 15):
