@@ -928,7 +928,10 @@ def transition(
                     CloseSocket("Session has expired"),
                 ]
                 return (
-                    ExpiredSession(session_id=connect_result.session_id),
+                    ExpiredSession(
+                        session_id=connect_result.session_id,
+                        is_connecting_allowed=state.is_connecting_allowed,
+                    ),
                     expired_connect_effects,
                 )
 
@@ -1089,6 +1092,7 @@ def transition(
         case (_, AuthFailedEvent(error=error)):
             auth_exc = _build_auth_exception(error)
             auth_failed_effects: list[SideEffect] = [
+                CloseSocket("Authentication failed"),
                 LogStateTransition(
                     logging.INFO,
                     "Zookeeper session closed, state: %s",
@@ -1102,11 +1106,12 @@ def transition(
             ]
             return AuthFailed(error=error), auth_failed_effects
 
-        case (ExpiredSession(), SessionExpiredEvent()):
+        case (ExpiredSession() | AuthFailed(), SessionExpiredEvent()):
             return state, []
 
         case (_, SessionExpiredEvent(session_id=session_id)):
             session_expired_effects: list[SideEffect] = [
+                CloseSocket("Session has expired"),
                 LogStateTransition(
                     logging.INFO,
                     "Zookeeper session closed, state: %s",
@@ -1117,7 +1122,10 @@ def transition(
                 ResetSessionData(),
             ]
             return (
-                ExpiredSession(session_id=session_id),
+                ExpiredSession(
+                    session_id=session_id,
+                    is_connecting_allowed=state.is_connecting_allowed,
+                ),
                 session_expired_effects,
             )
 
@@ -1139,6 +1147,7 @@ def transition(
 
         case (_, SessionClosedEvent() | CloseRequested()):
             closed_effects: list[SideEffect] = [
+                CloseSocket("Connection closed"),
                 LogStateTransition(
                     logging.INFO,
                     "Zookeeper session closed, state: %s",
@@ -1168,7 +1177,7 @@ def transition(
                 session_id=session_id,
                 is_connecting_allowed=allowing,
             ),
-            ConnectionLostEvent(keeper_state=k_state),
+            ConnectionLostEvent(keeper_state=k_state, reason=reason),
         ):
             next_state = Suspended(
                 host=host,
@@ -1178,29 +1187,41 @@ def transition(
                 keeper_state=k_state,
                 is_connecting_allowed=allowing,
             )
-            return next_state, _suspend_effects(k_state)
+            return next_state, [
+                CloseSocket(reason=reason or "Connection lost"),
+                *_suspend_effects(k_state),
+            ]
 
         case (
             Authenticating(stage=AuthStage.SASL),
             ConnectionLostEvent(keeper_state=k_state, reason=reason),
         ):
             return _reconnect_after_drop(state, k_state), [
+                CloseSocket(reason=reason or "Connection dropped in SASL"),
                 LogStateTransition(
                     logging.WARNING,
                     "Connection dropped in SASL: %s",
                     (reason,),
-                )
+                ),
             ]
 
         case (
             Authenticating() | Handshaking(),
-            ConnectionLostEvent(keeper_state=k_state),
+            ConnectionLostEvent(keeper_state=k_state, reason=reason),
         ):
-            return _reconnect_after_drop(state, k_state), []
+            return _reconnect_after_drop(state, k_state), [
+                CloseSocket(reason=reason or "Connection lost")
+            ]
 
         case (
-            Connected(session_id=session_id)
-            | ConnectedReadOnly(session_id=session_id),
+            Connected(
+                session_id=session_id,
+                is_connecting_allowed=allowing,
+            )
+            | ConnectedReadOnly(
+                session_id=session_id,
+                is_connecting_allowed=allowing,
+            ),
             RWServerFoundEvent(server=server),
         ):
             rw_host = server[0] if server else None
@@ -1210,8 +1231,12 @@ def transition(
                 port=rw_port,
                 session_id=session_id,
                 attempt=1,
+                is_connecting_allowed=allowing,
             )
-            return next_state, _suspend_effects(KeeperState.CONNECTING)
+            return next_state, [
+                CloseSocket(reason="Found RW server"),
+                *_suspend_effects(KeeperState.CONNECTING),
+            ]
 
         case (
             Connecting()
@@ -1226,7 +1251,7 @@ def transition(
 
         case (
             ExpiredSession() | AuthFailed(),
-            ConnectionLostEvent(keeper_state=KeeperState.CONNECTING),
+            ConnectionLostEvent(),
         ):
             return state, [
                 LogStateTransition(BLATHER, "Skipping state change")
