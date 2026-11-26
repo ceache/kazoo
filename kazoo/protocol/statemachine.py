@@ -900,9 +900,9 @@ def transition(
             ]
 
         case (
-            state,
+            AuthFailed() | Handshaking(is_connecting_allowed=False),
             ConnectResponseReceived(),
-        ) if not state.is_connecting_allowed:
+        ):
             return state, []
 
         case (
