@@ -30,10 +30,13 @@ from kazoo.exceptions import (
     InvalidStateTransitionError,
     KazooException,
     NoNodeError,
+    OperationTimeoutError,
     ReplyTooLargeError,
     SASLException,
     SessionClosedRequireSaslError,
     SessionExpiredError,
+    SessionMovedError,
+    ThrottledOpError,
 )
 from kazoo.loggingsupport import BLATHER
 from kazoo.protocol.sasl import (
@@ -1161,13 +1164,38 @@ class ConnectionHandler:
                 if zxid > 0:
                     client.last_zxid = zxid
                 if err_code:
+                    if err_code not in EXCEPTIONS:
+                        raise AuthFailedError(f"SASL error {err_code}")
                     callback_exception = EXCEPTIONS[err_code]()
                     self.logger.debug(
                         "Received error(xid=%s) %r",
                         xid,
                         callback_exception,
                     )
-                    raise callback_exception
+                    if isinstance(
+                        callback_exception,
+                        (
+                            AuthFailedError,
+                            SessionClosedRequireSaslError,
+                            SessionExpiredError,
+                        ),
+                    ):
+                        raise callback_exception
+                    if isinstance(
+                        callback_exception,
+                        (
+                            ConnectionLoss,
+                            OperationTimeoutError,
+                            SessionMovedError,
+                            ThrottledOpError,
+                        ),
+                    ):
+                        raise ConnectionDropped(
+                            f"Transient SASL error: {callback_exception!r}"
+                        ) from callback_exception
+                    raise AuthFailedError(
+                        f"SASL error: {callback_exception!r}"
+                    ) from callback_exception
                 self._emit_event(SASLChallengeReceived(challenge=challenge))
             case ResponsePacket():
                 self.logger.log(

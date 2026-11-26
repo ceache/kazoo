@@ -2129,3 +2129,43 @@ class TestWakeupOutsideSelect:
                 s_b.close()
             except Exception:
                 pass
+
+    def test_sasl_init_and_response_error_normalization(self) -> None:
+        """SASLExchange.__init__ errors and SASLResponse codes never crash."""
+        from kazoo.exceptions import (
+            AuthFailedError,
+            ConnectionLoss,
+            MarshallingError,
+            SessionExpiredError,
+            SessionMovedError,
+            UnimplementedError,
+        )
+        from kazoo.protocol.sasl import SASLConfig, SASLExchange
+        from kazoo.protocol.serialization import SASLResponse
+
+        cfg = SASLConfig(mechanism="GSSAPI")
+
+        def failing_factory(**kwargs: Any) -> Any:
+            raise OSError("kerberos GSSError init failed")
+
+        with pytest.raises(SASLException, match="SASL init failed"):
+            SASLExchange(cfg, "127.0.0.1", client_factory=failing_factory)
+
+        client = _make_mock_client()
+        conn = ConnectionHandler(client, KazooRetry())
+
+        # Permanent/unknown codes raise AuthFailedError
+        for code in (UnimplementedError.code, MarshallingError.code, -999):
+            with pytest.raises(AuthFailedError):
+                conn._process_packet(SASLResponse(xid=1, zxid=10, err=code))
+
+        # Transient transport/session codes raise ConnectionDropped
+        for code in (ConnectionLoss.code, SessionMovedError.code):
+            with pytest.raises(ConnectionDropped):
+                conn._process_packet(SASLResponse(xid=1, zxid=11, err=code))
+
+        # SessionExpiredError propagates for reconnect handling
+        with pytest.raises(SessionExpiredError):
+            conn._process_packet(
+                SASLResponse(xid=1, zxid=12, err=SessionExpiredError.code)
+            )
