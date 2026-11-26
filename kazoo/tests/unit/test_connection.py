@@ -1066,9 +1066,11 @@ class TestConnectionIOLoopDecomposition:
         assert len(events) == 0
 
     def test_run_io_loop_terminates_when_is_terminal(self) -> None:
+        from kazoo.protocol.statemachine import Handshaking
+
         client = _make_mock_client()
         client._state_machine = Mock()
-        client._state_machine.state = Connecting()
+        client._state_machine.state = Handshaking(host="127.0.0.1", port=2181)
         conn = ConnectionHandler(client, KazooRetry())
         conn._socket = Mock()
 
@@ -1083,6 +1085,48 @@ class TestConnectionIOLoopDecomposition:
         conn._poll_step = fake_poll_step  # type: ignore[method-assign]
         conn._run_io_loop()
         assert steps == 3
+
+    def test_run_io_loop_exits_without_spin_on_direct_teardown_events(
+        self,
+    ) -> None:
+        """Direct ConnectionLost/SessionExpired closes socket without spin."""
+        import socket
+
+        from kazoo.protocol.statemachine import (
+            ConnectionLostEvent,
+            SessionExpiredEvent,
+            Suspended,
+        )
+
+        for ev in (
+            ConnectionLostEvent(reason="direct drop"),
+            SessionExpiredEvent(session_id=42),
+        ):
+            client = KazooClient(hosts="127.0.0.1:2181")
+            conn = client._connection
+            s_a, s_b = socket.socketpair()
+            try:
+                s_a.setblocking(False)
+                s_b.sendall(b"unread bytes")
+                conn._selector = client.handler.create_selector()
+                conn._socket = s_a
+                conn._setup_selector()
+                client._state_machine.state = Connected(
+                    host="127.0.0.1", port=2181, session_id=42
+                )
+                client.send_event(ev)
+                assert conn._socket is None
+                # Even if a socket were still set in a non-active state,
+                # _run_io_loop exits immediately without spinning.
+                conn._socket = s_b
+                if isinstance(ev, ConnectionLostEvent):
+                    assert isinstance(client.state_machine, Suspended)
+                conn._run_io_loop()
+                conn._socket = None
+            finally:
+                conn._close_selector()
+                s_a.close()
+                s_b.close()
 
     def test_run_io_loop_terminates_when_socket_closed(self) -> None:
         client = _make_mock_client()

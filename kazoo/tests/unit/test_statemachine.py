@@ -455,7 +455,7 @@ class TestPureTransitionMatrix:
             state, ConnectionLostEvent(reason="drop")
         )
         assert next_state == Connecting(host="127.0.0.1", port=2181, attempt=1)
-        assert effects == []
+        assert effects == [CloseSocket(reason="drop")]
 
     def test_authenticating_sasl_and_auth_packets_progression(self) -> None:
         state = Handshaking(
@@ -555,6 +555,7 @@ class TestPureTransitionMatrix:
             host="127.0.0.1", port=2181, session_id=42, attempt=1
         )
         assert effects == [
+            CloseSocket(reason="socket broken"),
             LogStateTransition(logging.INFO, "Zookeeper connection lost"),
             FailPendingRequests(KeeperState.CONNECTING),
             EmitKazooStateChange(KazooState.SUSPENDED),
@@ -570,6 +571,7 @@ class TestPureTransitionMatrix:
             host="127.0.0.2", port=2181, session_id=42, attempt=1
         )
         assert effects == [
+            CloseSocket(reason="Found RW server"),
             LogStateTransition(logging.INFO, "Zookeeper connection lost"),
             FailPendingRequests(KeeperState.CONNECTING),
             EmitKazooStateChange(KazooState.SUSPENDED),
@@ -631,6 +633,7 @@ class TestPureTransitionMatrix:
             kazoo_state=KazooState.SUSPENDED,
         )
         assert effects == [
+            CloseSocket(reason="Connection reset by peer"),
             LogStateTransition(
                 logging.WARNING,
                 "Connection dropped in SASL: %s",
@@ -657,6 +660,7 @@ class TestPureTransitionMatrix:
             attempt=1,
         )
         assert effects == [
+            CloseSocket(reason="Connection reset by peer"),
             LogStateTransition(
                 logging.WARNING,
                 "Connection dropped in SASL: %s",
@@ -678,7 +682,7 @@ class TestPureTransitionMatrix:
             state_lost, ConnectionLostEvent(reason="network drop")
         )
         assert next_s1 == Connecting(host="127.0.0.1", port=2181, attempt=1)
-        assert eff1 == []
+        assert eff1 == [CloseSocket(reason="network drop")]
 
         state_susp = Authenticating(
             stage=AuthStage.INITIAL_AUTH,
@@ -693,7 +697,7 @@ class TestPureTransitionMatrix:
         assert next_s2 == Suspended(
             host="127.0.0.1", port=2181, session_id=1, attempt=1
         )
-        assert eff2 == []
+        assert eff2 == [CloseSocket(reason="network drop")]
 
     def test_terminal_states_ignore_connection_lost(self) -> None:
         # Inactive is absorbing (0 effects)
@@ -723,6 +727,7 @@ class TestPureTransitionMatrix:
         )
         assert next_state == ExpiredSession(session_id=42)
         assert effects == [
+            CloseSocket(reason="Session has expired"),
             LogStateTransition(
                 logging.INFO,
                 "Zookeeper session closed, state: %s",
@@ -752,6 +757,7 @@ class TestPureTransitionMatrix:
         next_state, effects = transition(state, SessionClosedEvent())
         assert next_state == Inactive()
         assert effects == [
+            CloseSocket(reason="Connection closed"),
             LogStateTransition(
                 logging.INFO,
                 "Zookeeper session closed, state: %s",
@@ -759,7 +765,7 @@ class TestPureTransitionMatrix:
             ),
             ResolveConnectResult(
                 success=False,
-                exception=effects[1].exception,  # type: ignore[union-attr]
+                exception=effects[2].exception,  # type: ignore[union-attr]
             ),
             EmitKazooStateChange(KazooState.LOST),
             FailPendingRequests(KeeperState.CLOSED),
@@ -767,7 +773,7 @@ class TestPureTransitionMatrix:
             StopConnectionLoop(),
         ]
         assert isinstance(
-            effects[1].exception,  # type: ignore[union-attr]
+            effects[2].exception,  # type: ignore[union-attr]
             ConnectionClosedError,
         )
 
@@ -798,6 +804,37 @@ class TestPureTransitionMatrix:
         s2, _ = transition(s1, ConnectionLostEvent(reason="dropped"))
         assert isinstance(s2, Suspended)
         assert s2.is_connecting_allowed is False
+
+        # Closing ConnectedReadOnly preserves is_connecting_allowed=False on
+        # RWServerFoundEvent and SessionExpiredEvent.
+        closing_ro = ConnectedReadOnly(
+            host="127.0.0.1",
+            port=2181,
+            session_id=42,
+            is_connecting_allowed=False,
+        )
+        s_rw, _ = transition(
+            closing_ro, RWServerFoundEvent(server=("127.0.0.2", 2181))
+        )
+        assert isinstance(s_rw, Suspended)
+        assert s_rw.is_connecting_allowed is False
+
+        s_exp, _ = transition(closing_ro, SessionExpiredEvent(session_id=42))
+        assert isinstance(s_exp, ExpiredSession)
+        assert s_exp.is_connecting_allowed is False
+
+        # Terminal AuthFailed stays AuthFailed on SessionExpiredEvent and
+        # ConnectionLostEvent regardless of keeper_state.
+        af = AuthFailed(error=AuthFailedError("bad"))
+        assert transition(af, SessionExpiredEvent(session_id=42)) == (af, [])
+        s_af, eff_af = transition(
+            af,
+            ConnectionLostEvent(
+                reason="late", keeper_state=KeeperState.ASSOCIATING
+            ),
+        )
+        assert s_af == af
+        assert eff_af == [LogStateTransition(BLATHER, "Skipping state change")]
 
     def test_auth_failed_to_inactive(self) -> None:
         state = AuthFailed(error=AuthFailedError("Connection dropped in SASL"))
@@ -1746,6 +1783,7 @@ _EFF_SUSPEND = (
     EmitKazooStateChange,
     InvalidateWatchers,
 )
+_EFF_CLOSE_SUSPEND = (CloseSocket,) + _EFF_SUSPEND
 _EFF_FINALIZE = (
     LogStateTransition,
     LogStateTransition,
@@ -1759,12 +1797,14 @@ _EFF_CONNECT_OK = (
     ConfigureReadOnlyMode,
 ) + _EFF_FINALIZE
 _EFF_EXPIRED = (
+    CloseSocket,
     LogStateTransition,
     EmitKazooStateChange,
     FailPendingRequests,
     ResetSessionData,
 )
 _EFF_AUTH_FAILED = (
+    CloseSocket,
     LogStateTransition,
     ResolveConnectResult,
     EmitKazooStateChange,
@@ -1773,6 +1813,7 @@ _EFF_AUTH_FAILED = (
     StopConnectionLoop,
 )
 _EFF_CLOSED = (
+    CloseSocket,
     LogStateTransition,
     ResolveConnectResult,
     EmitKazooStateChange,
@@ -1893,14 +1934,20 @@ _EXPECTED_MATRIX: dict[
     "ConnectionLostEvent": {
         "Inactive": (_SAME, ()),
         "Connecting": (_SAME, ()),
-        "Handshaking": (Connecting, ()),
-        "Handshaking[SUSPENDED]": (Suspended, ()),
-        "Authenticating.SASL": (Connecting, (LogStateTransition,)),
-        "Authenticating.SASL[SUSPENDED]": (Suspended, (LogStateTransition,)),
-        "Authenticating.INITIAL_AUTH": (Connecting, ()),
-        "Authenticating.INITIAL_AUTH[SUSPENDED]": (Suspended, ()),
-        "Connected": (Suspended, _EFF_SUSPEND),
-        "ConnectedReadOnly": (Suspended, _EFF_SUSPEND),
+        "Handshaking": (Connecting, (CloseSocket,)),
+        "Handshaking[SUSPENDED]": (Suspended, (CloseSocket,)),
+        "Authenticating.SASL": (
+            Connecting,
+            (CloseSocket, LogStateTransition),
+        ),
+        "Authenticating.SASL[SUSPENDED]": (
+            Suspended,
+            (CloseSocket, LogStateTransition),
+        ),
+        "Authenticating.INITIAL_AUTH": (Connecting, (CloseSocket,)),
+        "Authenticating.INITIAL_AUTH[SUSPENDED]": (Suspended, (CloseSocket,)),
+        "Connected": (Suspended, _EFF_CLOSE_SUSPEND),
+        "ConnectedReadOnly": (Suspended, _EFF_CLOSE_SUSPEND),
         "Suspended": (_SAME, ()),
         "ExpiredSession": (_SAME, (LogStateTransition,)),
         "AuthFailed": (_SAME, (LogStateTransition,)),
@@ -1921,7 +1968,7 @@ _EXPECTED_MATRIX: dict[
         "ConnectedReadOnly": (ExpiredSession, _EFF_EXPIRED),
         "Suspended": (ExpiredSession, _EFF_EXPIRED),
         "ExpiredSession": (_SAME, ()),
-        "AuthFailed": (ExpiredSession, _EFF_EXPIRED),
+        "AuthFailed": (_SAME, ()),
     },
     "AuthFailedEvent": {
         "Inactive": (_SAME, ()),
@@ -1980,8 +2027,8 @@ _EXPECTED_MATRIX: dict[
         "Authenticating.SASL[SUSPENDED]": (_SAME, ()),
         "Authenticating.INITIAL_AUTH": (_SAME, ()),
         "Authenticating.INITIAL_AUTH[SUSPENDED]": (_SAME, ()),
-        "Connected": (Suspended, _EFF_SUSPEND),
-        "ConnectedReadOnly": (Suspended, _EFF_SUSPEND),
+        "Connected": (Suspended, _EFF_CLOSE_SUSPEND),
+        "ConnectedReadOnly": (Suspended, _EFF_CLOSE_SUSPEND),
         "Suspended": (_SAME, ()),
         "ExpiredSession": (_SAME, ()),
         "AuthFailed": (_SAME, ()),

@@ -80,10 +80,13 @@ from kazoo.protocol.statemachine import (
     ConfigureReadOnlyMode,
     ConfigureTimeouts,
     ConnectAttemptStarted,
+    Connected,
+    ConnectedReadOnly,
     ConnectionLostEvent,
     ConnectResponseReceived,
     DrainWakeupPipe,
     EnqueueCloseRequest,
+    Handshaking,
     Inactive,
     ReadConnectResponsePacket,
     ReadSocketPacket,
@@ -1480,10 +1483,11 @@ class ConnectionHandler:
         self._dispatch_ready_events(ready, deadline)
 
     def _run_io_loop(self) -> None:
-        """Drive selector loop until terminal state or socket closed."""
+        """Drive selector loop while in an active-socket state."""
         while (
-            not isinstance(
-                self.client._state_machine.state, (Inactive, AuthFailed)
+            isinstance(
+                self.client._state_machine.state,
+                (Handshaking, Authenticating, Connected, ConnectedReadOnly),
             )
             and self._socket is not None
         ):
