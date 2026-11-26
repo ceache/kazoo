@@ -1210,16 +1210,17 @@ class FrameDecoder:
             self._frame_len = n
 
         if n > self._max_payload:
+            if avail >= 8:
+                xid = int_struct.unpack_from(self._buf, self._head + 4)[0]
+                if xid <= 0:
+                    raise ConnectionDropped(
+                        f"Oversize frame length {n} for non-request xid {xid}"
+                    )
             if avail < 20:
                 return None
             header = ReplyHeader(
                 *reply_header_struct.unpack_from(self._buf, self._head + 4)
             )
-            if header.xid <= 0:
-                raise ConnectionDropped(
-                    f"Oversize frame length {n} for non-request "
-                    f"xid {header.xid}"
-                )
             end = self._head + 4 + n
             if end > self._tail:
                 self._skip = end - self._tail

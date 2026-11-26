@@ -31,11 +31,15 @@ def test_session_callback_states() -> None:
     )
     assert client.state == KazooState.CONNECTED
 
+    client.send_event(ConnectionLostEvent(reason="drop"))
+    assert client.state == KazooState.SUSPENDED
+
     client.send_event(AuthFailedEvent())
     assert client.state == KazooState.LOST
 
-    client.send_event(ConnectionLostEvent(keeper_state=-250))
-    assert client.state == KazooState.SUSPENDED
+    # Terminal AuthFailed must not be resurrected by late ConnectionLostEvent
+    client.send_event(ConnectionLostEvent(keeper_state=-250))  # type: ignore[arg-type]
+    assert client.state == KazooState.LOST
 
 
 def test_start_fails_immediately_on_auth_failed() -> None:

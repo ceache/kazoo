@@ -830,7 +830,7 @@ class TestPureTransitionMatrix:
         s_af, eff_af = transition(
             af,
             ConnectionLostEvent(
-                reason="late", keeper_state=KeeperState.ASSOCIATING
+                reason="late", keeper_state=KeeperState.CLOSED
             ),
         )
         assert s_af == af
@@ -1290,6 +1290,7 @@ class TestClientStateMachineDriver:
         self,
     ) -> None:
         client = KazooClient()
+        client._state_machine.state = Connected(host="127.0.0.1", port=2181)
         conn = client._connection
         async_result = client.handler.async_result()
         client._pending.append(
@@ -1390,6 +1391,7 @@ class TestClientStateMachineDriver:
         # Reconnect attempt starts, socket connects -> Handshaking with
         # kazoo_state=SUSPENDED
         client.send_event(ConnectAttemptStarted(host="127.0.0.1", port=2181))
+        client._connection._socket = mock_sock
         client.send_event(
             SocketConnected(host="127.0.0.1", port=2181, session_id=42)
         )
@@ -1439,6 +1441,7 @@ class TestClientStateMachineDriver:
         # Reconnect starts SASL negotiation -> Authenticating(SASL)
         # with kazoo_state=SUSPENDED
         client.send_event(ConnectAttemptStarted(host="127.0.0.1", port=2181))
+        client._connection._socket = mock_sock
         client.send_event(
             SocketConnected(host="127.0.0.1", port=2181, session_id=42)
         )

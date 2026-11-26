@@ -946,12 +946,13 @@ class KazooClient:
             if self._conn_result is not None and not self._conn_result.ready():
                 return self._conn_result
             with self._state_machine._dispatch_lock:
-                if self.connected:
+                cur_state = self._state_machine.state
+                if cur_state.is_connected:
                     result = self.handler.async_result()
                     result.set(True)
                     return result
                 if (
-                    self._state_machine.state.is_connecting_allowed
+                    cur_state.is_connecting_allowed
                     and not self._connection.connection_stopped.is_set()
                 ):
                     self._conn_result = self.handler.async_result()
