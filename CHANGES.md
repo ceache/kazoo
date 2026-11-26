@@ -31,13 +31,15 @@
   * SASL negotiation requests share the unified client XID counter.
   * unexpected exceptions raised by the SASL mechanism are reported as `AuthFailedError('Authentication failed')` caused by `SASLException('SASL step failed')` (was `AuthFailedError('Unknown error')`).
   * the `BLATHER` `Session created` log line no longer includes the session password; connect and read timeouts are reported in seconds.
-  * `FrameDecoder` now allocates a fixed linear receive buffer (`READ_WINDOW + 4 + max_buffer + REPLY_OVERHEAD` = `1,310,811` bytes at the default `JUTE_MAX_BUFFER`, reused across reconnects) fed directly via `recv_into()`, dispatches replies uniformly by `xid` (no `is_connect`/`is_sasl` flags), deserializes normal responses in-decoder into `ResponsePacket` (releasing the frame `memoryview` slice immediately without lent-view tracking), and unpacks `Transaction` multi-headers directly without constructing temporary `MultiHeader` objects.
+  * `FrameDecoder` now lazily allocates a fixed linear receive buffer (`READ_WINDOW + 4 + max_buffer + REPLY_OVERHEAD` = `1,310,811` bytes at the default `JUTE_MAX_BUFFER`, reused across reconnects and released on `close()`) fed via non-blocking `recv_into()`, dispatches replies uniformly by `xid` (no `is_connect`/`is_sasl` flags), deserializes normal responses in-decoder into `ResponsePacket` (releasing the frame `memoryview` slice immediately without lent-view tracking), coalesces outbound request frames into contiguous write batches, and packs/unpacks `Transaction` multi-headers directly without constructing temporary `MultiHeader` objects.
 
 #### Bug Fixes
 
 * **protocol:**
   * handle `SASLException` and `SessionClosedRequireSaslError` cleanly as `AUTH_FAILED` in `_connect_attempt` (addresses #594)
   * connection dropped during SASL negotiation retries connecting/suspending instead of failing permanently as `AUTH_FAILED` (restores #594)
+  * serialize `StateMachineDriver.send_event()` with an `RLock` across the outermost dispatch, keep `wakeup` registered throughout each connection attempt, and keep `_read_packet()` non-blocking so `stop()` stays responsive across threading, gevent, and eventlet handlers
+  * track `Auth` (`xid=-4`) responses in a dedicated `auth_pending` queue isolated from positive-XID FIFO requests, and track `_last_recv` for heartbeat and dead-peer timeout detection even under continuous outbound wakeups
 * **client:**
   * wake connection unconditionally on request enqueue to eliminate lost-wakeup race condition
   * make state change listener notifications idempotent and deduplicate against `_last_notified_state` rather than asserting
