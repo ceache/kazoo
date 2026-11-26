@@ -1287,6 +1287,14 @@ def transition(
 class StateMachineDriver:
     """Thread/Greenlet-safe serialized event driver for ClientState."""
 
+    __slots__ = (
+        "state",
+        "_effect_executor",
+        "_event_queue",
+        "_dispatch_lock",
+        "_processing_events",
+    )
+
     def __init__(
         self,
         handler: IHandler,
