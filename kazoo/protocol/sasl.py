@@ -160,6 +160,24 @@ class SASLConfig:
         return cls.from_dict(sasl_options), filtered_auth
 
 
+def _normalize_sasl_error(
+    exc: Exception, default_message: str
+) -> AuthFailedError | SASLException | None:
+    """Map underlying puresasl/kerberos errors to Kazoo SASL exceptions.
+
+    Returns ``None`` if ``exc`` is already a ``SASLException`` or
+    ``AuthFailedError`` and should be re-raised as-is.
+    """
+    if isinstance(exc, (SASLException, AuthFailedError)):
+        return None
+    if PURESASL_AVAILABLE:
+        if isinstance(exc, puresasl.SASLProtocolException):
+            return AuthFailedError("protocol error")
+        if isinstance(exc, puresasl.SASLError):
+            return SASLException("library error")
+    return SASLException(default_message)
+
+
 class SASLExchange:
     """Sans-I/O driver for a single SASL challenge-response exchange."""
 
@@ -176,14 +194,20 @@ class SASLExchange:
         )
         self.config = sasl_cfg
         kwargs = sasl_cfg.to_client_kwargs(host)
-        if client_factory is not None:
-            self._sasl_cli: SASLClientProtocol = client_factory(**kwargs)
-        else:
-            if not PURESASL_AVAILABLE:
-                raise SASLException("Missing SASL support")
-            self._sasl_cli = puresasl.client.SASLClient(  # type: ignore[no-untyped-call]
-                **kwargs
-            )
+        if client_factory is None and not PURESASL_AVAILABLE:
+            raise SASLException("Missing SASL support")
+        try:
+            if client_factory is not None:
+                self._sasl_cli: SASLClientProtocol = client_factory(**kwargs)
+            else:
+                self._sasl_cli = puresasl.client.SASLClient(  # type: ignore[no-untyped-call]
+                    **kwargs
+                )
+        except Exception as exc:
+            normalized = _normalize_sasl_error(exc, "SASL init failed")
+            if normalized is None:
+                raise
+            raise normalized from exc
 
     @property
     def client(self) -> SASLClientProtocol:
@@ -207,14 +231,10 @@ class SASLExchange:
         try:
             response = self._sasl_cli.process(challenge=challenge)
         except Exception as exc:
-            if isinstance(exc, (SASLException, AuthFailedError)):
+            normalized = _normalize_sasl_error(exc, "SASL step failed")
+            if normalized is None:
                 raise
-            if PURESASL_AVAILABLE:
-                if isinstance(exc, puresasl.SASLProtocolException):
-                    raise AuthFailedError("protocol error") from exc
-                if isinstance(exc, puresasl.SASLError):
-                    raise SASLException("library error") from exc
-            raise SASLException("SASL step failed") from exc
+            raise normalized from exc
 
         if bool(getattr(self._sasl_cli, "complete", False)) and not response:
             return None
