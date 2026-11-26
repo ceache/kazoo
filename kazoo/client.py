@@ -893,7 +893,7 @@ class KazooClient:
             async_object.set_exception(
                 ConnectionClosedError("Connection has been closed")
             )
-            return None
+            return False
         return None
 
     def start(self, timeout: float = 15.0) -> None:
@@ -1358,7 +1358,6 @@ class KazooClient:
         @capture_exceptions(async_result)
         def do_create() -> None:
             inner_async_result = self.handler.async_result()
-            inner_async_result.rawlink(create_completion)
 
             call_result = self._call(opcode, inner_async_result)
             if call_result is False:
@@ -1368,6 +1367,7 @@ class KazooClient:
                 # KazooClient.create so that it gets set on the correct
                 # async_result object
                 raise cast("Exception", inner_async_result.exception)
+            inner_async_result.rawlink(create_completion)
 
         @capture_exceptions(async_result)
         def retry_completion(result: IAsyncResult) -> None:
