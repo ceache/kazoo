@@ -7,7 +7,7 @@ import logging
 import re
 import warnings
 from collections import defaultdict, deque
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import partial
 from os.path import split
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast, overload
@@ -186,7 +186,7 @@ class KazooClient:
         handler: IHandler | SequentialGeventHandler | None = None,
         default_acl: Sequence[ACL] | None = None,
         auth_data: Iterable[tuple[str, str]] | None = None,
-        sasl_options: dict[str, str] | None = None,
+        sasl_options: Mapping[str, Any] | SASLConfig | None = None,
         read_only: bool | None = None,
         randomize_hosts: bool = True,
         connection_retry: KazooRetry | KazooRetryParams | None = None,
@@ -218,7 +218,7 @@ class KazooClient:
         handler: IHandler | SequentialGeventHandler | None = None,
         default_acl: Sequence[ACL] | None = None,
         auth_data: Iterable[tuple[str, str]] | None = None,
-        sasl_options: dict[str, str] | None = None,
+        sasl_options: Mapping[str, Any] | SASLConfig | None = None,
         read_only: bool | None = None,
         randomize_hosts: bool = True,
         connection_retry: KazooRetry | KazooRetryParams | None = None,
@@ -244,7 +244,7 @@ class KazooClient:
         handler: IHandler | SequentialGeventHandler | None = None,
         default_acl: Sequence[ACL] | None = None,
         auth_data: Iterable[tuple[str, str]] | None = None,
-        sasl_options: dict[str, str] | None = None,
+        sasl_options: Mapping[str, Any] | SASLConfig | None = None,
         read_only: bool | None = None,
         randomize_hosts: bool = True,
         connection_retry: KazooRetry | KazooRetryParams | None = None,
@@ -404,9 +404,9 @@ class KazooClient:
         self.keyfile = keyfile
         self.keyfile_password = keyfile_password
         self.ca = ca
-        if (
-            concurrent_request_limit is not None
-            and concurrent_request_limit <= 0
+        if concurrent_request_limit is not None and (
+            isinstance(concurrent_request_limit, bool)
+            or concurrent_request_limit <= 0
         ):
             raise ConfigurationError(
                 "concurrent_request_limit must be greater than 0"
@@ -417,7 +417,7 @@ class KazooClient:
                 "Zookeeper client rate-limited to %d concurrent requests",
                 concurrent_request_limit,
             )
-        if max_buffer <= 0:
+        if isinstance(max_buffer, bool) or max_buffer <= 0:
             raise ConfigurationError("max_buffer must be greater than 0")
         self.max_buffer = max_buffer
 

@@ -178,3 +178,51 @@ def test_start_async_during_expired_and_post_connect_suspended() -> None:
         assert client.start_async().get_nowait() is True
     finally:
         conn.connection_stopped.set()
+
+
+def test_constructor_sasl_options_and_bool_limits() -> None:
+    """Validate SASLConfig edge cases and reject bool integer limits."""
+    from kazoo.protocol.sasl import SASLConfig
+
+    with pytest.raises(ConfigurationError):
+        KazooClient(sasl_options={})
+
+    with pytest.raises(ConfigurationError):
+        KazooClient(max_buffer=True)
+
+    with pytest.raises(ConfigurationError):
+        KazooClient(concurrent_request_limit=True)
+
+    cfg = SASLConfig(mechanism="DIGEST-MD5", username="u", password="p:w")
+    c_cfg = KazooClient(sasl_options=cfg)
+    assert c_cfg._connection.sasl_config == cfg
+
+    c_empty_pw = KazooClient(
+        sasl_options={
+            "mechanism": "PLAIN",
+            "username": "u",
+            "password": "",
+        }
+    )
+    assert c_empty_pw._connection.sasl_config is not None
+    assert c_empty_pw._connection.sasl_config.password == ""
+
+    cb = lambda: ("u", "p")  # noqa: E731
+    c_cb = KazooClient(
+        sasl_options={"mechanism": "DIGEST-MD5", "callback": cb}
+    )
+    assert c_cb._connection.sasl_config is not None
+    assert ("callback", cb) in c_cb._connection.sasl_config.extra_options
+
+    c_custom_mech = KazooClient(sasl_options={"mechanism": "EXTERNAL"})
+    assert c_custom_mech._connection.sasl_config is not None
+    assert c_custom_mech._connection.sasl_config.mechanism == "EXTERNAL"
+
+    with pytest.deprecated_call():
+        c_legacy = KazooClient(auth_data=[("sasl", "user:pass:with:colons")])
+    assert c_legacy._connection.sasl_config is not None
+    assert c_legacy._connection.sasl_config.username == "user"
+    assert c_legacy._connection.sasl_config.password == "pass:with:colons"
+
+    with pytest.deprecated_call(), pytest.raises(ConfigurationError):
+        KazooClient(auth_data=[("sasl", "no-colon")])
