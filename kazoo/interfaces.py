@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 from typing_extensions import Buffer
 
 if TYPE_CHECKING:
-    import queue
     from types import TracebackType
 
     from kazoo.protocol.states import Callback
@@ -174,8 +173,8 @@ class IHandler(Protocol):
     # FIXME These should be methods but I want to avoid changing the API for
     # now.
     timeout_exception: type[Exception] = None  # type: ignore[assignment]
-    sleep_func: staticmethod[[float], None] = None  # type: ignore[assignment]
-    queue_impl: type[queue.Queue[Any]] = None  # type: ignore[assignment]
+    sleep_func: Callable[[float], Any] = None  # type: ignore[assignment]
+    queue_impl: type[Any] = None  # type: ignore[assignment]
 
     def start(self) -> None:
         """Start the handler, used for setting up the handler."""
