@@ -20,8 +20,6 @@ from typing import (
     cast,
 )
 
-from typing_extensions import Buffer
-
 from kazoo.exceptions import (
     EXCEPTIONS,
     AuthFailedError,
@@ -148,11 +146,6 @@ CLOSE_RESPONSE = Close.type
 
 # Micro-optimization: We will always use the same ping instance
 _PingInstance = Ping()
-
-
-# removed from Python3+
-def buffer(obj: Buffer, offset: int = 0) -> memoryview:
-    return memoryview(obj)[offset:]
 
 
 class RequestManager:
@@ -681,9 +674,6 @@ class ConnectionHandler:
             self._emit_event(SASLCompleted())
             return
         self._sasl_exchange = SASLExchange(self.sasl_config, host)
-        self.client.sasl_cli = (  # type: ignore[attr-defined]
-            self._sasl_exchange.client
-        )
         self._step_sasl(challenge=None)
 
     def _step_sasl(self, challenge: bytes | None) -> None:
@@ -778,13 +768,10 @@ class ConnectionHandler:
                 session_id=sid,
                 session_passwd=passwd,
                 protocol_version=proto_version,
-                last_zxid=zxid,
             ):
                 self.client._session_id = sid
                 self.client._session_passwd = passwd
                 self.client._protocol_version = proto_version
-                if zxid is not None and zxid > 0:
-                    self.client.last_zxid = zxid
 
             case ConfigureTimeouts(
                 read_timeout=r_timeout, connect_timeout=c_timeout
@@ -1079,7 +1066,7 @@ class ConnectionHandler:
 
         watchers = self._watchers.collect_for_event(watch.type, path)
         if watchers is None:
-            self.logger.warn("Received unknown event %r", watch.type)
+            self.logger.warning("Received unknown event %r", watch.type)
             return
 
         # Strip the chroot if needed
@@ -1306,7 +1293,6 @@ class ConnectionHandler:
 
     def _send_request(
         self,
-        read_timeout: float,
         connect_timeout: float,
     ) -> None:
         """Called when we have something to send out on the socket.
@@ -1514,9 +1500,7 @@ class ConnectionHandler:
             if "wakeup" in ready:
                 self._drain_wakeup()
                 if self._is_session_active:
-                    self._send_request(
-                        self._read_timeout, self._connect_timeout
-                    )
+                    self._send_request(self._connect_timeout)
                     self._check_session_health(deadline)
                     return True
                 else:
@@ -1548,7 +1532,7 @@ class ConnectionHandler:
             )
         ):
             self._drain_wakeup()
-            self._send_request(self._read_timeout, self._connect_timeout)
+            self._send_request(self._connect_timeout)
 
         if self._frame_decoder.frame_ready:
             self._replies_since_select += 1

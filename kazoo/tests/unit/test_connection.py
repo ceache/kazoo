@@ -201,7 +201,7 @@ class TestConnectionXidMismatch:
         wire = reply_header_struct.pack(2, 100, 0)
 
         with pytest.raises(RuntimeError) as exc_info:
-            connection._frame_decoder.decode_packet(wire)
+            connection._frame_decoder._decode_packet(wire)
 
         assert exc_info.value.args == (
             "xids do not match, expected 1 received 2",
@@ -1232,7 +1232,7 @@ class TestConnectionIOLoopDecomposition:
         conn._requests.enqueue(r1, a1)
         conn._requests.enqueue(r2, a2)
 
-        conn._send_request(10.0, 10.0)
+        conn._send_request(10.0)
 
         # Both requests should have been dequeued and submitted
         assert len(conn._requests.queue) == 0
@@ -1310,7 +1310,7 @@ class TestConnectionIOLoopDecomposition:
         # Enqueue 1 request that fills capacity
         r1, a1 = Ping(), Mock()
         conn._requests.enqueue(r1, a1)
-        conn._send_request(10.0, 10.0)
+        conn._send_request(10.0)
         assert len(conn._requests.pending) == 1
         assert not conn._requests.has_send_capacity(1)
 
@@ -1319,12 +1319,12 @@ class TestConnectionIOLoopDecomposition:
         conn._requests.enqueue(r2, a2)
 
         # When not terminal, _send_request cannot send r2
-        conn._send_request(10.0, 10.0)
+        conn._send_request(10.0)
         assert len(conn._requests.queue) == 1
 
         # When terminal, _send_request bypasses capacity and sends Close
         client._state_machine.state = Inactive()
-        conn._send_request(10.0, 10.0)
+        conn._send_request(10.0)
         assert len(conn._requests.queue) == 0
         assert len(conn._requests.pending) == 2
 
@@ -1362,9 +1362,7 @@ class TestConnectionIOLoopDecomposition:
         client._connection._socket = sock
         client._state_machine.state = Handshaking(host="127.0.0.1", port=2181)
         client.send_event(
-            ConnectResponseReceived(
-                Connect(0, 0, 10000, 42, b"pwd", False), zxid=1
-            )
+            ConnectResponseReceived(Connect(0, 0, 10000, 42, b"pwd", False))
         )
         assert isinstance(client.state_machine, Connected)
         client._connection.wake = Mock()  # type: ignore[method-assign]
@@ -2326,7 +2324,7 @@ class TestWakeupOutsideSelect:
         conn._requests.enqueue(Auth(0, "digest", "u:p"), auth_res)
         conn._requests.enqueue(GetData("/k", None), get_res)
 
-        conn._send_request(10.0, 10.0)
+        conn._send_request(10.0)
         assert len(conn._requests.auth_pending) == 1
         assert len(conn._requests.pending) == 1
 
@@ -2339,7 +2337,7 @@ class TestWakeupOutsideSelect:
         auth_body = reply_header_struct.pack(-4, 20, 0)
         auth_wire = int_struct.pack(len(auth_body)) + auth_body
 
-        conn._frame_decoder.feed(getdata_wire + auth_wire)
+        conn._frame_decoder._feed(getdata_wire + auth_wire)
         conn._read_socket()
         conn._read_socket()
 

@@ -242,7 +242,7 @@ class TestPureTransitionMatrix:
             read_only=False,
         )
         next_state, effects = transition(
-            state, ConnectResponseReceived(connect_result=connect_res, zxid=77)
+            state, ConnectResponseReceived(connect_result=connect_res)
         )
         assert next_state == Connected(
             host="127.0.0.1",
@@ -256,7 +256,6 @@ class TestPureTransitionMatrix:
                 session_id=999,
                 session_passwd=b"newpass",
                 protocol_version=0,
-                last_zxid=77,
             ),
             ConfigureTimeouts(
                 read_timeout=20.0,
@@ -378,7 +377,6 @@ class TestPureTransitionMatrix:
                 session_id=555,
                 session_passwd=b"pwd",
                 protocol_version=0,
-                last_zxid=None,
             ),
             ConfigureTimeouts(read_timeout=10.0, connect_timeout=15.0),
             ConfigureReadOnlyMode(read_only=False),
@@ -419,7 +417,6 @@ class TestPureTransitionMatrix:
                 session_id=555,
                 session_passwd=b"pwd",
                 protocol_version=0,
-                last_zxid=None,
             ),
             ConfigureTimeouts(read_timeout=10.0, connect_timeout=15.0),
             ConfigureReadOnlyMode(read_only=False),
@@ -491,7 +488,6 @@ class TestPureTransitionMatrix:
                 session_id=999,
                 session_passwd=b"pwd",
                 protocol_version=0,
-                last_zxid=None,
             ),
             ConfigureTimeouts(read_timeout=6.0, connect_timeout=9.0),
             ConfigureReadOnlyMode(read_only=False),
@@ -1147,7 +1143,7 @@ class TestClientStateMachineDriver:
         )
         client.send_event(
             ConnectResponseReceived(
-                connect_result=Connect(0, 0, 10000, 100, b"pwd", False), zxid=1
+                connect_result=Connect(0, 0, 10000, 100, b"pwd", False)
             )
         )
 
@@ -1349,7 +1345,7 @@ class TestClientStateMachineDriver:
         )
         client.send_event(
             ConnectResponseReceived(
-                connect_result=Connect(0, 0, 10000, 1, b"pwd", False), zxid=1
+                connect_result=Connect(0, 0, 10000, 1, b"pwd", False)
             )
         )
         assert isinstance(client.state_machine, Authenticating)
@@ -1376,9 +1372,7 @@ class TestClientStateMachineDriver:
             host="127.0.0.1", port=2181, num_hosts=1
         )
         client.send_event(
-            ConnectResponseReceived(
-                Connect(0, 0, 10000, 42, b"pwd", False), zxid=1
-            )
+            ConnectResponseReceived(Connect(0, 0, 10000, 42, b"pwd", False))
         )
         assert client.state == KazooState.CONNECTED
         assert seen == [KazooState.CONNECTED]
@@ -1426,9 +1420,7 @@ class TestClientStateMachineDriver:
             host="127.0.0.1", port=2181, session_id=42
         )
         client.send_event(
-            ConnectResponseReceived(
-                Connect(0, 0, 10000, 42, b"pwd", False), zxid=1
-            )
+            ConnectResponseReceived(Connect(0, 0, 10000, 42, b"pwd", False))
         )
         assert client.state == KazooState.CONNECTED
         assert seen == [KazooState.CONNECTED]
@@ -1548,7 +1540,7 @@ class TestClientStateMachineDriver:
         )
         client.send_event(
             ConnectResponseReceived(
-                connect_result=Connect(0, 0, 10000, 1, b"pwd", False), zxid=1
+                connect_result=Connect(0, 0, 10000, 1, b"pwd", False)
             )
         )
         assert conn._is_session_active is True
@@ -1571,13 +1563,11 @@ class TestClientStateMachineDriver:
                 session_id=888,
                 session_passwd=b"mysecret",
                 protocol_version=1,
-                last_zxid=100,
             )
         )
         assert client._session_id == 888
         assert client._session_passwd == b"mysecret"
         assert client._protocol_version == 1
-        assert client.last_zxid == 100
 
     def test_execute_effect_configure_timeouts(self) -> None:
         client = KazooClient()
@@ -1622,16 +1612,16 @@ class TestFrameDecoderAndRequestManager:
         # Feed 1 byte at a time for the first frame
         first_frame_wire = wire[: 4 + len(f1)]
         for b in first_frame_wire[:-1]:
-            decoder.feed(bytes([b]))
+            decoder._feed(bytes([b]))
             assert decoder.pop_packet() is None
-        decoder.feed(first_frame_wire[-1:])
+        decoder._feed(first_frame_wire[-1:])
         p1 = decoder.pop_packet()
         assert isinstance(p1, ResponsePacket)
         assert p1.header == ReplyHeader(xid=1, zxid=100, err=0)
         assert decoder.pop_packet() is None
 
         # Feed both frames concatenated at once
-        decoder.feed(wire)
+        decoder._feed(wire)
         p_both_1 = decoder.pop_packet()
         p_both_2 = decoder.pop_packet()
         assert isinstance(p_both_1, ResponsePacket)
@@ -1653,9 +1643,9 @@ class TestFrameDecoderAndRequestManager:
         body.extend([0])
         wire = int_struct.pack(len(body)) + bytes(body)
 
-        decoder.feed(wire[:3])
+        decoder._feed(wire[:3])
         assert decoder.pop_packet() is None
-        decoder.feed(wire[3:])
+        decoder._feed(wire[3:])
         conn_res = decoder.pop_packet()
         assert isinstance(conn_res, Connect)
         assert conn_res.session_id == 12345
@@ -1665,7 +1655,7 @@ class TestFrameDecoderAndRequestManager:
         f_auth = reply_header_struct.pack(-4, 201, 0)
         f_sasl = reply_header_struct.pack(3, 202, 0) + _write_buffer(b"tok")
         for f in (f_ping, f_auth, f_sasl):
-            decoder.feed(int_struct.pack(len(f)) + f)
+            decoder._feed(int_struct.pack(len(f)) + f)
 
         assert decoder.pop_packet() == PingResponse(zxid=200, err=0)
         assert decoder.pop_packet() == AuthResponse(zxid=201, err=0)
@@ -1675,7 +1665,7 @@ class TestFrameDecoderAndRequestManager:
 
         decoder.reset()
         with pytest.raises(ConnectionDropped, match="Invalid frame length"):
-            decoder.feed(int_struct.pack(-5))
+            decoder._feed(int_struct.pack(-5))
 
     def test_request_manager_lifecycle(self) -> None:
         mgr = RequestManager()
@@ -1760,7 +1750,7 @@ _MATRIX_EVENTS: list[tuple[str, ClientEvent]] = [
     (
         "ConnectResponseReceived",
         ConnectResponseReceived(
-            connect_result=Connect(0, 0, 10000, 1, b"pwd", False), zxid=1
+            connect_result=Connect(0, 0, 10000, 1, b"pwd", False)
         ),
     ),
     ("SASLChallengeReceived", SASLChallengeReceived(challenge=b"token")),
@@ -2174,7 +2164,6 @@ class TestExhaustiveTransitionMatrix:
                 Connected(session_id=1),
                 ConnectResponseReceived(
                     connect_result=MagicMock(time_out=4000, session_id=1),
-                    zxid=1,
                 ),
             )
         assert "ConnectResponseReceived" in str(exc_info.value)
@@ -2199,7 +2188,7 @@ class TestExhaustiveTransitionMatrix:
         s_exp, eff_exp = transition(
             Handshaking(host="127.0.0.1", port=2181),
             ConnectResponseReceived(
-                connect_result=Connect(0, 0, 0, 99, b"pwd", False), zxid=1
+                connect_result=Connect(0, 0, 0, 99, b"pwd", False)
             ),
         )
         assert isinstance(s_exp, ExpiredSession)

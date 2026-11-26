@@ -237,7 +237,7 @@ class TestRateControl:
 
         # Tick 1: send requests up to limit=2
         assert can_send()
-        conn._send_request(10.0, 10.0)
+        conn._send_request(10.0)
         assert len(client._pending) == 2
         assert len(client._queue) == 3
 
@@ -253,7 +253,7 @@ class TestRateControl:
         assert can_send()
 
         # Tick 2: send request 2 up to limit=2
-        conn._send_request(10.0, 10.0)
+        conn._send_request(10.0)
         assert len(client._pending) == 2
         assert len(client._queue) == 2
         assert not can_send()
@@ -261,7 +261,7 @@ class TestRateControl:
         # Complete remaining requests
         while client._pending or client._queue:
             if can_send() and client._queue:
-                conn._send_request(10.0, 10.0)
+                conn._send_request(10.0)
             elif client._pending:
                 req, async_obj, xid = client._pending.popleft()
                 async_obj.set(f"resp_{xid}")

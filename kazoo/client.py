@@ -65,17 +65,14 @@ from kazoo.protocol.statemachine import (
     CloseRequested,
     Connected,
     ConnectedReadOnly,
-    DrainWakeupPipe,
     EmitKazooStateChange,
     ExpiredSession,
     FailPendingRequests,
     Inactive,
     InvalidateWatchers,
     LogStateTransition,
-    ReadSocketPacket,
     ResetSessionData,
     ResolveConnectResult,
-    SendHeartbeatPing,
     SideEffect,
     StateMachineDriver,
 )
@@ -799,9 +796,6 @@ class KazooClient:
     def _execute_effect(self, effect: SideEffect) -> None:
         """Route and execute descriptive side effects."""
         match effect:
-            case ReadSocketPacket() | DrainWakeupPipe() | SendHeartbeatPing():
-                self._connection.execute_effect(effect)
-
             case LogStateTransition(level=level, message=message, args=args):
                 self.logger.log(level, message, *args)
 

@@ -26,7 +26,7 @@ def test_session_callback_states() -> None:
     )
     client.send_event(
         ConnectResponseReceived(
-            connect_result=Connect(0, 0, 10000, 1, b"pwd", False), zxid=1
+            connect_result=Connect(0, 0, 10000, 1, b"pwd", False)
         )
     )
     assert client.state == KazooState.CONNECTED
@@ -105,7 +105,7 @@ def test_start_async_success() -> None:
         )
         client.send_event(
             ConnectResponseReceived(
-                connect_result=Connect(0, 0, 10000, 1, b"pwd", False), zxid=1
+                connect_result=Connect(0, 0, 10000, 1, b"pwd", False)
             )
         )
 
@@ -137,7 +137,7 @@ def test_start_async_recovers_from_expired_session() -> None:
         )
         client.send_event(
             ConnectResponseReceived(
-                connect_result=Connect(0, 0, 10000, 1, b"pwd", False), zxid=1
+                connect_result=Connect(0, 0, 10000, 1, b"pwd", False)
             )
         )
 

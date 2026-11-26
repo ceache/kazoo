@@ -777,7 +777,7 @@ class TestDataclassPacketsAndFrameDecoder:
             + _int_int_struct.pack(3, 3)
             + _write_string("/watched")
         )
-        decoder.feed(_int_struct.pack(len(watch_payload)) + watch_payload)
+        decoder._feed(_int_struct.pack(len(watch_payload)) + watch_payload)
         pkt = decoder.pop_packet()
         assert pkt == serialization.WatchPacket(
             zxid=555,
@@ -795,7 +795,7 @@ class TestDataclassPacketsAndFrameDecoder:
 
         # Feed and pop far more than one buffer's worth of frames
         for _ in range(4000):
-            decoder.feed(frame_wire)
+            decoder._feed(frame_wire)
             p = decoder.pop_packet()
             assert p == serialization.PingResponse(zxid=10, err=0)
 
@@ -854,12 +854,12 @@ class TestDataclassPacketsAndFrameDecoder:
         f2 = _reply_header_struct.pack(2, 101, 0)
         wire2 = _int_struct.pack(len(f2)) + f2
 
-        decoder.feed(wire1)
+        decoder._feed(wire1)
         p1 = decoder.pop_packet()
         assert isinstance(p1, serialization.ResponsePacket)
         assert p1.response is True
 
-        decoder.feed(wire2)
+        decoder._feed(wire2)
         p2 = decoder.pop_packet()
         assert isinstance(p2, serialization.ResponsePacket)
         assert p1.header.xid == 1
@@ -1077,7 +1077,7 @@ class TestDataclassPacketsAndFrameDecoder:
                     drain(dec, out, rng, always=True)
                     continue
                 n = min(rng.choice([1, 7, 4096, 65536, 262144]), max_take)
-                dec.feed(stream[pos : pos + n])
+                dec._feed(stream[pos : pos + n])
                 pos += n
                 assert_invariants(dec)
                 drain(dec, out, rng, always=not lazy_pop)
@@ -1189,7 +1189,7 @@ class TestDataclassPacketsAndFrameDecoder:
         assert pad_len == 256
         exact_body = hdr_b + _write_buffer(b"a" * pad_len) + stat_b
         assert len(exact_body) == exact_n
-        dec.feed(_int_struct.pack(len(exact_body)) + exact_body)
+        dec._feed(_int_struct.pack(len(exact_body)) + exact_body)
         assert dec.frame_ready is True
         exact_pkt = dec.pop_packet()
         assert isinstance(exact_pkt, serialization.ResponsePacket)
@@ -1206,7 +1206,7 @@ class TestDataclassPacketsAndFrameDecoder:
         next_wire = _int_struct.pack(len(next_body)) + next_body
 
         # Feed just 20 bytes (4B len + 16B ReplyHeader) first
-        dec.feed(over_wire[:20])
+        dec._feed(over_wire[:20])
         assert dec.frame_ready is True
         over_pkt = dec.pop_packet()
         assert isinstance(over_pkt, serialization.ResponsePacket)
@@ -1218,9 +1218,9 @@ class TestDataclassPacketsAndFrameDecoder:
 
         # Skip the rest across multiple chunks, then decode next_wire
         rest = over_wire[20:] + next_wire
-        dec.feed(rest[:100])
+        dec._feed(rest[:100])
         assert dec.pop_packet() is None
-        dec.feed(rest[100:])
+        dec._feed(rest[100:])
         next_pkt = dec.pop_packet()
         assert isinstance(next_pkt, serialization.ResponsePacket)
         assert next_pkt.header == serialization.ReplyHeader(
@@ -1301,7 +1301,7 @@ class TestDataclassPacketsAndFrameDecoder:
         )
 
         view = memoryview(wire).cast("b")
-        dec.feed(view[:1000])
+        dec._feed(view[:1000])
         assert dec.frame_ready is True
         pkt = dec.pop_packet()
         assert isinstance(pkt, serialization.ResponsePacket)
@@ -1312,7 +1312,7 @@ class TestDataclassPacketsAndFrameDecoder:
         pos = 1000
         while pos < len(view):
             chunk = view[pos : pos + 100_000]
-            dec.feed(chunk)
+            dec._feed(chunk)
             pos += len(chunk)
 
         pkt2 = dec.pop_packet()
@@ -1379,7 +1379,7 @@ class TestDataclassPacketsAndFrameDecoder:
         # 1) msg_len 15 rejected, 16 accepted
         dec = serialization.FrameDecoder(max_buffer=0)
         with pytest.raises(ConnectionDropped, match="Invalid frame length"):
-            dec.feed(_int_struct.pack(15))
+            dec._feed(_int_struct.pack(15))
         dec.reset()
 
         pending: collections.deque[tuple[object, object, int]] = (
@@ -1388,7 +1388,7 @@ class TestDataclassPacketsAndFrameDecoder:
         dec = serialization.FrameDecoder(
             max_buffer=0, pop_pending=pending.popleft
         )
-        dec.feed(_int_struct.pack(16) + _reply_header_struct.pack(1, 1, 0))
+        dec._feed(_int_struct.pack(16) + _reply_header_struct.pack(1, 1, 0))
         pkt16 = dec.pop_packet()
         assert isinstance(pkt16, serialization.ResponsePacket)
         assert pkt16.response is True
@@ -1401,7 +1401,7 @@ class TestDataclassPacketsAndFrameDecoder:
         )
         assert len(exact_body) == exact_n
         pending.append((serialization.GetData("/p", None), None, 2))
-        dec.feed(_int_struct.pack(exact_n) + exact_body)
+        dec._feed(_int_struct.pack(exact_n) + exact_body)
         pkt88 = dec.pop_packet()
         assert isinstance(pkt88, serialization.ResponsePacket)
         assert pkt88.error is None
@@ -1413,7 +1413,7 @@ class TestDataclassPacketsAndFrameDecoder:
         pending.append((serialization.GetData("/p", None), None, 3))
         pending.append((serialization.Delete("/p", -1), None, 4))
         # Deliver oversize inside READ_WINDOW + next frame in one read
-        dec.feed(
+        dec._feed(
             _int_struct.pack(over_n)
             + over_body
             + _int_struct.pack(16)
@@ -1436,7 +1436,7 @@ class TestDataclassPacketsAndFrameDecoder:
             + _reply_header_struct.pack(5, 5, 0)
             + b"x" * (over_n - 16)
         )
-        dec.feed(bad_xid_wire[:24])
+        dec._feed(bad_xid_wire[:24])
         with pytest.raises(
             RuntimeError, match="^xids do not match, expected 99 received 5$"
         ):
@@ -1452,12 +1452,12 @@ class TestDataclassPacketsAndFrameDecoder:
                 + b"x" * (over_n - 16)
             )
             with pytest.raises(ConnectionDropped, match="Oversize frame"):
-                dec.feed(wire[:20])
+                dec._feed(wire[:20])
             dec.reset()
             # Split after 4 bytes so xid arrives in second read
-            dec.feed(wire[:4])
+            dec._feed(wire[:4])
             with pytest.raises(ConnectionDropped, match="Oversize frame"):
-                dec.feed(wire[4:20])
+                dec._feed(wire[4:20])
 
     def test_frame_decoder_dispatch_errors_and_connect_readonly(self) -> None:
         from unittest.mock import Mock
@@ -1478,14 +1478,14 @@ class TestDataclassPacketsAndFrameDecoder:
                 + _write_buffer(b"")
                 + ro_bytes
             )
-            dec.feed(_int_struct.pack(len(body)) + body)
+            dec._feed(_int_struct.pack(len(body)) + body)
             pkt = dec.pop_packet()
             assert isinstance(pkt, serialization.Connect)
             assert pkt.session_id == 42
             assert pkt.read_only is expected_ro
 
         # Corrupt 16-byte Connect response -> ConnectionDropped
-        dec.feed(_int_struct.pack(16) + _int_int_long_struct.pack(0, 1, 2))
+        dec._feed(_int_struct.pack(16) + _int_int_long_struct.pack(0, 1, 2))
         with pytest.raises(
             ConnectionDropped, match="invalid server connect response"
         ):
@@ -1494,7 +1494,7 @@ class TestDataclassPacketsAndFrameDecoder:
         # Unknown negative xid -> ConnectionDropped
         for unknown_xid in (-3, -99):
             body = _reply_header_struct.pack(unknown_xid, 1, 0)
-            dec.feed(_int_struct.pack(len(body)) + body)
+            dec._feed(_int_struct.pack(len(body)) + body)
             with pytest.raises(
                 ConnectionDropped, match="Unknown reserved xid"
             ):
@@ -1502,20 +1502,20 @@ class TestDataclassPacketsAndFrameDecoder:
 
         # Empty pending on positive xid -> ConnectionDropped
         body_pos = _reply_header_struct.pack(1, 1, 0)
-        dec.feed(_int_struct.pack(len(body_pos)) + body_pos)
+        dec._feed(_int_struct.pack(len(body_pos)) + body_pos)
         with pytest.raises(ConnectionDropped, match="empty pending"):
             dec.pop_packet()
 
         # pop_pending=None on positive xid -> ConnectionDropped
         dec_no_pending = serialization.FrameDecoder()
-        dec_no_pending.feed(_int_struct.pack(len(body_pos)) + body_pos)
+        dec_no_pending._feed(_int_struct.pack(len(body_pos)) + body_pos)
         with pytest.raises(ConnectionDropped, match="no pending queue"):
             dec_no_pending.pop_packet()
 
         # xid mismatch -> async_object failed before RuntimeError raised
         async_obj = Mock()
         pending.append((serialization.Delete("/p", -1), async_obj, 10))
-        dec.feed(_int_struct.pack(16) + _reply_header_struct.pack(11, 5, 0))
+        dec._feed(_int_struct.pack(16) + _reply_header_struct.pack(11, 5, 0))
         with pytest.raises(
             RuntimeError, match="^xids do not match, expected 10 received 11$"
         ):
@@ -1529,7 +1529,7 @@ class TestDataclassPacketsAndFrameDecoder:
         pending.append((serialization.Delete("/ok", -1), a_ok, 21))
         bad_getdata = _reply_header_struct.pack(20, 100, 0)  # missing body
         good_del = _reply_header_struct.pack(21, 101, 0)
-        dec.feed(
+        dec._feed(
             _int_struct.pack(len(bad_getdata))
             + bad_getdata
             + _int_struct.pack(len(good_del))
@@ -1560,7 +1560,7 @@ class TestDataclassPacketsAndFrameDecoder:
         for trigger in ("pop", "get_buffer", "feed", "reset"):
             dec.reset()
             pending.append((serialization.Delete("/p", -1), None, 1))
-            dec.feed(make_reply_wire(1))
+            dec._feed(make_reply_wire(1))
             pkt = dec.pop_packet()
             assert isinstance(pkt, serialization.ResponsePacket)
             if trigger == "pop":
@@ -1568,7 +1568,7 @@ class TestDataclassPacketsAndFrameDecoder:
             elif trigger == "get_buffer":
                 dec.get_buffer()
             elif trigger == "feed":
-                dec.feed(b"")
+                dec._feed(b"")
             else:
                 dec.reset()
             assert id(dec._buf) == buf_id
@@ -1576,7 +1576,7 @@ class TestDataclassPacketsAndFrameDecoder:
         ping_b = _reply_header_struct.pack(
             serialization.ReservedXID.PING, 1, 0
         )
-        dec.feed(_int_struct.pack(len(ping_b)) + ping_b)
+        dec._feed(_int_struct.pack(len(ping_b)) + ping_b)
         assert isinstance(dec.pop_packet(), serialization.PingResponse)
         assert id(dec._buf) == buf_id
 
@@ -1587,7 +1587,7 @@ class TestDataclassPacketsAndFrameDecoder:
             with pytest.raises(
                 ConnectionDropped, match="Invalid frame length"
             ):
-                d1.feed(bad_hdr)
+                d1._feed(bad_hdr)
 
             d2 = serialization.FrameDecoder()
             mv = d2.get_buffer()
@@ -1673,12 +1673,12 @@ class TestDataclassPacketsAndFrameDecoder:
         # Feed until READ_WINDOW is reached (frame size 260)
         while dec._tail + len(frame) <= serialization.READ_WINDOW:
             pending.append((serialization.Delete("/p", -1), None, 1))
-            dec.feed(frame)
+            dec._feed(frame)
         # Fill past READ_WINDOW with another frame straddling L
         rem = serialization.READ_WINDOW - dec._tail
         if rem > 0:
             pending.append((serialization.Delete("/p", -1), None, 2))
-            dec.feed(
+            dec._feed(
                 _int_struct.pack(256)
                 + _reply_header_struct.pack(2, 2, 0)
                 + b"\x00" * (256 - len(hdr))
@@ -1695,7 +1695,7 @@ class TestDataclassPacketsAndFrameDecoder:
         over_wire = (
             _int_struct.pack(over_n) + hdr + b"\x00" * (over_n - len(hdr))
         )
-        dec.feed(over_wire[:40])
+        dec._feed(over_wire[:40])
         assert dec.frame_ready is True
         with pytest.raises(BufferError, match="pop frames"):
             dec.get_buffer()
@@ -1743,7 +1743,7 @@ class TestDataclassPacketsAndFrameDecoder:
         bad_wire = _int_struct.pack(len(bad_body)) + bad_body
         good_body = _reply_header_struct.pack(9, 10, 0)
         good_wire = _int_struct.pack(len(good_body)) + good_body
-        dec.feed(bad_wire + good_wire)
+        dec._feed(bad_wire + good_wire)
 
         with pytest.raises(
             ConnectionDropped, match="invalid server SASL response"
@@ -1766,7 +1766,7 @@ class TestDataclassPacketsAndFrameDecoder:
 
         # 1) Truncated WATCH frame (16 bytes < 20-byte watch_header_struct)
         short_watch = _reply_header_struct.pack(-1, 1, 0)
-        dec.feed(_int_struct.pack(len(short_watch)) + short_watch)
+        dec._feed(_int_struct.pack(len(short_watch)) + short_watch)
         with pytest.raises(
             ConnectionDropped, match="invalid server watch packet"
         ):
@@ -1780,7 +1780,7 @@ class TestDataclassPacketsAndFrameDecoder:
             + _int_struct.pack(len(bad_path))
             + bad_path
         )
-        dec.feed(_int_struct.pack(len(bad_watch)) + bad_watch)
+        dec._feed(_int_struct.pack(len(bad_watch)) + bad_watch)
         with pytest.raises(
             ConnectionDropped, match="invalid server watch packet"
         ):
@@ -1794,7 +1794,7 @@ class TestDataclassPacketsAndFrameDecoder:
             + _reply_header_struct.pack(12, 3, 0)
             + b"x" * (over_n - 16)
         )
-        dec.feed(over_sasl[:32])
+        dec._feed(over_sasl[:32])
         with pytest.raises(ConnectionDropped, match="Oversize SASL reply"):
             dec.pop_packet()
 
@@ -1808,7 +1808,7 @@ class TestDataclassPacketsAndFrameDecoder:
         stat = _stat_struct.pack(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
 
         def feed(body: bytes) -> None:
-            dec.feed(_int_struct.pack(len(body)) + body)
+            dec._feed(_int_struct.pack(len(body)) + body)
 
         # Request replies whose fields do not span the frame fail only
         # that request; later frames still decode.
@@ -1892,7 +1892,7 @@ class TestDataclassPacketsAndFrameDecoder:
         assert len(burst) > serialization.READ_WINDOW
 
         with pytest.raises(BufferError, match="pop frames"):
-            dec.feed(burst)
+            dec._feed(burst)
         assert len(dec._buf) == orig_cap
 
         while dec.pop_packet() is not None:
@@ -1969,7 +1969,7 @@ class TestDataclassPacketsAndFrameDecoder:
             watch_body = serialization.watch_header_struct.pack(
                 -1, 5, 0, 1, 3
             ) + _int_struct.pack(bad_len)
-            dec.feed(_int_struct.pack(len(watch_body)) + watch_body)
+            dec._feed(_int_struct.pack(len(watch_body)) + watch_body)
             with pytest.raises(
                 ConnectionDropped, match="invalid server watch packet"
             ):

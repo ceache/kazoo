@@ -128,6 +128,15 @@ def _read_acl(bytes: bytes | memoryview, offset: int) -> tuple[ACL, int]:
     return ACL(Permissions(perms), Id(scheme, id)), offset
 
 
+def _write_acls(buf: bytearray, acls: Sequence[ACL]) -> None:
+    """Append a length-prefixed ACL sequence to ``buf``."""
+    buf.extend(int_struct.pack(len(acls)))
+    for acl in acls:
+        buf.extend(int_struct.pack(acl.perms))
+        buf.extend(_write_string(acl.id.scheme))
+        buf.extend(_write_string(acl.id.id))
+
+
 def _write_string(bytes: str | None) -> bytes:
     # FIXME? This doesn't seem to behave sensibly if you pass in an empty
     # string. It will write a length of -1, which is the same as if you passed
@@ -254,13 +263,7 @@ class Create:
         b = bytearray()
         b.extend(_write_string(self.path))
         b.extend(_write_buffer(self.data))
-        b.extend(int_struct.pack(len(self.acl)))
-        for acl in self.acl:
-            b.extend(
-                int_struct.pack(acl.perms)
-                + _write_string(acl.id.scheme)
-                + _write_string(acl.id.id)
-            )
+        _write_acls(b, self.acl)
         b.extend(int_struct.pack(self.flags))
         return b
 
@@ -399,13 +402,7 @@ class SetACL:
     def serialize(self) -> bytearray:
         b = bytearray()
         b.extend(_write_string(self.path))
-        b.extend(int_struct.pack(len(self.acls)))
-        for acl in self.acls:
-            b.extend(
-                int_struct.pack(acl.perms)
-                + _write_string(acl.id.scheme)
-                + _write_string(acl.id.id)
-            )
+        _write_acls(b, self.acls)
         b.extend(int_struct.pack(self.version))
         return b
 
@@ -525,13 +522,7 @@ class Create2:
         b = bytearray()
         b.extend(_write_string(self.path))
         b.extend(_write_buffer(self.data))
-        b.extend(int_struct.pack(len(self.acl)))
-        for acl in self.acl:
-            b.extend(
-                int_struct.pack(acl.perms)
-                + _write_string(acl.id.scheme)
-                + _write_string(acl.id.id)
-            )
+        _write_acls(b, self.acl)
         b.extend(int_struct.pack(self.flags))
         return b
 
@@ -557,13 +548,7 @@ class CreateContainer:
         b = bytearray()
         b.extend(_write_string(self.path))
         b.extend(_write_buffer(self.data))
-        b.extend(int_struct.pack(len(self.acl)))
-        for acl in self.acl:
-            b.extend(
-                int_struct.pack(acl.perms)
-                + _write_string(acl.id.scheme)
-                + _write_string(acl.id.id)
-            )
+        _write_acls(b, self.acl)
         b.extend(int_struct.pack(self.flags))
         return b
 
@@ -590,13 +575,7 @@ class CreateTTL:
         b = bytearray()
         b.extend(_write_string(self.path))
         b.extend(_write_buffer(self.data))
-        b.extend(int_struct.pack(len(self.acl)))
-        for acl in self.acl:
-            b.extend(
-                int_struct.pack(acl.perms)
-                + _write_string(acl.id.scheme)
-                + _write_string(acl.id.id)
-            )
+        _write_acls(b, self.acl)
         b.extend(int_struct.pack(self.flags))
         b.extend(long_struct.pack(self.ttl))
         return b
@@ -855,6 +834,7 @@ class PingResponse:
     def deserialize(
         cls, buffer: bytes | memoryview, offset: int
     ) -> tuple[PingResponse, int]:
+        """Direct/test helper; bypassed by FrameDecoder._decode_packet()."""
         _, zxid, err = reply_header_struct.unpack_from(buffer, offset)
         return cls(zxid=zxid, err=err), offset + reply_header_struct.size
 
@@ -870,6 +850,7 @@ class AuthResponse:
     def deserialize(
         cls, buffer: bytes | memoryview, offset: int
     ) -> tuple[AuthResponse, int]:
+        """Direct/test helper; bypassed by FrameDecoder._decode_packet()."""
         _, zxid, err = reply_header_struct.unpack_from(buffer, offset)
         return cls(zxid=zxid, err=err), offset + reply_header_struct.size
 
@@ -1156,8 +1137,13 @@ class FrameDecoder:
         self._tail += nbytes
         self._advance_scan()
 
-    def feed(self, data: bytes | bytearray | memoryview) -> None:
-        """Append incoming bytes without ``recv_into`` (tests/feeding)."""
+    def _feed(self, data: bytes | bytearray | memoryview) -> None:
+        """Internal test-only helper to feed bytes without ``recv_into``.
+
+        Copies ``data`` in chunks through :meth:`get_buffer` and
+        :meth:`buffer_updated`. Runtime I/O does not call this method; it
+        reads directly into ``get_buffer()`` via ``socket.recv_into()``.
+        """
         if not data:
             return
         mv = memoryview(data)
@@ -1275,12 +1261,16 @@ class FrameDecoder:
         self._frame_len = -1
 
         try:
-            return self.decode_packet(frame_view)
+            return self._decode_packet(frame_view)
         finally:
             frame_view.release()
 
-    def decode_packet(self, frame: bytes | memoryview) -> ServerPacket:
-        """Decode a complete raw frame into a typed ServerPacket."""
+    def _decode_packet(self, frame: bytes | memoryview) -> ServerPacket:
+        """Internal helper to decode a complete raw frame into a ServerPacket.
+
+        Called by :meth:`pop_packet` at runtime and directly by unit tests for
+        single-frame decoding.
+        """
         size = len(frame)
         if size < 16:
             raise ConnectionDropped(
@@ -1391,9 +1381,9 @@ class FrameDecoder:
     def encode_request(request: Any, xid: int | None = None) -> bytes:
         """Encode a client request into a 4-byte length-prefixed wire frame."""
         b = bytearray()
-        if xid:
+        if xid is not None:
             b.extend(int_struct.pack(xid))
-        if request.type:
+        if request.type is not None:
             b.extend(int_struct.pack(request.type))
         b += request.serialize()
         return int_struct.pack(len(b)) + b
