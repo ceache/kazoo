@@ -2377,3 +2377,43 @@ class TestWakeupOutsideSelect:
             _, deadline = conn._compute_poll_timeout()
             with pytest.raises(client.handler.timeout_exception):
                 conn._dispatch_ready_events({"wakeup"}, deadline)
+
+    def test_auth_response_transient_vs_permanent_errors(self) -> None:
+        """AuthResponse separates transient drops from permanent AuthFailed."""
+        from kazoo.exceptions import (
+            AuthFailedError,
+            SessionExpiredError,
+            SessionMovedError,
+        )
+        from kazoo.protocol.serialization import AuthResponse
+
+        client = KazooClient(hosts="127.0.0.1:2181")
+        conn = client._connection
+        client._state_machine.state = Connected(host="127.0.0.1", port=2181)
+
+        # Transient SessionExpiredError -> raises SessionExpiredError
+        res_exp = client.handler.async_result()
+        conn._requests.auth_pending.append(res_exp)
+        with pytest.raises(SessionExpiredError):
+            conn._process_packet(
+                AuthResponse(zxid=1, err=SessionExpiredError.code)
+            )
+        assert isinstance(res_exp.exception, SessionExpiredError)
+        assert isinstance(client.state_machine, Connected)
+
+        # Transient SessionMovedError -> raises ConnectionDropped (reconnects)
+        res_moved = client.handler.async_result()
+        conn._requests.auth_pending.append(res_moved)
+        with pytest.raises(ConnectionDropped):
+            conn._process_packet(
+                AuthResponse(zxid=2, err=SessionMovedError.code)
+            )
+        assert isinstance(res_moved.exception, SessionMovedError)
+        assert isinstance(client.state_machine, Connected)
+
+        # Permanent AuthFailedError -> transitions to terminal AuthFailed
+        res_fail = client.handler.async_result()
+        conn._requests.auth_pending.append(res_fail)
+        conn._process_packet(AuthResponse(zxid=3, err=AuthFailedError.code))
+        assert isinstance(res_fail.exception, AuthFailedError)
+        assert isinstance(client.state_machine, AuthFailed)

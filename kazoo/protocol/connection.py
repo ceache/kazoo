@@ -1205,10 +1205,24 @@ class ConnectionHandler:
                     err = (
                         EXCEPTIONS[err_code]()
                         if err_code in EXCEPTIONS
-                        else AuthFailedError()
+                        else AuthFailedError(f"Auth error {err_code}")
                     )
                     if async_object is not None:
                         async_object.set_exception(err)
+                    if isinstance(err, SessionExpiredError):
+                        raise err
+                    if isinstance(
+                        err,
+                        (
+                            ConnectionLoss,
+                            OperationTimeoutError,
+                            SessionMovedError,
+                            ThrottledOpError,
+                        ),
+                    ):
+                        raise ConnectionDropped(
+                            f"Transient auth error: {err!r}"
+                        ) from err
                     self._emit_event(AuthFailedEvent(error=err))
                 else:
                     if async_object is not None:
