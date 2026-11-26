@@ -1034,8 +1034,10 @@ class TestSASLConfigAndExchange:
         )
 
     def test_sasl_config_from_client_options_validation(self) -> None:
-        with pytest.raises(ConfigurationError, match="mechanism must be"):
-            SASLConfig.from_client_options({"mechanism": "INVALID"})
+        with pytest.raises(ConfigurationError, match="specify a mechanism"):
+            SASLConfig.from_client_options({"mechanism": ""})
+        cfg, _ = SASLConfig.from_client_options({"mechanism": "EXTERNAL"})
+        assert cfg is not None and cfg.mechanism == "EXTERNAL"
         with pytest.raises(ConfigurationError, match="requires a password"):
             SASLConfig.from_client_options(
                 {"mechanism": "DIGEST-MD5", "username": "alice"}

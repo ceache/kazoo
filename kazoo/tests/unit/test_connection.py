@@ -2422,7 +2422,7 @@ class TestWakeupOutsideSelect:
 
         client = KazooClient(hosts="127.0.0.1:2181")
         conn = client._connection
-        observed: list[tuple[str, bool]] = []
+        observed: list[tuple[Any, bool]] = []
         orig_release = conn._release_wakeup
 
         def spy_release() -> None:
@@ -2430,9 +2430,7 @@ class TestWakeupOutsideSelect:
             orig_release()
 
         client.add_listener(
-            lambda s: observed.append(
-                (f"state:{s}", conn.connection_stopped.is_set())
-            )
+            lambda s: observed.append((s, conn.connection_stopped.is_set()))
         )
         try:
             with patch.object(client.handler, "spawn", return_value=Mock()):
@@ -2449,7 +2447,7 @@ class TestWakeupOutsideSelect:
             ):
                 conn.zk_loop()
             assert conn.connection_stopped.is_set() is True
-            assert ("state:LOST", False) in observed
+            assert (KazooState.LOST, False) in observed
             assert ("release", False) in observed
         finally:
             conn.connection_stopped.set()
