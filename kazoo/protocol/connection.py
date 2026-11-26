@@ -1368,15 +1368,17 @@ class ConnectionHandler:
                 "within the connection retry policy."
             )
         finally:
-            self.connection_stopped.set()
-            if not isinstance(
-                self.client.state_machine, (Inactive, AuthFailed)
-            ):
-                self._emit_event(SessionClosedEvent())
-            # StopConnectionLoop registered the wakeup socket and wrote
-            # a byte to it; nothing selects after this routine returns.
-            self._release_wakeup()
-            self.logger.log(BLATHER, "Connection stopped")
+            try:
+                if not isinstance(
+                    self.client.state_machine, (Inactive, AuthFailed)
+                ):
+                    self._emit_event(SessionClosedEvent())
+            finally:
+                # StopConnectionLoop wrote a wake byte; nothing selects after
+                # this routine returns.
+                self._release_wakeup()
+                self.connection_stopped.set()
+                self.logger.log(BLATHER, "Connection stopped")
 
     def _expand_client_hosts(self) -> list[tuple[str, str, int]]:
         # Expand the entire list in advance so we can randomize it if needed

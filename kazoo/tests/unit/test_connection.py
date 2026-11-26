@@ -2417,3 +2417,43 @@ class TestWakeupOutsideSelect:
         conn._process_packet(AuthResponse(zxid=3, err=AuthFailedError.code))
         assert isinstance(res_fail.exception, AuthFailedError)
         assert isinstance(client.state_machine, AuthFailed)
+
+    def test_zk_loop_sets_connection_stopped_after_teardown(self) -> None:
+        """connection_stopped is set only after SessionClosed & release."""
+        from kazoo.protocol.states import KazooState
+
+        client = KazooClient(hosts="127.0.0.1:2181")
+        conn = client._connection
+        observed: list[tuple[str, bool]] = []
+        orig_release = conn._release_wakeup
+
+        def spy_release() -> None:
+            observed.append(("release", conn.connection_stopped.is_set()))
+            orig_release()
+
+        client.add_listener(
+            lambda s: observed.append(
+                (f"state:{s}", conn.connection_stopped.is_set())
+            )
+        )
+        try:
+            with patch.object(client.handler, "spawn", return_value=Mock()):
+                conn.start()
+            client._state_machine.state = Connected(
+                host="127.0.0.1", port=2181
+            )
+            client._last_notified_state = KazooState.CONNECTED
+            with (
+                patch.object(
+                    conn, "_connect_loop", side_effect=RetryFailedError("done")
+                ),
+                patch.object(conn, "_release_wakeup", side_effect=spy_release),
+            ):
+                conn.zk_loop()
+            assert conn.connection_stopped.is_set() is True
+            assert ("state:LOST", False) in observed
+            assert ("release", False) in observed
+        finally:
+            conn.connection_stopped.set()
+            conn._connection_routine = None
+            conn.close()
