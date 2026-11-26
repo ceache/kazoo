@@ -38,6 +38,7 @@ from kazoo.protocol.serialization import (
     SASL,
     Close,
     Connect,
+    FrameDecoder,
     GetData,
     Ping,
     ReplyHeader,
@@ -1224,8 +1225,11 @@ class TestConnectionIOLoopDecomposition:
         client = _make_mock_client()
         client.concurrent_request_limit = 10
         conn = ConnectionHandler(client, KazooRetry())
+        sent_chunks: list[bytes] = []
         conn._socket = Mock()
-        conn._socket.send.side_effect = lambda v: len(v)
+        conn._socket.send.side_effect = lambda v: (
+            sent_chunks.append(bytes(v)) or len(v)
+        )
 
         r1, a1 = Ping(), Mock()
         r2, a2 = Ping(), Mock()
@@ -1234,9 +1238,13 @@ class TestConnectionIOLoopDecomposition:
 
         conn._send_request(10.0)
 
-        # Both requests should have been dequeued and submitted
+        # Both requests should have been dequeued, coalesced into 1 send()
         assert len(conn._requests.queue) == 0
         assert len(conn._requests.pending) == 2
+        assert sent_chunks == [
+            FrameDecoder.encode_request(r1, 1)
+            + FrameDecoder.encode_request(r2, 2)
+        ]
 
     def test_poll_step_dispatches_queued_requests_when_session_active(
         self,

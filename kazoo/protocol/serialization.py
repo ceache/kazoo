@@ -601,10 +601,10 @@ class Transaction:
     def serialize(self) -> bytearray:
         b = bytearray()
         for op in self.operations:
-            b.extend(
-                MultiHeader(op.type, False, -1).serialize() + op.serialize()
-            )
-        return b + multiheader_struct.pack(-1, True, -1)
+            b.extend(multiheader_struct.pack(op.type, False, -1))
+            b.extend(op.serialize())
+        b.extend(multiheader_struct.pack(-1, True, -1))
+        return b
 
     @classmethod
     def deserialize(
@@ -1381,15 +1381,25 @@ class FrameDecoder:
         )
 
     @staticmethod
+    def encode_request_into(
+        buf: bytearray, request: Any, xid: int | None = None
+    ) -> None:
+        """Append a 4-byte length-prefixed wire frame into ``buf``."""
+        start = len(buf)
+        buf.extend(b"\x00\x00\x00\x00")
+        if xid is not None:
+            buf.extend(int_struct.pack(xid))
+        if request.type is not None:
+            buf.extend(int_struct.pack(request.type))
+        buf.extend(request.serialize())
+        int_struct.pack_into(buf, start, len(buf) - start - 4)
+
+    @staticmethod
     def encode_request(request: Any, xid: int | None = None) -> bytes:
         """Encode a client request into a 4-byte length-prefixed wire frame."""
         b = bytearray()
-        if xid is not None:
-            b.extend(int_struct.pack(xid))
-        if request.type is not None:
-            b.extend(int_struct.pack(request.type))
-        b += request.serialize()
-        return int_struct.pack(len(b)) + b
+        FrameDecoder.encode_request_into(b, request, xid)
+        return bytes(b)
 
 
 __all__ = (

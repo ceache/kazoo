@@ -144,8 +144,11 @@ CHILD_EVENT = 4
 
 CLOSE_RESPONSE = Close.type
 
-# Micro-optimization: We will always use the same ping instance
+# Micro-optimization: reuse ping instance and pre-encoded ping wire frame
 _PingInstance = Ping()
+_PING_FRAME = FrameDecoder.encode_request(_PingInstance, ReservedXID.PING)
+# Cap per-write coalesced outbound frame batch size at 64 KiB
+_SEND_BATCH_MAX = 64 * 1024
 
 
 class RequestManager:
@@ -991,7 +994,9 @@ class ConnectionHandler:
         )
         self._write(FrameDecoder.encode_request(request, xid), timeout)
 
-    def _write(self, msg: bytes, timeout: float | None = None) -> None:
+    def _write(
+        self, msg: bytes | bytearray, timeout: float | None = None
+    ) -> None:
         """Write raw bytes to the socket.
 
         Attempts an optimistic non-blocking send first for the fast-path.
@@ -1297,23 +1302,36 @@ class ConnectionHandler:
     ) -> None:
         """Called when we have something to send out on the socket.
 
+        Coalesces queued requests into contiguous send batches (up to
+        ``_SEND_BATCH_MAX`` bytes per ``_write``) to reduce per-request
+        ``send()`` syscalls while preserving wire order.
+
         When terminal (e.g. during client.stop()), all queued requests bypass
         the concurrent request limit window so that shutdown completes promptly
         without waiting behind a saturated pipeline.
         """
         limit = self.client.concurrent_request_limit
         terminal = self._is_terminal
+        batch = bytearray()
+        encode_into = FrameDecoder.encode_request_into
+
         while terminal or self._requests.has_send_capacity(limit):
             try:
                 request, _ = self._requests.peek_queued()
             except IndexError:
-                return
+                break
 
             # Special case for testing, if this is a _SessionExpire object
             # then throw a SessionExpiration error as if we were dropped
             if request is _SESSION_EXPIRED:
+                if batch:
+                    self._write(batch, connect_timeout)
+                    self._last_send = time.monotonic()
                 raise SessionExpiredError("Session expired: Testing")
             if request is _CONNECTION_DROP:
+                if batch:
+                    self._write(batch, connect_timeout)
+                    self._last_send = time.monotonic()
                 raise ConnectionDropped("Connection dropped: Testing")
 
             # Special case for auth packets
@@ -1323,11 +1341,30 @@ class ConnectionHandler:
                 xid = self._requests.next_xid()
 
             self._requests.dequeue_to_pending(xid)
-            self._submit(request, connect_timeout, xid)
+            level = BLATHER if isinstance(request, Ping) else logging.DEBUG
+            if self.logger.isEnabledFor(level):
+                self.logger.log(
+                    level, "Sending request(xid=%s): %s", xid, request
+                )
+            encode_into(batch, request, xid)
+            if len(batch) >= _SEND_BATCH_MAX:
+                self._write(batch, connect_timeout)
+                self._last_send = time.monotonic()
+                batch.clear()
+
+        if batch:
+            self._write(batch, connect_timeout)
             self._last_send = time.monotonic()
 
     def _send_ping(self, connect_timeout: float) -> None:
-        self._submit(_PingInstance, connect_timeout, ReservedXID.PING)
+        if self.logger.isEnabledFor(BLATHER):
+            self.logger.log(
+                BLATHER,
+                "Sending request(xid=%s): %s",
+                ReservedXID.PING,
+                _PingInstance,
+            )
+        self._write(_PING_FRAME, connect_timeout)
 
         # Determine if we need to check for a r/w server
         if self._ro_mode:

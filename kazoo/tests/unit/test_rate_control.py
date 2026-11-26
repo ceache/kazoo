@@ -220,7 +220,7 @@ class TestRateControl:
         # Mock read_sock and write_sock
         mock_read_sock = Mock()
         conn._read_sock = mock_read_sock
-        conn._submit = Mock()  # type: ignore[method-assign]
+        conn._write = Mock()  # type: ignore[method-assign]
         conn._requests.xid = 0
 
         # Queue 5 requests
