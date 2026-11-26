@@ -160,19 +160,19 @@ class TestPureTransitionMatrix:
             state, ConnectAttemptStarted(host="127.0.0.1", port=2181)
         )
         assert next_state == Inactive()
-        assert effects == []
+        assert effects == ()
 
     def test_start_requested_then_connect_attempt_started(self) -> None:
         state = Inactive()
         s1, eff1 = transition(state, StartRequested())
         assert s1 == Connecting(attempt=0)
-        assert eff1 == []
+        assert eff1 == ()
 
         s2, eff2 = transition(
             s1, ConnectAttemptStarted(host="127.0.0.1", port=2181)
         )
         assert s2 == Connecting(host="127.0.0.1", port=2181, attempt=1)
-        assert eff2 == [LogStateTransition(BLATHER, "Skipping state change")]
+        assert eff2 == (LogStateTransition(BLATHER, "Skipping state change"),)
 
     def test_connecting_increments_attempt_without_effects(self) -> None:
         state = Connecting(host="10.0.0.1", port=2181, attempt=1)
@@ -180,7 +180,7 @@ class TestPureTransitionMatrix:
             state, ConnectAttemptStarted(host="10.0.0.2", port=2181)
         )
         assert next_state == Connecting(host="10.0.0.2", port=2181, attempt=2)
-        assert effects == []
+        assert effects == ()
 
     def test_socket_connected_transitions_to_handshaking_and_sends_packet(
         self,
@@ -213,9 +213,9 @@ class TestPureTransitionMatrix:
             kazoo_state=KazooState.LOST,
         )
         expected_connect = Connect(0, 50, 10000, 123, b"pass", False)
-        assert effects == [
-            SendConnectPacket(connect=expected_connect, timeout=5.0)
-        ]
+        assert effects == (
+            SendConnectPacket(connect=expected_connect, timeout=5.0),
+        )
 
     def test_handshaking_readable_yields_read_connect_response_packet(
         self,
@@ -223,7 +223,7 @@ class TestPureTransitionMatrix:
         state = Handshaking(host="127.0.0.1", port=2181)
         next_state, effects = transition(state, SocketReadable())
         assert next_state == state
-        assert effects == [ReadConnectResponsePacket()]
+        assert effects == (ReadConnectResponsePacket(),)
 
     def test_handshaking_connect_response_success_transitions_to_connected(
         self,
@@ -251,7 +251,7 @@ class TestPureTransitionMatrix:
             read_timeout=20.0,
             connect_timeout=15.0,
         )
-        assert effects == [
+        assert effects == (
             UpdateSessionData(
                 session_id=999,
                 session_passwd=b"newpass",
@@ -278,7 +278,7 @@ class TestPureTransitionMatrix:
             ResolveConnectResult(success=True),
             EmitKazooStateChange(KazooState.CONNECTED),
             SessionEstablished(),
-        ]
+        )
 
     def test_handshaking_connect_response_expired(self) -> None:
         state = Handshaking(
@@ -299,7 +299,7 @@ class TestPureTransitionMatrix:
             state, ConnectResponseReceived(connect_result=connect_res)
         )
         assert next_state == ExpiredSession(session_id=999)
-        assert effects == [
+        assert effects == (
             LogStateTransition(
                 logging.WARNING,
                 "Zookeeper session closed, state: %s",
@@ -309,7 +309,7 @@ class TestPureTransitionMatrix:
             FailPendingRequests(KeeperState.EXPIRED_SESSION),
             ResetSessionData(),
             CloseSocket("Session has expired"),
-        ]
+        )
 
     def test_handshaking_connect_response_expired_initial_connect(
         self,
@@ -332,7 +332,7 @@ class TestPureTransitionMatrix:
             state, ConnectResponseReceived(connect_result=connect_res)
         )
         assert next_state == ExpiredSession(session_id=999)
-        assert effects == [
+        assert effects == (
             LogStateTransition(
                 logging.WARNING,
                 "Zookeeper session closed, state: %s",
@@ -342,7 +342,7 @@ class TestPureTransitionMatrix:
             FailPendingRequests(KeeperState.EXPIRED_SESSION),
             ResetSessionData(),
             CloseSocket("Session has expired"),
-        ]
+        )
 
     def test_handshaking_connect_response_with_sasl(self) -> None:
         state = Handshaking(
@@ -373,7 +373,7 @@ class TestPureTransitionMatrix:
             read_only=False,
             pending_auth=(("digest", "u:p"),),
         )
-        assert effects == [
+        assert effects == (
             UpdateSessionData(
                 session_id=555,
                 session_passwd=b"pwd",
@@ -383,7 +383,7 @@ class TestPureTransitionMatrix:
             ConfigureTimeouts(read_timeout=10.0, connect_timeout=15.0),
             ConfigureReadOnlyMode(read_only=False),
             StartSASLHandshake(host="127.0.0.1"),
-        ]
+        )
 
     def test_handshaking_connect_response_with_auth(self) -> None:
         state = Handshaking(
@@ -414,7 +414,7 @@ class TestPureTransitionMatrix:
             read_only=False,
             pending_auth=(("digest", "u2:p2"),),
         )
-        assert effects == [
+        assert effects == (
             UpdateSessionData(
                 session_id=555,
                 session_passwd=b"pwd",
@@ -424,7 +424,7 @@ class TestPureTransitionMatrix:
             ConfigureTimeouts(read_timeout=10.0, connect_timeout=15.0),
             ConfigureReadOnlyMode(read_only=False),
             SendAuthPacket(scheme="digest", credential="u1:p1"),
-        ]
+        )
 
     def test_handshaking_poll_timeout_drops_connection(self) -> None:
         state = Handshaking(host="127.0.0.1", port=2181)
@@ -432,14 +432,14 @@ class TestPureTransitionMatrix:
         assert next_state == Connecting(
             host="127.0.0.1", port=2181, attempt=1, is_connecting_allowed=True
         )
-        assert effects == [
+        assert effects == (
             CloseSocket(reason="socket time-out during handshake"),
             LogStateTransition(
                 logging.WARNING,
                 "Connection time-out: %s",
                 ("socket time-out during handshake",),
             ),
-        ]
+        )
 
     def test_handshaking_connection_lost_transitions_to_connecting(
         self,
@@ -455,7 +455,7 @@ class TestPureTransitionMatrix:
             state, ConnectionLostEvent(reason="drop")
         )
         assert next_state == Connecting(host="127.0.0.1", port=2181, attempt=1)
-        assert effects == [CloseSocket(reason="drop")]
+        assert effects == (CloseSocket(reason="drop"),)
 
     def test_authenticating_sasl_and_auth_packets_progression(self) -> None:
         state = Handshaking(
@@ -486,7 +486,7 @@ class TestPureTransitionMatrix:
             read_only=False,
             pending_auth=(("digest", "u1:p1"), ("digest", "u2:p2")),
         )
-        assert eff1 == [
+        assert eff1 == (
             UpdateSessionData(
                 session_id=999,
                 session_passwd=b"pwd",
@@ -496,26 +496,26 @@ class TestPureTransitionMatrix:
             ConfigureTimeouts(read_timeout=6.0, connect_timeout=9.0),
             ConfigureReadOnlyMode(read_only=False),
             StartSASLHandshake(host="127.0.0.1"),
-        ]
+        )
 
         # Server challenge -> StepSASLHandshake
         s2, eff2 = transition(s1, SASLChallengeReceived(challenge=b"chal1"))
         assert s2 == s1
-        assert eff2 == [StepSASLHandshake(challenge=b"chal1")]
+        assert eff2 == (StepSASLHandshake(challenge=b"chal1"),)
 
         # SASL completes -> enters INITIAL_AUTH stage and sends first Auth
         s3, eff3 = transition(s2, SASLCompleted())
         assert isinstance(s3, Authenticating)
         assert s3.stage == AuthStage.INITIAL_AUTH
         assert s3.pending_auth == (("digest", "u2:p2"),)
-        assert eff3 == [SendAuthPacket(scheme="digest", credential="u1:p1")]
+        assert eff3 == (SendAuthPacket(scheme="digest", credential="u1:p1"),)
 
         # First Auth packet reply arrives -> sends second pending Auth packet
         s4, eff4 = transition(s3, AuthPacketCompleted())
         assert isinstance(s4, Authenticating)
         assert s4.stage == AuthStage.INITIAL_AUTH
         assert s4.pending_auth == ()
-        assert eff4 == [SendAuthPacket(scheme="digest", credential="u2:p2")]
+        assert eff4 == (SendAuthPacket(scheme="digest", credential="u2:p2"),)
 
         # Second Auth packet reply arrives -> Connected!
         s5, eff5 = transition(s4, AuthPacketCompleted())
@@ -526,7 +526,7 @@ class TestPureTransitionMatrix:
             read_timeout=6.0,
             connect_timeout=9.0,
         )
-        assert eff5 == [
+        assert eff5 == (
             LogStateTransition(
                 logging.INFO,
                 "Zookeeper connection established, state: %s",
@@ -542,7 +542,7 @@ class TestPureTransitionMatrix:
             ResolveConnectResult(success=True),
             EmitKazooStateChange(KazooState.CONNECTED),
             SessionEstablished(),
-        ]
+        )
 
     def test_connected_to_suspended_on_connection_lost(
         self,
@@ -554,13 +554,13 @@ class TestPureTransitionMatrix:
         assert next_state == Suspended(
             host="127.0.0.1", port=2181, session_id=42, attempt=1
         )
-        assert effects == [
+        assert effects == (
             CloseSocket(reason="socket broken"),
             LogStateTransition(logging.INFO, "Zookeeper connection lost"),
             FailPendingRequests(KeeperState.CONNECTING),
             EmitKazooStateChange(KazooState.SUSPENDED),
             InvalidateWatchers(),
-        ]
+        )
 
     def test_connected_ro_to_suspended_on_rw_server_found(self) -> None:
         state = ConnectedReadOnly(host="127.0.0.1", port=2181, session_id=42)
@@ -570,13 +570,13 @@ class TestPureTransitionMatrix:
         assert next_state == Suspended(
             host="127.0.0.2", port=2181, session_id=42, attempt=1
         )
-        assert effects == [
+        assert effects == (
             CloseSocket(reason="Found RW server"),
             LogStateTransition(logging.INFO, "Zookeeper connection lost"),
             FailPendingRequests(KeeperState.CONNECTING),
             EmitKazooStateChange(KazooState.SUSPENDED),
             InvalidateWatchers(),
-        ]
+        )
 
     def test_auth_states_connect_attempt_started(self) -> None:
         for stage in (AuthStage.SASL, AuthStage.INITIAL_AUTH):
@@ -594,7 +594,7 @@ class TestPureTransitionMatrix:
             assert next_s1 == Connecting(
                 host="127.0.0.2", port=2182, attempt=1
             )
-            assert eff1 == []
+            assert eff1 == ()
 
             # 2. kazoo_state == SUSPENDED -> Suspended
             s_susp = Authenticating(
@@ -610,7 +610,7 @@ class TestPureTransitionMatrix:
             assert next_s2 == Suspended(
                 host="127.0.0.2", port=2182, session_id=1, attempt=1
             )
-            assert eff2 == []
+            assert eff2 == ()
 
     def test_auth_sasl_connection_lost_transitions_to_suspended_when_suspended(
         self,
@@ -632,14 +632,14 @@ class TestPureTransitionMatrix:
             attempt=1,
             kazoo_state=KazooState.SUSPENDED,
         )
-        assert effects == [
+        assert effects == (
             CloseSocket(reason="Connection reset by peer"),
             LogStateTransition(
                 logging.WARNING,
                 "Connection dropped in SASL: %s",
                 ("Connection reset by peer",),
             ),
-        ]
+        )
 
     def test_auth_sasl_connection_lost_transitions_to_connecting_when_lost(
         self,
@@ -659,14 +659,14 @@ class TestPureTransitionMatrix:
             port=2181,
             attempt=1,
         )
-        assert effects == [
+        assert effects == (
             CloseSocket(reason="Connection reset by peer"),
             LogStateTransition(
                 logging.WARNING,
                 "Connection dropped in SASL: %s",
                 ("Connection reset by peer",),
             ),
-        ]
+        )
 
     def test_auth_initial_connection_lost_transitions_to_connecting(
         self,
@@ -682,7 +682,7 @@ class TestPureTransitionMatrix:
             state_lost, ConnectionLostEvent(reason="network drop")
         )
         assert next_s1 == Connecting(host="127.0.0.1", port=2181, attempt=1)
-        assert eff1 == [CloseSocket(reason="network drop")]
+        assert eff1 == (CloseSocket(reason="network drop"),)
 
         state_susp = Authenticating(
             stage=AuthStage.INITIAL_AUTH,
@@ -697,7 +697,7 @@ class TestPureTransitionMatrix:
         assert next_s2 == Suspended(
             host="127.0.0.1", port=2181, session_id=1, attempt=1
         )
-        assert eff2 == [CloseSocket(reason="network drop")]
+        assert eff2 == (CloseSocket(reason="network drop"),)
 
     def test_terminal_states_ignore_connection_lost(self) -> None:
         # Inactive is absorbing (0 effects)
@@ -705,7 +705,7 @@ class TestPureTransitionMatrix:
             Inactive(), ConnectionLostEvent(reason="drop")
         )
         assert next_state == Inactive()
-        assert effects == []
+        assert effects == ()
 
         # Other terminal states skip state change with BLATHER log
         for term_state in (
@@ -716,9 +716,9 @@ class TestPureTransitionMatrix:
                 term_state, ConnectionLostEvent(reason="drop")
             )
             assert next_state == term_state
-            assert effects == [
-                LogStateTransition(BLATHER, "Skipping state change")
-            ]
+            assert effects == (
+                LogStateTransition(BLATHER, "Skipping state change"),
+            )
 
     def test_suspended_to_expired_session(self) -> None:
         state = Suspended(host="127.0.0.1", port=2181, session_id=42)
@@ -726,7 +726,7 @@ class TestPureTransitionMatrix:
             state, SessionExpiredEvent(session_id=42)
         )
         assert next_state == ExpiredSession(session_id=42)
-        assert effects == [
+        assert effects == (
             CloseSocket(reason="Session has expired"),
             LogStateTransition(
                 logging.INFO,
@@ -736,7 +736,7 @@ class TestPureTransitionMatrix:
             EmitKazooStateChange(KazooState.LOST),
             FailPendingRequests(KeeperState.EXPIRED_SESSION),
             ResetSessionData(),
-        ]
+        )
 
     def test_connecting_to_auth_failed_preserves_cause(self) -> None:
         cause = RuntimeError("sasl failure")
@@ -756,7 +756,7 @@ class TestPureTransitionMatrix:
         state = Connected(host="127.0.0.1", port=2181, session_id=42)
         next_state, effects = transition(state, SessionClosedEvent())
         assert next_state == Inactive()
-        assert effects == [
+        assert effects == (
             CloseSocket(reason="Connection closed"),
             LogStateTransition(
                 logging.INFO,
@@ -771,7 +771,7 @@ class TestPureTransitionMatrix:
             FailPendingRequests(KeeperState.CLOSED),
             ResetSessionData(),
             StopConnectionLoop(),
-        ]
+        )
         assert isinstance(
             effects[2].exception,  # type: ignore[union-attr]
             ConnectionClosedError,
@@ -781,7 +781,7 @@ class TestPureTransitionMatrix:
         state = Inactive()
         next_state, effects = transition(state, SessionClosedEvent())
         assert next_state == Inactive()
-        assert effects == []
+        assert effects == ()
 
     def test_close_requested_in_connected_forbids_reconnect_on_drop(
         self,
@@ -794,12 +794,12 @@ class TestPureTransitionMatrix:
         s1, eff1 = transition(state, CloseRequested())
         assert isinstance(s1, Connected)
         assert s1.is_connecting_allowed is False
-        assert eff1 == [EnqueueCloseRequest()]
+        assert eff1 == (EnqueueCloseRequest(),)
 
         # Second CloseRequested while closing must be a no-op (I-2 idempotency)
         s1_again, eff_again = transition(s1, CloseRequested())
         assert s1_again == s1
-        assert eff_again == []
+        assert eff_again == ()
 
         s2, _ = transition(s1, ConnectionLostEvent(reason="dropped"))
         assert isinstance(s2, Suspended)
@@ -826,7 +826,7 @@ class TestPureTransitionMatrix:
         # Terminal AuthFailed stays AuthFailed on SessionExpiredEvent and
         # ConnectionLostEvent regardless of keeper_state.
         af = AuthFailed(error=AuthFailedError("bad"))
-        assert transition(af, SessionExpiredEvent(session_id=42)) == (af, [])
+        assert transition(af, SessionExpiredEvent(session_id=42)) == (af, ())
         s_af, eff_af = transition(
             af,
             ConnectionLostEvent(
@@ -834,7 +834,9 @@ class TestPureTransitionMatrix:
             ),
         )
         assert s_af == af
-        assert eff_af == [LogStateTransition(BLATHER, "Skipping state change")]
+        assert eff_af == (
+            LogStateTransition(BLATHER, "Skipping state change"),
+        )
 
     def test_auth_failed_to_inactive(self) -> None:
         state = AuthFailed(error=AuthFailedError("Connection dropped in SASL"))
@@ -862,18 +864,18 @@ class TestPureTransitionMatrix:
         s3, eff3 = transition(state, HeartbeatDeadlineReached())
         assert isinstance(s3, Connected)
         assert s3.ping_outstanding is True
-        assert eff3 == [SendHeartbeatPing()]
+        assert eff3 == (SendHeartbeatPing(),)
 
         # 4. PingReceived -> ping_outstanding=False
         s4, eff4 = transition(s3, PingReceived())
         assert isinstance(s4, Connected)
         assert s4.ping_outstanding is False
-        assert eff4 == []
+        assert eff4 == ()
 
         # 5. PollTimeoutExpired while ping_outstanding=True
         s5, eff5 = transition(s3, PollTimeoutExpired())
         assert isinstance(s5, Suspended)
-        assert eff5 == [
+        assert eff5 == (
             CloseSocket(reason="outstanding heartbeat ping not received"),
             LogStateTransition(
                 logging.WARNING,
@@ -884,7 +886,7 @@ class TestPureTransitionMatrix:
             FailPendingRequests(KeeperState.CONNECTING),
             EmitKazooStateChange(KazooState.SUSPENDED),
             InvalidateWatchers(),
-        ]
+        )
 
     def test_socket_polling_events_drain_during_terminal_state_shutdown(
         self,
@@ -898,14 +900,14 @@ class TestPureTransitionMatrix:
                 WakeUpSignaled(),
             )
             assert s1 == terminal_state
-            assert eff1 == [DrainWakeupPipe()]
+            assert eff1 == (DrainWakeupPipe(),)
 
             s2, eff2 = transition(
                 terminal_state,
                 SocketReadable(),
             )
             assert s2 == terminal_state
-            assert eff2 == []
+            assert eff2 == ()
 
         for in_flight_state in (
             Inactive(),
@@ -920,7 +922,7 @@ class TestPureTransitionMatrix:
                 WakeUpSignaled(),
             )
             assert s_inf == in_flight_state
-            assert eff_inf == [DrainWakeupPipe()]
+            assert eff_inf == (DrainWakeupPipe(),)
 
 
 class _FakeSASLError(Exception):
@@ -1510,7 +1512,7 @@ class TestClientStateMachineDriver:
         ):
             next_state, effects = transition(inactive, event)
             assert isinstance(next_state, Inactive)
-            assert effects == []
+            assert effects == ()
 
         # WakeUpSignaled in Inactive drains wakeup pipe (I-8)
         st_wake, eff_wake = transition(inactive, WakeUpSignaled())
@@ -1522,7 +1524,7 @@ class TestClientStateMachineDriver:
         for state in (AuthFailed(), ExpiredSession(session_id=1)):
             next_state, read_effects = transition(state, SocketReadable())
             assert next_state == state
-            assert read_effects == []
+            assert read_effects == ()
 
             next_state, wake_effects = transition(state, WakeUpSignaled())
             assert next_state == state
@@ -2155,6 +2157,7 @@ class TestExhaustiveTransitionMatrix:
         assert isinstance(expected, tuple)
         exp_state, exp_effects = expected
         next_state, effects = transition(state, event)
+        assert isinstance(effects, tuple)
         if exp_state == _SAME:
             assert next_state == state
         else:
@@ -2211,7 +2214,7 @@ class TestExhaustiveTransitionMatrix:
         )
         s_idem, eff_idem = transition(closing_state, CloseRequested())
         assert s_idem == closing_state
-        assert eff_idem == []
+        assert eff_idem == ()
 
     def test_dataclasses_use_slots(self) -> None:
         instances = [
