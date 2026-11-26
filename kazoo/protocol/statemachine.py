@@ -509,11 +509,14 @@ _DRAIN_WAKEUP_PIPE = DrainWakeupPipe()
 _SEND_HEARTBEAT_PING = SendHeartbeatPing()
 _ENQUEUE_CLOSE_REQUEST = EnqueueCloseRequest()
 
-_EFFECTS_READ_SOCKET: list[SideEffect] = [_READ_SOCKET_PACKET]
-_EFFECTS_READ_CONNECT: list[SideEffect] = [_READ_CONNECT_RESPONSE_PACKET]
-_EFFECTS_DRAIN_WAKEUP: list[SideEffect] = [_DRAIN_WAKEUP_PIPE]
-_EFFECTS_SEND_PING: list[SideEffect] = [_SEND_HEARTBEAT_PING]
-_NO_EFFECTS: list[SideEffect] = []
+_EFFECTS_READ_SOCKET: tuple[SideEffect, ...] = (_READ_SOCKET_PACKET,)
+_EFFECTS_READ_CONNECT: tuple[SideEffect, ...] = (
+    _READ_CONNECT_RESPONSE_PACKET,
+)
+_EFFECTS_DRAIN_WAKEUP: tuple[SideEffect, ...] = (_DRAIN_WAKEUP_PIPE,)
+_EFFECTS_SEND_PING: tuple[SideEffect, ...] = (_SEND_HEARTBEAT_PING,)
+_EFFECTS_ENQUEUE_CLOSE: tuple[SideEffect, ...] = (_ENQUEUE_CLOSE_REQUEST,)
+_NO_EFFECTS: tuple[SideEffect, ...] = ()
 
 
 # =====================================================================
@@ -533,15 +536,19 @@ def _build_auth_exception(error: Exception | None) -> AuthFailedError:
 def _suspend_effects(
     keeper_state: KeeperState,
     emit_kazoo_change: bool = True,
-) -> list[SideEffect]:
-    effects: list[SideEffect] = [
+) -> tuple[SideEffect, ...]:
+    if emit_kazoo_change:
+        return (
+            LogStateTransition(logging.INFO, "Zookeeper connection lost"),
+            FailPendingRequests(keeper_state),
+            EmitKazooStateChange(KazooState.SUSPENDED),
+            InvalidateWatchers(),
+        )
+    return (
         LogStateTransition(logging.INFO, "Zookeeper connection lost"),
         FailPendingRequests(keeper_state),
-    ]
-    if emit_kazoo_change:
-        effects.append(EmitKazooStateChange(KazooState.SUSPENDED))
-    effects.append(InvalidateWatchers())
-    return effects
+        InvalidateWatchers(),
+    )
 
 
 def _reconnect_after_drop(
@@ -573,7 +580,7 @@ def _finalize_connected(
     read_timeout: float,
     connect_timeout: float,
     read_only: bool,
-) -> tuple[ClientState, list[SideEffect]]:
+) -> tuple[ClientState, tuple[SideEffect, ...]]:
     next_state: ClientState
     if read_only:
         next_state = ConnectedReadOnly(
@@ -591,7 +598,7 @@ def _finalize_connected(
             read_timeout=read_timeout,
             connect_timeout=connect_timeout,
         )
-    effects: list[SideEffect] = [
+    effects: tuple[SideEffect, ...] = (
         LogStateTransition(
             logging.INFO,
             "Zookeeper connection established, state: %s",
@@ -607,13 +614,13 @@ def _finalize_connected(
         ResolveConnectResult(success=True),
         EmitKazooStateChange(KazooState.CONNECTED),
         SessionEstablished(),
-    ]
+    )
     return next_state, effects
 
 
 def transition(
     state: ClientState, event: ClientEvent
-) -> tuple[ClientState, list[SideEffect]]:
+) -> tuple[ClientState, tuple[SideEffect, ...]]:
     """Pure state transition function. Zero I/O happens inside here."""
     match (state, event):
         # -----------------------------------------------------------------
@@ -694,7 +701,7 @@ def transition(
                     session_id=state.session_id,
                     is_connecting_allowed=state.is_connecting_allowed,
                 ),
-                [
+                (
                     CloseSocket(
                         reason="outstanding heartbeat ping not received"
                     ),
@@ -704,40 +711,40 @@ def transition(
                         ("outstanding heartbeat ping not received",),
                     ),
                     *_suspend_effects(KeeperState.CONNECTING),
-                ],
+                ),
             )
 
         case (
             Connected() | ConnectedReadOnly(),
             PollTimeoutExpired(),
         ):
-            return state, []
+            return state, _NO_EFFECTS
 
         case (
             Authenticating(),
             PollTimeoutExpired(),
         ):
-            return _reconnect_after_drop(state), [
+            return _reconnect_after_drop(state), (
                 CloseSocket(reason="socket time-out during authentication"),
                 LogStateTransition(
                     logging.WARNING,
                     "Connection time-out: %s",
                     ("socket time-out during authentication",),
                 ),
-            ]
+            )
 
         case (
             Handshaking(),
             PollTimeoutExpired(),
         ):
-            return _reconnect_after_drop(state), [
+            return _reconnect_after_drop(state), (
                 CloseSocket(reason="socket time-out during handshake"),
                 LogStateTransition(
                     logging.WARNING,
                     "Connection time-out: %s",
                     ("socket time-out during handshake",),
                 ),
-            ]
+            )
 
         case (
             Inactive()
@@ -747,7 +754,7 @@ def transition(
             | AuthFailed(),
             PollTimeoutExpired(),
         ):
-            return state, []
+            return state, _NO_EFFECTS
 
         # -----------------------------------------------------------------
         # 2. Lifecycle & Connection Initialization Events
@@ -756,7 +763,7 @@ def transition(
             Inactive() | ExpiredSession() | AuthFailed(),
             StartRequested(),
         ):
-            return Connecting(attempt=0), []
+            return Connecting(attempt=0), _NO_EFFECTS
 
         case (
             Connecting()
@@ -767,21 +774,21 @@ def transition(
             | Suspended(),
             StartRequested(),
         ):
-            return state, []
+            return state, _NO_EFFECTS
 
         # Inactive absorbs all other events not explicitly handled in
         # section 1 above (e.g. SocketReadable and WakeUpSignaled ->
         # DrainWakeupPipe remain active).
         case (Inactive(), _):
-            return state, []
+            return state, _NO_EFFECTS
 
         case (
             state,
             ConnectAttemptStarted(),
         ) if not state.is_connecting_allowed:
-            return state, [
-                LogStateTransition(BLATHER, "Skipping state change")
-            ]
+            return state, (
+                LogStateTransition(BLATHER, "Skipping state change"),
+            )
 
         case (
             ExpiredSession(),
@@ -789,7 +796,7 @@ def transition(
         ):
             return (
                 Connecting(host=host, port=port, attempt=1),
-                [LogStateTransition(BLATHER, "Skipping state change")],
+                (LogStateTransition(BLATHER, "Skipping state change"),),
             )
 
         case (
@@ -799,11 +806,11 @@ def transition(
             if attempt == 0:
                 return (
                     Connecting(host=host, port=port, attempt=1),
-                    [LogStateTransition(BLATHER, "Skipping state change")],
+                    (LogStateTransition(BLATHER, "Skipping state change"),),
                 )
             return (
                 Connecting(host=host, port=port, attempt=attempt + 1),
-                [],
+                _NO_EFFECTS,
             )
 
         case (
@@ -817,7 +824,7 @@ def transition(
                     session_id=session_id,
                     attempt=attempt + 1,
                 ),
-                [],
+                _NO_EFFECTS,
             )
 
         case (
@@ -846,7 +853,7 @@ def transition(
         ):
             return (
                 replace(_reconnect_after_drop(state), host=host, port=port),
-                [],
+                _NO_EFFECTS,
             )
 
         # -----------------------------------------------------------------
@@ -856,7 +863,7 @@ def transition(
             state,
             SocketConnected(),
         ) if not state.is_connecting_allowed:
-            return state, []
+            return state, _NO_EFFECTS
 
         case (
             Connecting() | Suspended() | Handshaking(),
@@ -893,17 +900,17 @@ def transition(
                 num_hosts=num_hosts,
                 kazoo_state=state.kazoo_state,
             )
-            return next_state, [
+            return next_state, (
                 SendConnectPacket(
                     connect=connect_req, timeout=connect_timeout
                 ),
-            ]
+            )
 
         case (
             AuthFailed() | Handshaking(is_connecting_allowed=False),
             ConnectResponseReceived(),
         ):
-            return state, []
+            return state, _NO_EFFECTS
 
         case (
             Handshaking(
@@ -916,7 +923,7 @@ def transition(
             ConnectResponseReceived(connect_result=connect_result, zxid=zxid),
         ):
             if connect_result.time_out <= 0:
-                expired_connect_effects: list[SideEffect] = [
+                expired_connect_effects: tuple[SideEffect, ...] = (
                     LogStateTransition(
                         logging.WARNING,
                         "Zookeeper session closed, state: %s",
@@ -926,7 +933,7 @@ def transition(
                     FailPendingRequests(KeeperState.EXPIRED_SESSION),
                     ResetSessionData(),
                     CloseSocket("Session has expired"),
-                ]
+                )
                 return (
                     ExpiredSession(
                         session_id=connect_result.session_id,
@@ -941,7 +948,7 @@ def transition(
             conn_session_id = connect_result.session_id
             eff_ro = bool(connect_result.read_only)
 
-            common_effects: list[SideEffect] = [
+            common_effects: tuple[SideEffect, ...] = (
                 UpdateSessionData(
                     session_id=conn_session_id,
                     session_passwd=connect_result.passwd,
@@ -953,7 +960,7 @@ def transition(
                     connect_timeout=connect_timeout,
                 ),
                 ConfigureReadOnlyMode(read_only=eff_ro),
-            ]
+            )
 
             if has_sasl:
                 return (
@@ -968,7 +975,7 @@ def transition(
                         pending_auth=auth_data,
                         kazoo_state=state.kazoo_state,
                     ),
-                    common_effects + [StartSASLHandshake(host=host)],
+                    (*common_effects, StartSASLHandshake(host=host)),
                 )
 
             if auth_data:
@@ -985,12 +992,12 @@ def transition(
                         pending_auth=auth_data[1:],
                         kazoo_state=state.kazoo_state,
                     ),
-                    common_effects
-                    + [
+                    (
+                        *common_effects,
                         SendAuthPacket(
                             scheme=first_scheme, credential=first_cred
                         ),
-                    ],
+                    ),
                 )
 
             finalize_state, finalize_effects = _finalize_connected(
@@ -1007,7 +1014,7 @@ def transition(
             Authenticating(stage=AuthStage.SASL),
             SASLChallengeReceived(challenge=challenge),
         ):
-            return state, [StepSASLHandshake(challenge=challenge)]
+            return state, (StepSASLHandshake(challenge=challenge),)
 
         case (
             Authenticating(
@@ -1030,11 +1037,11 @@ def transition(
                         stage=AuthStage.INITIAL_AUTH,
                         pending_auth=pending_auth[1:],
                     ),
-                    [
+                    (
                         SendAuthPacket(
                             scheme=first_scheme, credential=first_cred
-                        )
-                    ],
+                        ),
+                    ),
                 )
             return _finalize_connected(
                 host=host,
@@ -1062,11 +1069,11 @@ def transition(
                 first_scheme, first_cred = pending_auth[0]
                 return (
                     replace(state, pending_auth=pending_auth[1:]),
-                    [
+                    (
                         SendAuthPacket(
                             scheme=first_scheme, credential=first_cred
-                        )
-                    ],
+                        ),
+                    ),
                 )
             return _finalize_connected(
                 host=host,
@@ -1081,17 +1088,17 @@ def transition(
             Connected() | ConnectedReadOnly(),
             AuthPacketCompleted(),
         ):
-            return state, []
+            return state, _NO_EFFECTS
 
         # -----------------------------------------------------------------
         # 5. Teardown, Failure, & Reconnection Events
         # -----------------------------------------------------------------
         case (AuthFailed(), AuthFailedEvent()):
-            return state, []
+            return state, _NO_EFFECTS
 
         case (_, AuthFailedEvent(error=error)):
             auth_exc = _build_auth_exception(error)
-            auth_failed_effects: list[SideEffect] = [
+            auth_failed_effects: tuple[SideEffect, ...] = (
                 CloseSocket("Authentication failed"),
                 LogStateTransition(
                     logging.INFO,
@@ -1103,14 +1110,14 @@ def transition(
                 FailPendingRequests(KeeperState.AUTH_FAILED),
                 ResetSessionData(),
                 StopConnectionLoop(),
-            ]
+            )
             return AuthFailed(error=error), auth_failed_effects
 
         case (ExpiredSession() | AuthFailed(), SessionExpiredEvent()):
-            return state, []
+            return state, _NO_EFFECTS
 
         case (_, SessionExpiredEvent(session_id=session_id)):
-            session_expired_effects: list[SideEffect] = [
+            session_expired_effects: tuple[SideEffect, ...] = (
                 CloseSocket("Session has expired"),
                 LogStateTransition(
                     logging.INFO,
@@ -1120,7 +1127,7 @@ def transition(
                 EmitKazooStateChange(KazooState.LOST),
                 FailPendingRequests(KeeperState.EXPIRED_SESSION),
                 ResetSessionData(),
-            ]
+            )
             return (
                 ExpiredSession(
                     session_id=session_id,
@@ -1134,7 +1141,7 @@ def transition(
             | ConnectedReadOnly(is_connecting_allowed=False),
             CloseRequested(),
         ):
-            return state, []
+            return state, _NO_EFFECTS
 
         case (
             Connected() | ConnectedReadOnly(),
@@ -1142,11 +1149,11 @@ def transition(
         ):
             return (
                 replace(state, is_connecting_allowed=False),
-                [_ENQUEUE_CLOSE_REQUEST],
+                _EFFECTS_ENQUEUE_CLOSE,
             )
 
         case (_, SessionClosedEvent() | CloseRequested()):
-            closed_effects: list[SideEffect] = [
+            closed_effects: tuple[SideEffect, ...] = (
                 CloseSocket("Connection closed"),
                 LogStateTransition(
                     logging.INFO,
@@ -1161,7 +1168,7 @@ def transition(
                 FailPendingRequests(KeeperState.CLOSED),
                 ResetSessionData(),
                 StopConnectionLoop(),
-            ]
+            )
             return Inactive(), closed_effects
 
         case (
@@ -1187,31 +1194,31 @@ def transition(
                 keeper_state=k_state,
                 is_connecting_allowed=allowing,
             )
-            return next_state, [
+            return next_state, (
                 CloseSocket(reason=reason or "Connection lost"),
                 *_suspend_effects(k_state),
-            ]
+            )
 
         case (
             Authenticating(stage=AuthStage.SASL),
             ConnectionLostEvent(keeper_state=k_state, reason=reason),
         ):
-            return _reconnect_after_drop(state, k_state), [
+            return _reconnect_after_drop(state, k_state), (
                 CloseSocket(reason=reason or "Connection dropped in SASL"),
                 LogStateTransition(
                     logging.WARNING,
                     "Connection dropped in SASL: %s",
                     (reason,),
                 ),
-            ]
+            )
 
         case (
             Authenticating() | Handshaking(),
             ConnectionLostEvent(keeper_state=k_state, reason=reason),
         ):
-            return _reconnect_after_drop(state, k_state), [
-                CloseSocket(reason=reason or "Connection lost")
-            ]
+            return _reconnect_after_drop(state, k_state), (
+                CloseSocket(reason=reason or "Connection lost"),
+            )
 
         case (
             Connected(
@@ -1233,10 +1240,10 @@ def transition(
                 attempt=1,
                 is_connecting_allowed=allowing,
             )
-            return next_state, [
+            return next_state, (
                 CloseSocket(reason="Found RW server"),
                 *_suspend_effects(KeeperState.CONNECTING),
-            ]
+            )
 
         case (
             Connecting()
@@ -1247,21 +1254,21 @@ def transition(
             | AuthFailed(),
             RWServerFoundEvent(),
         ):
-            return state, []
+            return state, _NO_EFFECTS
 
         case (
             ExpiredSession() | AuthFailed(),
             ConnectionLostEvent(),
         ):
-            return state, [
-                LogStateTransition(BLATHER, "Skipping state change")
-            ]
+            return state, (
+                LogStateTransition(BLATHER, "Skipping state change"),
+            )
 
         case (
             Connecting() | Suspended(),
             ConnectionLostEvent(keeper_state=k_state),
         ) if state.keeper_state == k_state:
-            return state, []
+            return state, _NO_EFFECTS
 
         case (_, ConnectionLostEvent(keeper_state=k_state)):
             next_state = Suspended(keeper_state=k_state)
