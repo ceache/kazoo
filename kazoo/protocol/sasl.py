@@ -177,6 +177,8 @@ def _normalize_sasl_error(
 class SASLExchange:
     """Sans-I/O driver for a single SASL challenge-response exchange."""
 
+    __slots__ = ("config", "_sasl_cli")
+
     def __init__(
         self,
         config: SASLConfig | Mapping[str, Any],
