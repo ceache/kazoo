@@ -1216,7 +1216,7 @@ class TestConnectionIOLoopDecomposition:
         KazooClient._call(client, r1, a1)
         client._connection.wake.assert_called_once()
 
-        # Second request on non-empty queue also triggers wake (F-5)
+        # Second request on non-empty queue also triggers wake
         KazooClient._call(client, r2, a2)
         assert client._connection.wake.call_count == 2
 
@@ -1374,7 +1374,7 @@ class TestConnectionIOLoopDecomposition:
         assert async_obj is None
         client._connection.wake.assert_called_once()
 
-        # Second CloseRequested while closing must be a no-op (I-2 idempotency)
+        # Second CloseRequested while closing must be a no-op
         client.send_event(CloseRequested())
         assert len(client._request_manager.queue) == 1
         client._connection.wake.assert_called_once()

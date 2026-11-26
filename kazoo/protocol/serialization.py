@@ -61,7 +61,10 @@ def _packet(cls: type[_T]) -> type[_T]:
     Packets are immutable by contract. Immutability is enforced by mypy,
     not at runtime: frozen dataclasses set each field through
     object.__setattr__, which roughly triples construction cost.
-    Packets are not hashable.
+
+    Note: ``frozen_default=True`` causes static type checkers to treat
+    instances as ``Hashable``, even though runtime instances define
+    ``__hash__ = None`` and are not hashable.
     """
     return dataclass(slots=True)(cls)
 

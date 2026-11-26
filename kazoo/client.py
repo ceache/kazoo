@@ -103,7 +103,6 @@ if TYPE_CHECKING:
     from types import TracebackType
     from typing import Annotated
 
-    from kazoo.handlers.gevent import SequentialGeventHandler
     from kazoo.interfaces import IAsyncResult, IHandler
     from kazoo.protocol.states import ZnodeStat
 
@@ -180,7 +179,7 @@ class KazooClient:
         hosts: str | list[str] = "127.0.0.1:2181",
         timeout: float = 10.0,
         client_id: tuple[int | None, bytes] | None = None,
-        handler: IHandler | SequentialGeventHandler | None = None,
+        handler: IHandler | None = None,
         default_acl: Sequence[ACL] | None = None,
         auth_data: Iterable[tuple[str, str]] | None = None,
         sasl_options: Mapping[str, Any] | SASLConfig | None = None,
@@ -212,7 +211,7 @@ class KazooClient:
         hosts: str | list[str] = "127.0.0.1:2181",
         timeout: float = 10.0,
         client_id: tuple[int | None, bytes] | None = None,
-        handler: IHandler | SequentialGeventHandler | None = None,
+        handler: IHandler | None = None,
         default_acl: Sequence[ACL] | None = None,
         auth_data: Iterable[tuple[str, str]] | None = None,
         sasl_options: Mapping[str, Any] | SASLConfig | None = None,
@@ -238,7 +237,7 @@ class KazooClient:
         hosts: str | list[str] = "127.0.0.1:2181",
         timeout: float = 10.0,
         client_id: tuple[int | None, bytes] | None = None,
-        handler: IHandler | SequentialGeventHandler | None = None,
+        handler: IHandler | None = None,
         default_acl: Sequence[ACL] | None = None,
         auth_data: Iterable[tuple[str, str]] | None = None,
         sasl_options: Mapping[str, Any] | SASLConfig | None = None,
@@ -369,10 +368,8 @@ class KazooClient:
         self.logger = logger or log
 
         # Record the handler strategy used
-        # FIXME we need to work on making SequentialGeventHandler being an
-        # IHandler to make this cleaner but for now this will do.
-        self.handler = cast(
-            "IHandler", handler if handler else SequentialThreadingHandler()
+        self.handler: IHandler = (
+            handler if handler else SequentialThreadingHandler()
         )
         if inspect.isclass(self.handler):
             raise ConfigurationError(
@@ -875,7 +872,7 @@ class KazooClient:
         self._request_manager.enqueue(request, async_object)
 
         # Wake connection unconditionally on every enqueue to prevent
-        # lost-wakeup race (F-5). If profiling high-throughput workloads
+        # lost-wakeup races. If profiling high-throughput workloads
         # warrants saving send() syscalls, use test-and-set via _wake_lock
         # (producer acquires non-blocking, consumer releases after
         # _drain_wakeup).

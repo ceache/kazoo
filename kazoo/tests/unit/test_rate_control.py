@@ -70,7 +70,7 @@ class TestRateControl:
         assert elapsed < 0.5
         assert len(client._queue) == 10
         # Unconditional wakeup signals on every enqueue to prevent
-        # lost-wakeup race (F-5)
+        # lost-wakeup races
         assert mock_conn.wake.call_count == 10
 
     def test_completion_worker_chained_requests_no_deadlock(self) -> None:

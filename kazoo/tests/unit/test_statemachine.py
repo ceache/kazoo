@@ -792,7 +792,7 @@ class TestPureTransitionMatrix:
         assert s1.is_connecting_allowed is False
         assert eff1 == (EnqueueCloseRequest(),)
 
-        # Second CloseRequested while closing must be a no-op (I-2 idempotency)
+        # Second CloseRequested while closing must be a no-op
         s1_again, eff_again = transition(s1, CloseRequested())
         assert s1_again == s1
         assert eff_again == ()
@@ -1448,7 +1448,7 @@ class TestClientStateMachineDriver:
         )
         assert client.state == KazooState.SUSPENDED
 
-        # SASL times out: must remain Suspended, not drop to LOST (F-2)
+        # SASL times out: must remain Suspended, not drop to LOST
         client.send_event(PollTimeoutExpired())
         assert isinstance(client.state_machine, Suspended)
         assert client.state == KazooState.SUSPENDED
@@ -1511,7 +1511,7 @@ class TestClientStateMachineDriver:
             assert isinstance(next_state, Inactive)
             assert effects == ()
 
-        # WakeUpSignaled in Inactive drains wakeup pipe (I-8)
+        # WakeUpSignaled in Inactive drains wakeup pipe
         st_wake, eff_wake = transition(inactive, WakeUpSignaled())
         assert st_wake == inactive
         assert len(eff_wake) == 1
