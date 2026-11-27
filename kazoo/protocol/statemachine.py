@@ -83,6 +83,7 @@ class Authenticating:
     host: str | None = None
     port: int | None = None
     session_id: int | None = None
+    session_passwd: bytes = b""
     read_timeout: float = 10.0
     connect_timeout: float = 10.0
     read_only: bool = False
@@ -101,6 +102,7 @@ class Connected:
     host: str | None = None
     port: int | None = None
     session_id: int | None = None
+    session_passwd: bytes = b""
     read_timeout: float = 10.0
     connect_timeout: float = 10.0
     ping_outstanding: bool = False
@@ -118,6 +120,7 @@ class ConnectedReadOnly:
     host: str | None = None
     port: int | None = None
     session_id: int | None = None
+    session_passwd: bytes = b""
     read_timeout: float = 10.0
     connect_timeout: float = 10.0
     ping_outstanding: bool = False
@@ -575,6 +578,7 @@ def _finalize_connected(
     read_timeout: float,
     connect_timeout: float,
     read_only: bool,
+    session_passwd: bytes = b"",
 ) -> tuple[ClientState, tuple[SideEffect, ...]]:
     next_state: ClientState
     if read_only:
@@ -582,6 +586,7 @@ def _finalize_connected(
             host=host,
             port=port,
             session_id=session_id,
+            session_passwd=session_passwd,
             read_timeout=read_timeout,
             connect_timeout=connect_timeout,
         )
@@ -590,6 +595,7 @@ def _finalize_connected(
             host=host,
             port=port,
             session_id=session_id,
+            session_passwd=session_passwd,
             read_timeout=read_timeout,
             connect_timeout=connect_timeout,
         )
@@ -823,14 +829,8 @@ def transition(
             )
 
         case (
-            Connected(
-                session_id=session_id,
-                is_connecting_allowed=allowing,
-            )
-            | ConnectedReadOnly(
-                session_id=session_id,
-                is_connecting_allowed=allowing,
-            ),
+            Connected(session_id=session_id)
+            | ConnectedReadOnly(session_id=session_id),
             ConnectAttemptStarted(host=host, port=port),
         ):
             next_state: ClientState = Suspended(
@@ -838,9 +838,11 @@ def transition(
                 port=port,
                 session_id=session_id,
                 attempt=1,
-                is_connecting_allowed=allowing,
             )
-            return next_state, _suspend_effects(KeeperState.CONNECTING)
+            return next_state, (
+                CloseSocket("Starting new connection attempt"),
+                *_suspend_effects(KeeperState.CONNECTING),
+            )
 
         case (
             Authenticating() | Handshaking(),
@@ -848,7 +850,7 @@ def transition(
         ):
             return (
                 replace(_reconnect_after_drop(state), host=host, port=port),
-                _NO_EFFECTS,
+                (CloseSocket("Starting new connection attempt"),),
             )
 
         # -----------------------------------------------------------------
@@ -963,6 +965,7 @@ def transition(
                         host=host,
                         port=port,
                         session_id=conn_session_id,
+                        session_passwd=connect_result.passwd,
                         read_timeout=read_timeout,
                         connect_timeout=connect_timeout,
                         read_only=eff_ro,
@@ -980,6 +983,7 @@ def transition(
                         host=host,
                         port=port,
                         session_id=conn_session_id,
+                        session_passwd=connect_result.passwd,
                         read_timeout=read_timeout,
                         connect_timeout=connect_timeout,
                         read_only=eff_ro,
@@ -998,6 +1002,7 @@ def transition(
                 host=host,
                 port=port,
                 session_id=conn_session_id,
+                session_passwd=connect_result.passwd,
                 read_timeout=read_timeout,
                 connect_timeout=connect_timeout,
                 read_only=eff_ro,
@@ -1016,6 +1021,7 @@ def transition(
                 host=host,
                 port=port,
                 session_id=session_id,
+                session_passwd=session_passwd,
                 read_timeout=read_timeout,
                 connect_timeout=connect_timeout,
                 read_only=read_only,
@@ -1041,6 +1047,7 @@ def transition(
                 host=host,
                 port=port,
                 session_id=session_id,
+                session_passwd=session_passwd,
                 read_timeout=read_timeout,
                 connect_timeout=connect_timeout,
                 read_only=read_only,
@@ -1052,6 +1059,7 @@ def transition(
                 host=host,
                 port=port,
                 session_id=session_id,
+                session_passwd=session_passwd,
                 read_timeout=read_timeout,
                 connect_timeout=connect_timeout,
                 read_only=read_only,
@@ -1073,6 +1081,7 @@ def transition(
                 host=host,
                 port=port,
                 session_id=session_id,
+                session_passwd=session_passwd,
                 read_timeout=read_timeout,
                 connect_timeout=connect_timeout,
                 read_only=read_only,
@@ -1258,17 +1267,15 @@ def transition(
                 LogStateTransition(BLATHER, "Skipping state change"),
             )
 
-        case (
-            Connecting() | Suspended(),
-            ConnectionLostEvent(keeper_state=k_state),
-        ) if state.keeper_state == k_state:
+        case (Connecting(), ConnectionLostEvent()):
             return state, _NO_EFFECTS
 
-        case (_, ConnectionLostEvent(keeper_state=k_state)):
-            next_state = Suspended(keeper_state=k_state)
-            return next_state, _suspend_effects(
+        case (Suspended(), ConnectionLostEvent(keeper_state=k_state)):
+            if state.keeper_state == k_state:
+                return state, _NO_EFFECTS
+            return replace(state, keeper_state=k_state), _suspend_effects(
                 k_state,
-                emit_kazoo_change=(state.kazoo_state != KazooState.SUSPENDED),
+                emit_kazoo_change=False,
             )
 
         # Illegal state transition
