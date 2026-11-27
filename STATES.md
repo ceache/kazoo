@@ -24,12 +24,13 @@ stateDiagram-v2
     Connecting --> Inactive : SessionClosedEvent / CloseRequested
 
     %% Handshake & Negotiation
+    Handshaking --> Handshaking : SocketConnected
     Handshaking --> ExpiredSession : ConnectResponseReceived [time_out <= 0] / SessionExpiredEvent
     Handshaking --> Authenticating : ConnectResponseReceived [has_sasl or auth_data]
     Handshaking --> Connected : ConnectResponseReceived [Read-Write]
     Handshaking --> ConnectedReadOnly : ConnectResponseReceived [Read-Only]
-    Handshaking --> Connecting : ConnectionLostEvent / PollTimeoutExpired [if LOST]
-    Handshaking --> Suspended : ConnectionLostEvent / PollTimeoutExpired [if SUSPENDED]
+    Handshaking --> Connecting : ConnectAttemptStarted / ConnectionLostEvent / PollTimeoutExpired [if LOST]
+    Handshaking --> Suspended : ConnectAttemptStarted / ConnectionLostEvent / PollTimeoutExpired [if SUSPENDED]
     Handshaking --> AuthFailed : AuthFailedEvent
     Handshaking --> Inactive : SessionClosedEvent / CloseRequested
 
@@ -39,27 +40,27 @@ stateDiagram-v2
     Authenticating --> Authenticating : AuthPacketCompleted [more credentials]
     Authenticating --> Connected : SASLCompleted / AuthPacketCompleted [Read-Write]
     Authenticating --> ConnectedReadOnly : SASLCompleted / AuthPacketCompleted [Read-Only]
-    Authenticating --> Connecting : ConnectionLostEvent / PollTimeoutExpired [if LOST]
-    Authenticating --> Suspended : ConnectionLostEvent / PollTimeoutExpired [if SUSPENDED]
+    Authenticating --> Connecting : ConnectAttemptStarted / ConnectionLostEvent / PollTimeoutExpired [if LOST]
+    Authenticating --> Suspended : ConnectAttemptStarted / ConnectionLostEvent / PollTimeoutExpired [if SUSPENDED]
     Authenticating --> ExpiredSession : SessionExpiredEvent
     Authenticating --> AuthFailed : AuthFailedEvent
     Authenticating --> Inactive : SessionClosedEvent / CloseRequested
 
     %% Active Session States
-    Connected --> Connected : CloseRequested [EnqueueCloseRequest, is_connecting_allowed=False]
+    Connected --> Connected : AuthPacketCompleted / PingReceived / HeartbeatDeadlineReached / CloseRequested [is_connecting_allowed=False]
     Connected --> Suspended : ConnectAttemptStarted / ConnectionLostEvent / RWServerFoundEvent / PollTimeoutExpired [ping_outstanding]
     Connected --> ExpiredSession : SessionExpiredEvent
     Connected --> AuthFailed : AuthFailedEvent
     Connected --> Inactive : SessionClosedEvent
 
-    ConnectedReadOnly --> ConnectedReadOnly : CloseRequested [EnqueueCloseRequest, is_connecting_allowed=False]
+    ConnectedReadOnly --> ConnectedReadOnly : AuthPacketCompleted / PingReceived / HeartbeatDeadlineReached / CloseRequested [is_connecting_allowed=False]
     ConnectedReadOnly --> Suspended : ConnectAttemptStarted / ConnectionLostEvent / RWServerFoundEvent / PollTimeoutExpired [ping_outstanding]
     ConnectedReadOnly --> ExpiredSession : SessionExpiredEvent
     ConnectedReadOnly --> AuthFailed : AuthFailedEvent
     ConnectedReadOnly --> Inactive : SessionClosedEvent
 
     %% Reconnection & Session Loss
-    Suspended --> Suspended : ConnectAttemptStarted (next host)
+    Suspended --> Suspended : ConnectAttemptStarted / ConnectionLostEvent
     Suspended --> Handshaking : SocketConnected
     Suspended --> ExpiredSession : SessionExpiredEvent
     Suspended --> AuthFailed : AuthFailedEvent
@@ -143,11 +144,11 @@ Side effects are declarative command objects returned as an immutable tuple by `
 | `DrainWakeupPipe` | Drain a wakeup byte from the internal pipe without sending a request (when wakeup signals arrive during non-connected states). |
 | `EnqueueCloseRequest` | Enqueue a `Close()` packet and wake the connection thread during graceful shutdown. |
 | `SendHeartbeatPing` | Transmit ZooKeeper heartbeat `Ping` frame (`xid=ReservedXID.PING`). |
-| `CloseSocket` | Unregister and close the active transport socket cleanly while keeping the persistent selector open until `ConnectionHandler.close()`. |
+| `CloseSocket` | Unregister and close the active transport socket, reset `FrameDecoder`, and fail any remaining in-flight `pending`/`auth_pending` entries with `ConnectionLoss` while keeping the persistent selector open until `ConnectionHandler.close()`. On terminal transitions (`AuthFailed`, `ExpiredSession`), `FailPendingRequests` runs *before* `CloseSocket` so in-flight callers receive the terminal exception. |
 | `SessionEstablished` | Notify handler that session is active and reset retry backoff. |
 | `StopConnectionLoop` | Instruct connection loop to halt connecting. |
 | `ResolveConnectResult` | Complete or fail pending `start_async()` promise. |
-| `EmitKazooStateChange` | Notify registered user state listeners (`CONNECTED`, `SUSPENDED`, `LOST`). |
+| `EmitKazooStateChange` | Queue a `KazooState` notification (`CONNECTED`, `SUSPENDED`, `LOST`) delivered to registered user state listeners in FIFO order after `_dispatch_lock` is released. |
 | `FailPendingRequests` | Fail pending requests with appropriate exception (`ConnectionLoss`, `SessionExpiredError`, `AuthFailedError`). |
 | `InvalidateWatchers` | Notify watchers with `WatchedEvent(type=NONE, state=...)` and clear watcher maps. |
 | `ResetSessionData` | Reset queues, session credentials, and zxid. |
@@ -159,5 +160,5 @@ Side effects are declarative command objects returned as an immutable tuple by `
 
 1. **Deterministic State Progression**: Given identical starting state and input event, `transition()` always produces the exact same next state and immutable side effect tuple.
 2. **Unified Event Loop & Data-Plane Fast Path**: There is only one selector loop. The persistent selector is created once in `ConnectionHandler.start()` alongside the wakeup socketpair, survives individual `CloseSocket` reconnect transitions, and is closed once in `ConnectionHandler.close()`. The wakeup socket is registered for the entire duration of each connection attempt: `ConnectionHandler._setup_selector()` registers it at the start of each attempt (`start()` does not), and `ConnectionHandler._release_wakeup()` unregisters and drains it at the end of every attempt, when the connection routine exits, and at the end of `ConnectionHandler.stop()`. A selector may keep watching a registered socket between `select()` calls (gevent's does), and a pending wake byte would then spin the hub. `Handshaking`, `Authenticating`, and `Connected` share that loop. In steady state (`Connected` / `ConnectedReadOnly`), `ConnectionHandler._poll_step()` streams packets and queued requests directly via `_read_socket()` and `_send_request()` without invoking `transition()` or `execute_effect()`, leaving heartbeats, timeouts, and lifecycle transitions in the pure machine.
-3. **No Phantom State**: `ConnectionHandler._is_session_active` and `ConnectionHandler._is_terminal` are computed from `client._state_machine.state` on every access and keep no flags of their own (no separate `ping_outstanding` `Event` or cached connection-state boolean). `_is_session_active` is the state's `is_connected`; `_is_terminal` is true when the state's `is_terminal` is true or its `is_connecting_allowed` is false.
+3. **No Phantom State**: `ConnectionHandler._is_session_active` and `ConnectionHandler._is_terminal` are computed from `client._state_machine.state` on every access via `is_terminal_state()` and keep no flags of their own (no separate `ping_outstanding` `Event` or cached connection-state boolean). `_is_session_active` is the state's `is_connected`; `_is_terminal` is true when the state's `is_terminal` is true or its `is_connecting_allowed` is false. (`Connected`/`ConnectedReadOnly` carry an immutable `(session_id, session_passwd)` snapshot for atomic `client.client_id` reads, while `KazooClient._session_id`/`_session_passwd` retain the reconnect/constructor credentials updated by `UpdateSessionData` and cleared by `ResetSessionData`.)
 4. **Bounded Failure Handling**: `transition()` raises `InvalidStateTransitionError` for any disallowed state/event pair — including `SocketReadable` and `WakeUpSignaled` in `Connected` / `ConnectedReadOnly`. Three kinds of late or stray events are defined as safe no-ops instead: `Inactive` absorbs every event except `StartRequested` (`WakeUpSignaled` still drains the wakeup pipe), `PingReceived` is ignored in every non-connected state, and non-active/terminal states ignore benign timer/poll/stray-socket events (while `ExpiredSession` and `AuthFailed` remain in place and log a late `ConnectionLostEvent` skip without resetting backoff or resurrecting a terminal session). When `InvalidStateTransitionError` is raised at runtime, `ConnectionHandler._emit_event` logs it at `WARNING` and converts it to `ConnectionDropped`, so the connection is closed and retried and the connection loop keeps running.
