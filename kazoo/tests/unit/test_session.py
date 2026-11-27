@@ -353,3 +353,58 @@ class TestRequestAndWatcherManagers:
         from kazoo.protocol import session
 
         assert not any(name.startswith("_") for name in session.__all__)
+
+    def test_request_manager_reset_clears_deques_in_place(self) -> None:
+        """[L-6] reset() clears deques in place without rebinding them."""
+        rm = RequestManager()
+        q_ref = rm.queue
+        p_ref = rm.pending
+        a_ref = rm.auth_pending
+        comp = _FakeCompletion()
+        rm.enqueue(GetData("/k", None), comp)
+        rm.reset()
+        assert rm.queue is q_ref and len(rm.queue) == 0
+        assert rm.pending is p_ref and len(rm.pending) == 0
+        assert rm.auth_pending is a_ref and len(rm.auth_pending) == 0
+
+    def test_packet_router_rejects_unexpected_connect_outside_handshaking(
+        self,
+    ) -> None:
+        """[L-2] Stray Connect outside Handshaking raises ConnectionDropped."""
+        import logging
+
+        from kazoo.exceptions import ConnectionDropped
+        from kazoo.protocol.serialization import Connect
+        from kazoo.protocol.session import PacketRouter
+        from kazoo.protocol.statemachine import (
+            Authenticating,
+            Connected,
+            Handshaking,
+        )
+
+        emitted: list[object] = []
+        state_box: list[Any] = [Connected(host="h", port=2181, session_id=1)]
+        router = PacketRouter(
+            requests=RequestManager(),
+            watchers=WatcherManager(),
+            get_state=lambda: state_box[0],
+            set_last_zxid=lambda _z: None,
+            unchroot=lambda p: p,
+            emit_event=emitted.append,
+            dispatch_watch=lambda _cb: None,
+            logger=logging.getLogger("test"),
+        )
+        pkt = Connect(0, 0, 10000, 1, b"\x00" * 16, False)
+
+        for bad_state in (
+            Connected(host="h", port=2181, session_id=1),
+            Authenticating(host="h", port=2181, session_id=1),
+        ):
+            state_box[0] = bad_state
+            with pytest.raises(ConnectionDropped, match="Unexpected Connect"):
+                router.process_packet(pkt)
+        assert emitted == []
+
+        state_box[0] = Handshaking(host="h", port=2181)
+        router.process_packet(pkt)
+        assert len(emitted) == 1

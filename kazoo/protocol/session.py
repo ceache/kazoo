@@ -63,10 +63,12 @@ from kazoo.protocol.statemachine import (
     ClientState,
     ConnectionLostEvent,
     ConnectResponseReceived,
+    Handshaking,
     RWServerFoundEvent,
     SASLChallengeReceived,
     SessionClosedEvent,
     SessionExpiredEvent,
+    is_terminal_state,
 )
 from kazoo.protocol.states import (
     EVENT_TYPE_MAP,
@@ -230,12 +232,12 @@ class RequestManager:
                 break
 
     def reset(self, state: KeeperState | None = None) -> None:
-        """Fail any remaining requests and reinitialize fresh deques."""
+        """Fail any remaining requests and clear all queues in place."""
         if state is not None:
             self.fail_all(state)
-        self.queue = deque()
-        self.pending = deque()
-        self.auth_pending = deque()
+        self.queue.clear()
+        self.pending.clear()
+        self.auth_pending.clear()
 
 
 class WatcherManager:
@@ -405,6 +407,11 @@ class RWProbeSchedule:
         self.last_attempt = now
         return endpoint
 
+    def set_last_attempt(self, value: float | None) -> None:
+        """Update ``last_attempt`` and clear any cached backoff deadline."""
+        self.last_attempt = value
+        self._backoff_until = None
+
     def mark_found(self) -> None:
         """Reset backoff delay after discovering a read/write endpoint."""
         self.delay = 0.5
@@ -462,8 +469,7 @@ class PacketRouter:
         return self._unchroot(path)
 
     def _is_terminal(self) -> bool:
-        state = self._get_state()
-        return state.is_terminal or not state.is_connecting_allowed
+        return is_terminal_state(self._get_state())
 
     def read_watch_event(self, watch: WatchPacket) -> None:
         """Collect matching watchers and dispatch a :class:`WatchedEvent`."""
@@ -564,6 +570,10 @@ class PacketRouter:
         is_active = state.is_connected
         match packet:
             case Connect():
+                if not isinstance(state, Handshaking):
+                    raise ConnectionDropped(
+                        f"Unexpected Connect in {type(state).__name__}"
+                    )
                 self._emit_event(
                     ConnectResponseReceived(connect_result=packet)
                 )

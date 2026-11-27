@@ -179,8 +179,7 @@ class RWPinger:
 
     @last_attempt.setter
     def last_attempt(self, value: float | None) -> None:
-        self.schedule.last_attempt = value
-        self.schedule._backoff_until = None
+        self.schedule.set_last_attempt(value)
 
     def __iter__(
         self,
