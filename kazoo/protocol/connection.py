@@ -11,12 +11,12 @@ import ssl
 import time
 from binascii import hexlify
 from collections.abc import Callable, Iterator
+from collections.abc import Set as AbstractSet
 from contextlib import AbstractContextManager, contextmanager
 from typing import (
     TYPE_CHECKING,
     Any,
     Literal,
-    TypeVar,
     cast,
 )
 
@@ -124,9 +124,6 @@ __all__ = (
     "RWPinger",
     "RWServerAvailable",
     "WatcherManager",
-    "_CONNECTION_DROP",
-    "_SESSION_EXPIRED",
-    "_exception_to_event",
 )
 
 # Micro-optimization: reuse ping instance and pre-encoded ping wire frame
@@ -134,6 +131,11 @@ _PingInstance = Ping()
 _PING_FRAME = FrameDecoder.encode_request(_PingInstance, ReservedXID.PING)
 # Cap per-write coalesced outbound frame batch size at 64 KiB
 _SEND_BATCH_MAX = 64 * 1024
+# Pre-allocated selector readiness singletons (0 allocations per poll)
+_READY_EMPTY: frozenset[str] = frozenset()
+_READY_ZK: frozenset[str] = frozenset(("zk_socket",))
+_READY_WAKEUP: frozenset[str] = frozenset(("wakeup",))
+_READY_BOTH: frozenset[str] = frozenset(("zk_socket", "wakeup"))
 
 # Tracks which ConnectionHandler owns the currently executing zk_loop routine
 # (works across OS threads, Gevent greenlets, and Eventlet greenthreads).
@@ -222,9 +224,6 @@ class RWPinger:
                 yield False
 
 
-ReturnValue = TypeVar("ReturnValue")
-
-
 class ConnectionHandler:
     """Zookeeper connection handler"""
 
@@ -252,6 +251,7 @@ class ConnectionHandler:
 
         self._read_sock: Socket | None = None
         self._write_sock: Socket | None = None
+        self._wakeup_signaled: bool = False
 
         self._socket: Socket | None = None
         self._ssl_socket: ssl.SSLSocket | None = None
@@ -275,16 +275,15 @@ class ConnectionHandler:
             max_buffer=max_buffer,
             pop_pending=self._requests.pop_pending,
         )
+        self._send_buf = bytearray()
         self._replies_since_select: int = 0
         self._yield_control = client.handler.yield_control
 
         self._host_ports: list[tuple[str, str, int]] = []
         self._rw_server: tuple[str, str, int] | None = None
         self._ro_mode: (
-            Iterator[Literal[False] | tuple[str, str, int]]
-            | Literal[False]
-            | None
-        ) = False
+            Iterator[Literal[False] | tuple[str, str, int]] | None
+        ) = None
 
         self._connection_routine: Threadlike | None = None
         self._last_send: float = 0.0
@@ -320,6 +319,7 @@ class ConnectionHandler:
 
     @property
     def _wakeup_registered(self) -> bool:
+        """Internal helper (used by tests) to inspect wakeup registration."""
         if self._selector is None or self._read_sock is None:
             return False
         try:
@@ -416,17 +416,24 @@ class ConnectionHandler:
             except (KeyError, ValueError):
                 pass
 
-    def _select(self, timeout: float) -> set[str]:
+    def _select(self, timeout: float) -> frozenset[str]:
         """Wait for readable events on the persistent selector."""
         ssl_sock = self._ssl_socket
         has_ssl_pending = ssl_sock is not None and ssl_sock.pending() > 0
         assert self._selector is not None
         events = self._selector.select(0.0 if has_ssl_pending else timeout)
 
-        ready: set[str] = {key.data for key, _ in events}
-        if has_ssl_pending:
-            ready.add("zk_socket")
-        return ready
+        has_zk = has_ssl_pending
+        has_wakeup = False
+        for key, _ in events:
+            data = key.data
+            if data == "zk_socket":
+                has_zk = True
+            elif data == "wakeup":
+                has_wakeup = True
+        if has_zk:
+            return _READY_BOTH if has_wakeup else _READY_ZK
+        return _READY_WAKEUP if has_wakeup else _READY_EMPTY
 
     def _dispose_sasl(self) -> None:
         """Dispose of active SASL exchange if present."""
@@ -602,6 +609,7 @@ class ConnectionHandler:
         self.connection_closed.set()
         self._close_selector()
         self._frame_decoder.release()
+        self._send_buf = bytearray()
         ws, rs = self._write_sock, self._read_sock
         self._write_sock = self._read_sock = None
         if ws is not None:
@@ -651,6 +659,7 @@ class ConnectionHandler:
         sock = self._write_sock
         if sock is None:
             return False
+        self._wakeup_signaled = True
         try:
             sock.send(b"\0")
             return True
@@ -659,8 +668,14 @@ class ConnectionHandler:
         except OSError:
             return False
 
-    def _drain_wakeup(self) -> None:
-        """Drain all bytes from the non-blocking wakeup pipe."""
+    def _drain_wakeup(self, *, drain_all: bool = False) -> None:
+        """Drain bytes from the non-blocking wakeup pipe.
+
+        When ``drain_all`` is False (hot path), stops after a short read
+        (``< 4096`` bytes) to avoid a second ``recv()`` + ``BlockingIOError``
+        syscall on every wakeup. Pass ``drain_all=True`` during teardown.
+        """
+        self._wakeup_signaled = False
         sock = self._read_sock
         if sock is None:
             return
@@ -668,6 +683,8 @@ class ConnectionHandler:
             try:
                 chunk = sock.recv(4096)
                 if not chunk or not isinstance(chunk, (bytes, bytearray)):
+                    break
+                if not drain_all and len(chunk) < 4096:
                     break
             except (BlockingIOError, OSError):
                 break
@@ -689,7 +706,7 @@ class ConnectionHandler:
         loop spin until the next select() or until close().
         """
         self._update_io_interest(0, "wakeup")
-        self._drain_wakeup()
+        self._drain_wakeup(drain_all=True)
 
     def _server_pinger(self) -> RWPinger:
         """Returns a server pinger iterable, that will ping the next
@@ -891,16 +908,15 @@ class ConnectionHandler:
     def _find_persistent_recursive_watchers(
         self, path: str
     ) -> list[WatchFunc]:
+        """Internal test helper forwarding to ``WatcherManager``."""
         return self._watchers.find_persistent_recursive(path)
 
     def _read_watch_event(self, watch: WatchPacket) -> None:
+        """Internal test helper forwarding to ``PacketRouter``."""
         self._packet_router.read_watch_event(watch)
 
-    def _update_watchers_for_response(self, request: Any) -> None:
-        """Register or remove client watchers after a successful response."""
-        self._watchers.update_for_response(request)
-
     def _read_response(self, packet: ResponsePacket) -> object | None:
+        """Internal test helper forwarding to ``PacketRouter``."""
         return self._packet_router.read_response(packet)
 
     def _process_packet(self, packet: ServerPacket) -> object | None:
@@ -936,49 +952,59 @@ class ConnectionHandler:
         """
         limit = self.client.concurrent_request_limit
         terminal = self._is_terminal
-        batch = bytearray()
+        batch = self._send_buf
+        batch.clear()
         encode_into = FrameDecoder.encode_request_into
 
-        while terminal or self._requests.has_send_capacity(limit):
-            try:
-                request, _ = self._requests.peek_queued()
-            except IndexError:
-                break
+        try:
+            while terminal or self._requests.has_send_capacity(limit):
+                try:
+                    request, _ = self._requests.peek_queued()
+                except IndexError:
+                    break
 
-            # Special case for testing, if this is a _SessionExpire object
-            # then throw a SessionExpiration error as if we were dropped
-            if request is _SESSION_EXPIRED:
-                if batch:
+                # Special case for testing, if this is a _SessionExpire object
+                # then throw a SessionExpiration error as if we were dropped
+                if request is _SESSION_EXPIRED:
+                    if batch:
+                        self._write(batch, connect_timeout)
+                        self._last_send = time.monotonic()
+                    raise SessionExpiredError("Session expired: Testing")
+                if request is _CONNECTION_DROP:
+                    if batch:
+                        self._write(batch, connect_timeout)
+                        self._last_send = time.monotonic()
+                    raise ConnectionDropped("Connection dropped: Testing")
+
+                # Special case for auth packets
+                if request.type == Auth.type:
+                    xid: int = ReservedXID.AUTH
+                else:
+                    xid = self._requests.next_xid()
+
+                self._requests.dequeue_to_pending(xid)
+                level = BLATHER if isinstance(request, Ping) else logging.DEBUG
+                if self.logger.isEnabledFor(level):
+                    self.logger.log(
+                        level, "Sending request(xid=%s): %s", xid, request
+                    )
+                encode_into(batch, request, xid)
+                if len(batch) >= _SEND_BATCH_MAX:
                     self._write(batch, connect_timeout)
                     self._last_send = time.monotonic()
-                raise SessionExpiredError("Session expired: Testing")
-            if request is _CONNECTION_DROP:
-                if batch:
-                    self._write(batch, connect_timeout)
-                    self._last_send = time.monotonic()
-                raise ConnectionDropped("Connection dropped: Testing")
+                    if len(batch) > _SEND_BATCH_MAX:
+                        batch = self._send_buf = bytearray()
+                    else:
+                        batch.clear()
 
-            # Special case for auth packets
-            if request.type == Auth.type:
-                xid: int = ReservedXID.AUTH
-            else:
-                xid = self._requests.next_xid()
-
-            self._requests.dequeue_to_pending(xid)
-            level = BLATHER if isinstance(request, Ping) else logging.DEBUG
-            if self.logger.isEnabledFor(level):
-                self.logger.log(
-                    level, "Sending request(xid=%s): %s", xid, request
-                )
-            encode_into(batch, request, xid)
-            if len(batch) >= _SEND_BATCH_MAX:
+            if batch:
                 self._write(batch, connect_timeout)
                 self._last_send = time.monotonic()
+        finally:
+            if len(batch) > _SEND_BATCH_MAX:
+                self._send_buf = bytearray()
+            else:
                 batch.clear()
-
-        if batch:
-            self._write(batch, connect_timeout)
-            self._last_send = time.monotonic()
 
     def _send_ping(self, connect_timeout: float) -> None:
         if self.logger.isEnabledFor(BLATHER):
@@ -1162,7 +1188,7 @@ class ConnectionHandler:
                 self._emit_event(HEARTBEAT_DEADLINE_REACHED)
 
     def _dispatch_ready_events(
-        self, ready: set[str], deadline: float | None
+        self, ready: AbstractSet[str], deadline: float | None
     ) -> bool:
         """Translate ready selector handles into state machine events.
 
@@ -1190,12 +1216,13 @@ class ConnectionHandler:
             # to process more responses. Otherwise the responses
             # may choke out the requests. See PR#633.
             if "wakeup" in ready:
-                self._drain_wakeup()
                 if self._is_session_active:
+                    self._drain_wakeup()
                     self._send_request(self._connect_timeout)
                     self._check_session_health()
                     return True
                 else:
+                    # WAKEUP_SIGNALED runs DrainWakeupPipe via state machine.
                     self._emit_event(WAKEUP_SIGNALED)
                     return True
 
@@ -1221,7 +1248,8 @@ class ConnectionHandler:
                 )
             )
         ):
-            self._drain_wakeup()
+            if self._wakeup_signaled:
+                self._drain_wakeup()
             self._send_request(self._connect_timeout)
 
         if self._frame_decoder.frame_ready:

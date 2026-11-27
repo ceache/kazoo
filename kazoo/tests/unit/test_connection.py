@@ -3061,3 +3061,55 @@ class TestWakeupOutsideSelect:
         assert async_obj.get_nowait() == (b"ok", None)
         assert async_obj.exception is None
         assert len(callbacks) == 1
+
+    def test_efficiency_send_buf_drain_wakeup_and_ready_singletons(
+        self,
+    ) -> None:
+        """[E-1][E-2][E-4][L-4] _send_buf, short-read drain, ready sets."""
+        from kazoo.protocol import connection as conn_mod
+        from kazoo.protocol.serialization import SetData
+
+        assert not any(name.startswith("_") for name in conn_mod.__all__)
+
+        client = _make_mock_client()
+        client._state_machine.state = Connected()
+        conn = ConnectionHandler(client, KazooRetry())
+        conn._socket = Mock()
+        conn._socket.send.side_effect = lambda mv: len(mv)
+
+        # 1. [E-1] Persistent _send_buf reused on normal sends, trimmed after
+        # > _SEND_BATCH_MAX payload.
+        initial_buf = conn._send_buf
+        conn._requests.enqueue(GetData("/a", None), Mock())
+        conn._send_request(5.0)
+        assert conn._send_buf is initial_buf
+        assert len(conn._send_buf) == 0
+
+        conn._requests.enqueue(
+            SetData("/big", b"x" * (conn_mod._SEND_BATCH_MAX + 128), -1),
+            Mock(),
+        )
+        conn._send_request(5.0)
+        assert conn._send_buf is not initial_buf
+        assert len(conn._send_buf) == 0
+
+        # 2. [E-2] Hot-path _drain_wakeup stops after a short read (1 recv).
+        mock_read_sock = Mock()
+        mock_read_sock.recv.return_value = b"\0"
+        conn._read_sock = mock_read_sock
+        conn._drain_wakeup()
+        assert mock_read_sock.recv.call_count == 1
+
+        # 3. [E-4] _select returns pre-allocated frozenset singletons.
+        conn._selector = Mock()
+        conn._selector.select.return_value = []
+        assert conn._select(0.0) is conn_mod._READY_EMPTY
+        conn._selector.select.return_value = [(Mock(data="zk_socket"), 1)]
+        assert conn._select(0.0) is conn_mod._READY_ZK
+        conn._selector.select.return_value = [(Mock(data="wakeup"), 1)]
+        assert conn._select(0.0) is conn_mod._READY_WAKEUP
+        conn._selector.select.return_value = [
+            (Mock(data="zk_socket"), 1),
+            (Mock(data="wakeup"), 1),
+        ]
+        assert conn._select(0.0) is conn_mod._READY_BOTH
