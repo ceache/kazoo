@@ -100,6 +100,7 @@ class TestBuildSSLContext:
             ciphers="HIGH:!aNULL",
         )
         with (
+            patch.object(ssl.SSLContext, "load_default_certs"),
             patch.object(ssl.SSLContext, "set_ciphers") as mock_ciphers,
             patch.object(ssl.SSLContext, "load_verify_locations") as mock_ca,
             patch.object(ssl.SSLContext, "load_cert_chain") as mock_chain,
