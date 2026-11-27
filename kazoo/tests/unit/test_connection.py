@@ -5,8 +5,9 @@ import logging
 import selectors
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
@@ -23,6 +24,7 @@ from kazoo.exceptions import (
     ZookeeperError,
 )
 from kazoo.loggingsupport import BLATHER
+from kazoo.protocol import connection as connection_mod
 from kazoo.protocol.connection import (
     CLOSE_RESPONSE,
     STOP_CONNECTING,
@@ -104,6 +106,37 @@ def _make_mock_client(**kwargs: Any) -> Mock:
     for key, value in kwargs.items():
         setattr(client, key, value)
     return client
+
+
+@pytest.fixture
+def patch_connection_random(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[[int], Mock]:
+    """Patch ``kazoo.protocol.connection.random`` locally for the test thread.
+
+    Replaces only the module binding on ``kazoo.protocol.connection`` (leaving
+    the global ``random`` module untouched) and counts ``randint`` calls only
+    on the test thread so background threads from other tests cannot interfere.
+    """
+    real_random = connection_mod.random
+    test_tid = threading.get_ident()
+
+    def _install(value: int) -> Mock:
+        recorded = Mock(return_value=value)
+
+        def _randint(a: int, b: int) -> int:
+            if threading.get_ident() == test_tid:
+                return int(recorded(a, b))
+            return real_random.randint(a, b)
+
+        proxy = SimpleNamespace(
+            randint=_randint,
+            shuffle=real_random.shuffle,
+        )
+        monkeypatch.setattr(connection_mod, "random", proxy)
+        return recorded
+
+    return _install
 
 
 def _attach_fake_selector(
@@ -869,7 +902,9 @@ class TestRWServerSelection:
             assert next(it) is False
             assert len(dialed) == 2
 
-    def test_rw_pinger_exponential_backoff(self) -> None:
+    def test_rw_pinger_exponential_backoff(
+        self, patch_connection_random: Callable[[int], Mock]
+    ) -> None:
         ro_sock = Mock()
         ro_sock.recv.return_value = b"ro"
         dialed: list[tuple[str, str, int, float | None]] = []
@@ -894,12 +929,10 @@ class TestRWServerSelection:
             no_error,
         )
 
-        with (
-            patch(
-                "kazoo.protocol.connection.time.monotonic",
-                side_effect=lambda: now,
-            ),
-            patch("kazoo.protocol.connection.random.randint", return_value=0),
+        patch_connection_random(0)
+        with patch(
+            "kazoo.protocol.connection.time.monotonic",
+            side_effect=lambda: now,
         ):
             it = iter(pinger)
             # First run-through steps one host per next() before back-off
@@ -1808,7 +1841,9 @@ class TestConnectionRecvIntoAndBurstScheduling:
             if conn._write_sock is not None:
                 conn._write_sock.close()
 
-    def test_replies_per_yield_triggers_yield_control_and_resets(self) -> None:
+    def test_replies_per_yield_triggers_yield_control_and_resets(
+        self, patch_connection_random: Callable[[int], Mock]
+    ) -> None:
         client = _make_mock_client(concurrent_request_limit=200)
         client._state_machine.state = Connected()
         conn = ConnectionHandler(client, KazooRetry())
@@ -1829,10 +1864,8 @@ class TestConnectionRecvIntoAndBurstScheduling:
 
         conn._socket.recv_into.side_effect = fake_recv_into
 
-        with (
-            patch.object(conn, "_select", return_value={"zk_socket"}),
-            patch("random.randint", return_value=20) as mock_randint,
-        ):
+        mock_randint = patch_connection_random(20)
+        with patch.object(conn, "_select", return_value={"zk_socket"}):
             for _ in range(count):
                 conn._poll_step()
 
@@ -2689,7 +2722,9 @@ class TestWakeupOutsideSelect:
             conn._connection_routine = None
             conn.close()
 
-    def test_heartbeat_ping_timeout_does_not_collapse_to_jitter(self) -> None:
+    def test_heartbeat_ping_timeout_does_not_collapse_to_jitter(
+        self, patch_connection_random: Callable[[int], Mock]
+    ) -> None:
         """[C-1][C-9] Pending ping gets ~read_timeout/2 and fresh deadline."""
         from kazoo.protocol.serialization import PingResponse, WatchPacket
 
@@ -2703,48 +2738,48 @@ class TestWakeupOutsideSelect:
         conn._last_recv = 1000.0
 
         # Deterministic minimal jitter (0.01s) — worst case for the C-1 bug.
-        with patch("random.randint", return_value=1):
-            with patch("time.monotonic", return_value=1003.33):
-                _, deadline = conn._compute_poll_timeout()
-                conn._dispatch_ready_events(set(), deadline)
+        patch_connection_random(1)
+        with patch("time.monotonic", return_value=1003.33):
+            _, deadline = conn._compute_poll_timeout()
+            conn._dispatch_ready_events(set(), deadline)
 
-            assert isinstance(client.state_machine, Connected)
-            assert client.state_machine.ping_outstanding is True
-            assert conn._last_send == pytest.approx(1003.33)
+        assert isinstance(client.state_machine, Connected)
+        assert client.state_machine.ping_outstanding is True
+        assert conn._last_send == pytest.approx(1003.33)
 
-            # Immediately after sending the ping, the next poll timeout must
-            # be ~read_timeout/2 - jitter (~3.325s), NOT jitter (0.01s).
-            with patch("time.monotonic", return_value=1003.33):
-                timeout, _ = conn._compute_poll_timeout()
-                assert timeout == pytest.approx(6.67 / 2.0 - 0.01, abs=1e-3)
+        # Immediately after sending the ping, the next poll timeout must
+        # be ~read_timeout/2 - jitter (~3.325s), NOT jitter (0.01s).
+        with patch("time.monotonic", return_value=1003.33):
+            timeout, _ = conn._compute_poll_timeout()
+            assert timeout == pytest.approx(6.67 / 2.0 - 0.01, abs=1e-3)
 
-            # A Watch arriving while ping_outstanding=True advances _last_recv
-            # but must not stretch the remaining ping wait to _read_timeout.
-            conn._last_recv = 1003.83
-            with patch("time.monotonic", return_value=1003.83):
-                conn._process_packet(
-                    WatchPacket(zxid=1, type=3, state=3, path="/w")
-                )
-                timeout_after_watch, _ = conn._compute_poll_timeout()
-                assert timeout_after_watch == pytest.approx(
-                    (1003.33 + 6.67 / 2.0 - 0.01) - 1003.83, abs=1e-3
-                )
+        # A Watch arriving while ping_outstanding=True advances _last_recv
+        # but must not stretch the remaining ping wait to _read_timeout.
+        conn._last_recv = 1003.83
+        with patch("time.monotonic", return_value=1003.83):
+            conn._process_packet(
+                WatchPacket(zxid=1, type=3, state=3, path="/w")
+            )
+            timeout_after_watch, _ = conn._compute_poll_timeout()
+            assert timeout_after_watch == pytest.approx(
+                (1003.33 + 6.67 / 2.0 - 0.01) - 1003.83, abs=1e-3
+            )
 
-            # Ping reply arriving 0.5s later keeps session Connected and does
-            # not trigger a spurious second ping from a stale deadline.
-            with patch("time.monotonic", return_value=1003.83):
-                with patch.object(
-                    conn,
-                    "_read_socket",
-                    side_effect=lambda: (
-                        setattr(conn, "_last_recv", 1003.83),
-                        conn._process_packet(PingResponse(zxid=2, err=0)),
-                    ),
-                ):
-                    conn._dispatch_ready_events({"zk_socket"}, deadline)
+        # Ping reply arriving 0.5s later keeps session Connected and does
+        # not trigger a spurious second ping from a stale deadline.
+        with patch("time.monotonic", return_value=1003.83):
+            with patch.object(
+                conn,
+                "_read_socket",
+                side_effect=lambda: (
+                    setattr(conn, "_last_recv", 1003.83),
+                    conn._process_packet(PingResponse(zxid=2, err=0)),
+                ),
+            ):
+                conn._dispatch_ready_events({"zk_socket"}, deadline)
 
-            assert isinstance(client.state_machine, Connected)
-            assert client.state_machine.ping_outstanding is False
+        assert isinstance(client.state_machine, Connected)
+        assert client.state_machine.ping_outstanding is False
 
     def test_sasl_drop_and_timeout_clears_pending_before_reconnect(
         self,
