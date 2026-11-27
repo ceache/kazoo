@@ -1035,6 +1035,9 @@ class TestConnectionIOLoopDecomposition:
         events.clear()
         client._state_machine = Mock()
         client._state_machine.state = Connected()
+        conn._read_timeout = 10.0
+        conn._last_send = 95.0
+        conn._last_recv = 95.0
         with patch("time.monotonic", return_value=105.0):
             conn._dispatch_ready_events(set(), 100.0)
             assert any(isinstance(e, PollTimeoutExpired) for e in events)
@@ -1049,7 +1052,10 @@ class TestConnectionIOLoopDecomposition:
             read_called = True
 
         conn._read_socket = fake_read_socket  # type: ignore[method-assign]
-        conn._dispatch_ready_events({"zk_socket"}, None)
+        conn._last_send = 105.0
+        conn._last_recv = 105.0
+        with patch("time.monotonic", return_value=105.0):
+            conn._dispatch_ready_events({"zk_socket"}, None)
         assert read_called is True
         assert len(events) == 0
 
@@ -1062,7 +1068,8 @@ class TestConnectionIOLoopDecomposition:
             send_called = True
 
         conn._send_request = fake_send_request  # type: ignore[method-assign]
-        res = conn._dispatch_ready_events({"wakeup"}, None)
+        with patch("time.monotonic", return_value=105.0):
+            res = conn._dispatch_ready_events({"wakeup"}, None)
         assert res is True
         assert send_called is True
         assert len(events) == 0
@@ -2513,3 +2520,60 @@ class TestWakeupOutsideSelect:
             conn.connection_stopped.set()
             conn._connection_routine = None
             conn.close()
+
+    def test_heartbeat_ping_timeout_does_not_collapse_to_jitter(self) -> None:
+        """[C-1][C-9] Pending ping gets ~read_timeout/2 and fresh deadline."""
+        from kazoo.protocol.serialization import PingResponse, WatchPacket
+
+        client = KazooClient(hosts="127.0.0.1:2181")
+        conn = client._connection
+        client._state_machine.state = Connected(host="127.0.0.1", port=2181)
+        conn._socket = Mock()
+        conn._socket.send.side_effect = lambda v: len(v)
+        conn._read_timeout = 6.67
+        conn._last_send = 1000.0
+        conn._last_recv = 1000.0
+
+        # Deterministic minimal jitter (0.01s) — worst case for the C-1 bug.
+        with patch("random.randint", return_value=1):
+            with patch("time.monotonic", return_value=1003.33):
+                _, deadline = conn._compute_poll_timeout()
+                conn._dispatch_ready_events(set(), deadline)
+
+            assert isinstance(client.state_machine, Connected)
+            assert client.state_machine.ping_outstanding is True
+            assert conn._last_send == pytest.approx(1003.33)
+
+            # Immediately after sending the ping, the next poll timeout must
+            # be ~read_timeout/2 - jitter (~3.325s), NOT jitter (0.01s).
+            with patch("time.monotonic", return_value=1003.33):
+                timeout, _ = conn._compute_poll_timeout()
+                assert timeout == pytest.approx(6.67 / 2.0 - 0.01, abs=1e-3)
+
+            # A Watch arriving while ping_outstanding=True advances _last_recv
+            # but must not stretch the remaining ping wait to _read_timeout.
+            conn._last_recv = 1003.83
+            with patch("time.monotonic", return_value=1003.83):
+                conn._process_packet(
+                    WatchPacket(zxid=1, type=3, state=3, path="/w")
+                )
+                timeout_after_watch, _ = conn._compute_poll_timeout()
+                assert timeout_after_watch == pytest.approx(
+                    (1003.33 + 6.67 / 2.0 - 0.01) - 1003.83, abs=1e-3
+                )
+
+            # Ping reply arriving 0.5s later keeps session Connected and does
+            # not trigger a spurious second ping from a stale deadline.
+            with patch("time.monotonic", return_value=1003.83):
+                with patch.object(
+                    conn,
+                    "_read_socket",
+                    side_effect=lambda: (
+                        setattr(conn, "_last_recv", 1003.83),
+                        conn._process_packet(PingResponse(zxid=2, err=0)),
+                    ),
+                ):
+                    conn._dispatch_ready_events({"zk_socket"}, deadline)
+
+            assert isinstance(client.state_machine, Connected)
+            assert client.state_machine.ping_outstanding is False

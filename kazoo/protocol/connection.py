@@ -1042,28 +1042,45 @@ class ConnectionHandler:
 
         now = time.monotonic()
         deadline, jitter_time = self._get_heartbeat_deadline()
-        timeout = max(deadline - now, jitter_time)
         state = self.client._state_machine.state
+        if (
+            isinstance(state, (Connected, ConnectedReadOnly))
+            and state.ping_outstanding
+        ):
+            ping_rem = max(
+                0.0,
+                (self._last_send + self._read_timeout / 2.0 - jitter_time)
+                - now,
+            )
+            if self._last_recv > 0.0:
+                recv_rem = max(
+                    0.0, (self._last_recv + self._read_timeout) - now
+                )
+                return min(ping_rem, recv_rem), deadline
+            return ping_rem, deadline
+
+        timeout = max(deadline - now, jitter_time)
         if (
             self._last_recv > 0.0
             and isinstance(state, (Connected, ConnectedReadOnly))
-            and (
-                state.ping_outstanding
-                or self._requests.pending
-                or self._requests.auth_pending
-            )
+            and (self._requests.pending or self._requests.auth_pending)
         ):
             recv_rem = max(0.0, (self._last_recv + self._read_timeout) - now)
             if recv_rem < timeout:
                 timeout = recv_rem
         return timeout, deadline
 
-    def _check_session_health(self, deadline: float | None) -> None:
+    def _check_session_health(
+        self,
+        deadline: float | None = None,
+        now: float | None = None,
+    ) -> None:
         """Send heartbeat pings and drop half-open connections past timeout."""
         state = self.client._state_machine.state
         if not isinstance(state, (Connected, ConnectedReadOnly)):
             return
-        now = time.monotonic()
+        if now is None:
+            now = time.monotonic()
         if (
             self._last_recv > 0.0
             and (
@@ -1076,12 +1093,10 @@ class ConnectionHandler:
             raise self.handler.timeout_exception(
                 "socket time-out: no response from server"
             )
-        if (
-            not state.ping_outstanding
-            and deadline is not None
-            and now >= deadline
-        ):
-            self._emit_event(HEARTBEAT_DEADLINE_REACHED)
+        if not state.ping_outstanding and self._last_send > 0.0:
+            fresh_deadline, _ = self._get_heartbeat_deadline()
+            if now >= fresh_deadline:
+                self._emit_event(HEARTBEAT_DEADLINE_REACHED)
 
     def _dispatch_ready_events(
         self, ready: set[str], deadline: float | None
@@ -1115,14 +1130,14 @@ class ConnectionHandler:
                 self._drain_wakeup()
                 if self._is_session_active:
                     self._send_request(self._connect_timeout)
-                    self._check_session_health(deadline)
+                    self._check_session_health()
                     return True
                 else:
                     self._emit_event(WAKEUP_SIGNALED)
                     return True
 
         if self._is_session_active:
-            self._check_session_health(deadline)
+            self._check_session_health()
         elif (
             self._phase_deadline is not None
             and time.monotonic() >= self._phase_deadline
@@ -1160,8 +1175,7 @@ class ConnectionHandler:
                     should_yield
                     and self.client._state_machine.state.is_connected
                 ):
-                    hb_deadline, _ = self._get_heartbeat_deadline()
-                    self._check_session_health(hb_deadline)
+                    self._check_session_health()
             else:
                 self._emit_event(SOCKET_READABLE)
             return
