@@ -69,12 +69,25 @@ def test_yield_control_eventlet_switches_greenlets() -> None:
 
 
 def test_eventlet_selector_subclasses_base_selector() -> None:
-    pytest.importorskip("eventlet")
+    eventlet = pytest.importorskip("eventlet")
     from kazoo.handlers.eventlet import SequentialEventletHandler
 
     handler = SequentialEventletHandler()
-    with handler.create_selector() as sel:
-        assert isinstance(sel, selectors.BaseSelector)
+    s_a, s_b = handler.create_socket_pair()
+    try:
+        s_a.setblocking(False)
+        s_b.setblocking(False)
+        s_b.send(b"x")
+        with handler.create_selector() as sel:
+            assert isinstance(sel, selectors.BaseSelector)
+            sel.register(s_a, selectors.EVENT_READ, data="a")
+            with patch.object(eventlet, "sleep") as mock_sleep:
+                ready = sel.select(1.0)
+                assert len(ready) == 1
+                mock_sleep.assert_not_called()
+    finally:
+        s_a.close()
+        s_b.close()
 
 
 def test_handlers_expose_create_selector_and_no_legacy_select() -> None:

@@ -50,7 +50,12 @@ def _yield_before_after() -> Generator[None, None, None]:
 
 
 class _EventletSelector(selectors.BaseSelector):
-    """Green selector wrapper that yields cooperatively around select()."""
+    """Thin ``selectors.BaseSelector`` adapter over eventlet's green selector.
+
+    ``eventlet.green.selectors.DefaultSelector`` subclasses eventlet's green
+    copy of ``selectors.BaseSelector`` rather than the stdlib class and
+    already yields cooperatively to the eventlet hub inside ``select()``.
+    """
 
     def __init__(self) -> None:
         self._selector = green_selectors.DefaultSelector()
@@ -85,13 +90,10 @@ class _EventletSelector(selectors.BaseSelector):
     def select(
         self, timeout: float | None = None
     ) -> list[tuple[selectors.SelectorKey, int]]:
-        try:
-            return cast(
-                "list[tuple[selectors.SelectorKey, int]]",
-                self._selector.select(timeout),
-            )
-        finally:
-            eventlet.sleep(0)  # type: ignore[no-untyped-call]
+        return cast(
+            "list[tuple[selectors.SelectorKey, int]]",
+            self._selector.select(timeout),
+        )
 
     def close(self) -> None:
         self._selector.close()

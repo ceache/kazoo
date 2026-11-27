@@ -394,3 +394,25 @@ class TestThreadingAsync:
 
         mockback2.assert_called_once_with(async_result)
         mockback1.assert_called_once_with(async_result)
+
+    def test_inline_callback_exception_on_stopped_handler_is_isolated(
+        self,
+    ) -> None:
+        handler = self._makeHandler()
+        assert handler.running is False
+
+        seen: list[str] = []
+
+        def bad_cb(_res: AsyncResult) -> None:
+            seen.append("bad")
+            raise RuntimeError("boom")
+
+        def good_cb(_res: AsyncResult) -> None:
+            seen.append("good")
+
+        async_result = self._makeOne(handler)
+        async_result.rawlink(bad_cb)
+        async_result.rawlink(good_cb)
+        # Must not propagate and must still invoke subsequent callbacks.
+        async_result.set_exception(RuntimeError("closed"))
+        assert seen == ["bad", "good"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 import socket
 import ssl
 import time
@@ -19,6 +20,8 @@ if TYPE_CHECKING:
 
     from kazoo.interfaces import Socket
 
+
+log = logging.getLogger(__name__)
 
 # sentinel objects
 # Note: This needs to be a unique object that is not None, as None is used to
@@ -145,7 +148,10 @@ class AsyncResult(IAsyncResult):
                     functools.partial(callback, self)
                 )
             else:
-                functools.partial(callback, self)()
+                try:
+                    functools.partial(callback, self)()
+                except Exception:
+                    log.exception("Exception in AsyncResult callback")
 
 
 def _set_default_tcpsock_options(module: ModuleType, sock: Socket) -> Socket:
