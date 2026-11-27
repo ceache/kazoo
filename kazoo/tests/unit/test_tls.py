@@ -174,4 +174,5 @@ class TestBuildSSLContext:
             )
             assert sock is wrapped
             mock_wrap.assert_called_once()
+            mock_wrap.call_args.args[0].close()
             wrapped.connect.assert_called_once_with(("127.0.0.1", 2181))
