@@ -20,14 +20,18 @@ stateDiagram-v2
     Connecting --> Connecting : ConnectAttemptStarted (next host)
     Connecting --> Handshaking : SocketConnected
     Connecting --> Connecting : ConnectionLostEvent (retry)
+    Connecting --> AuthFailed : AuthFailedEvent
+    Connecting --> Inactive : SessionClosedEvent / CloseRequested
 
     %% Handshake & Negotiation
-    Handshaking --> ExpiredSession : ConnectResponseReceived [time_out <= 0]
+    Handshaking --> ExpiredSession : ConnectResponseReceived [time_out <= 0] / SessionExpiredEvent
     Handshaking --> Authenticating : ConnectResponseReceived [has_sasl or auth_data]
     Handshaking --> Connected : ConnectResponseReceived [Read-Write]
     Handshaking --> ConnectedReadOnly : ConnectResponseReceived [Read-Only]
     Handshaking --> Connecting : ConnectionLostEvent / PollTimeoutExpired [if LOST]
     Handshaking --> Suspended : ConnectionLostEvent / PollTimeoutExpired [if SUSPENDED]
+    Handshaking --> AuthFailed : AuthFailedEvent
+    Handshaking --> Inactive : SessionClosedEvent / CloseRequested
 
     %% Authentication (SASL & Initial Auth Credentials Exchange)
     Authenticating --> Authenticating : SASLChallengeReceived (StepSASLHandshake)
@@ -37,7 +41,9 @@ stateDiagram-v2
     Authenticating --> ConnectedReadOnly : SASLCompleted / AuthPacketCompleted [Read-Only]
     Authenticating --> Connecting : ConnectionLostEvent / PollTimeoutExpired [if LOST]
     Authenticating --> Suspended : ConnectionLostEvent / PollTimeoutExpired [if SUSPENDED]
+    Authenticating --> ExpiredSession : SessionExpiredEvent
     Authenticating --> AuthFailed : AuthFailedEvent
+    Authenticating --> Inactive : SessionClosedEvent / CloseRequested
 
     %% Active Session States
     Connected --> Connected : CloseRequested [EnqueueCloseRequest, is_connecting_allowed=False]
@@ -60,6 +66,7 @@ stateDiagram-v2
     Suspended --> Inactive : SessionClosedEvent / CloseRequested
 
     ExpiredSession --> Connecting : ConnectAttemptStarted / StartRequested (re-connect afresh)
+    ExpiredSession --> AuthFailed : AuthFailedEvent
     ExpiredSession --> Inactive : SessionClosedEvent / CloseRequested
 
     AuthFailed --> Connecting : StartRequested (manual restart)
