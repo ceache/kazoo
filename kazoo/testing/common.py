@@ -37,7 +37,7 @@ from packaging import (
 
 import kazoo.client
 from kazoo.interfaces import Event
-from kazoo.protocol.connection import (
+from kazoo.protocol.session import (
     _CONNECTION_DROP,
     _SESSION_EXPIRED,
 )
