@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from typing_extensions import ParamSpec
 
 from kazoo.interfaces import FdLike, IAsyncResult
+from kazoo.protocol.tls import TLSConfig, build_ssl_context
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -244,6 +245,21 @@ def create_tcp_connection(
     if timeout is not None:
         end = time.monotonic() + timeout
     sock: Socket | None = None
+    ssl_context: ssl.SSLContext | None = None
+    if use_ssl:
+        ssl_context = build_ssl_context(
+            TLSConfig(
+                use_ssl=True,
+                ca=ca,
+                certfile=certfile,
+                keyfile=keyfile,
+                keyfile_password=keyfile_password,
+                verify_certs=verify_certs,
+                check_hostname=check_hostname,
+                options=options,
+                ciphers=ciphers,
+            )
+        )
 
     while True:
         timeout_at = end if end is None else end - time.monotonic()
@@ -252,46 +268,13 @@ def create_tcp_connection(
         if timeout_at is not None and timeout_at <= 0:
             break
 
-        if use_ssl:
-            # Disallow use of SSLv2 and V3 (meaning we require TLSv1.0+)
-            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-
-            if options is not None:
-                context.options = options
-            else:
-                context.options |= ssl.OP_NO_SSLv2
-                context.options |= ssl.OP_NO_SSLv3
-
-            if ciphers:
-                context.set_ciphers(ciphers)
-
-            # Load default CA certs
-            context.load_default_certs(ssl.Purpose.SERVER_AUTH)
-            if check_hostname and not verify_certs:
-                raise ValueError(
-                    "verify_certs must be True when"
-                    + " check_hostname is True"
-                )
-            # We must set check_hostname to False prior to setting
-            # verify_mode to CERT_NONE.
-            context.check_hostname = check_hostname
-            context.verify_mode = (
-                ssl.CERT_REQUIRED if verify_certs else ssl.CERT_NONE
-            )
-            if ca:
-                context.load_verify_locations(ca)
-            if certfile and keyfile:
-                context.load_cert_chain(
-                    certfile=certfile,
-                    keyfile=keyfile,
-                    password=keyfile_password,
-                )
+        if ssl_context is not None:
             try:
-                # Query the address to get back it's address family
+                # Query the address to get back its address family
                 addrs = socket.getaddrinfo(
                     address[0], address[1], 0, socket.SOCK_STREAM
                 )
-                conn = context.wrap_socket(
+                conn = ssl_context.wrap_socket(
                     module.socket(addrs[0][0]), server_hostname=hostname
                 )
                 conn.settimeout(timeout_at)

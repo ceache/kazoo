@@ -85,6 +85,7 @@ from kazoo.protocol.states import (
     WatchedEvent,
     WatcherType,
 )
+from kazoo.protocol.tls import TLSConfig
 
 # convenience API
 from kazoo.recipe.barrier import Barrier, DoubleBarrier
@@ -391,6 +392,15 @@ class KazooClient:
         self.chroot: str = None  # type: ignore[assignment]
         self.set_hosts(hosts)
 
+        self.tls_config = TLSConfig(
+            use_ssl=use_ssl,
+            ca=ca,
+            certfile=certfile,
+            keyfile=keyfile,
+            keyfile_password=keyfile_password,
+            verify_certs=verify_certs,
+            check_hostname=check_hostname,
+        )
         self.use_ssl = use_ssl
         self.verify_certs = verify_certs
         self.check_hostname = check_hostname
