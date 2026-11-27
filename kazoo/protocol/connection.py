@@ -254,7 +254,7 @@ class ConnectionHandler:
         self._write_sock: Socket | None = None
 
         self._socket: Socket | None = None
-        self._socket_is_ssl: bool = False
+        self._ssl_socket: ssl.SSLSocket | None = None
         self._selector: selectors.BaseSelector | None = None
         self._write_selector: selectors.BaseSelector | None = None
         self._requests: RequestManager = client._request_manager
@@ -383,7 +383,7 @@ class ConnectionHandler:
             except Exception:
                 pass
             self._socket = None
-        self._socket_is_ssl = False
+        self._ssl_socket = None
         self._replies_since_select = 0
         self._phase_deadline = None
         self._heartbeat_deadline = None
@@ -418,11 +418,8 @@ class ConnectionHandler:
 
     def _select(self, timeout: float) -> set[str]:
         """Wait for readable events on the persistent selector."""
-        has_ssl_pending = (
-            self._socket_is_ssl
-            and self._socket is not None
-            and cast(ssl.SSLSocket, self._socket).pending() > 0
-        )
+        ssl_sock = self._ssl_socket
+        has_ssl_pending = ssl_sock is not None and ssl_sock.pending() > 0
         assert self._selector is not None
         events = self._selector.select(0.0 if has_ssl_pending else timeout)
 
@@ -714,6 +711,8 @@ class ConnectionHandler:
         if packet is not None:
             return packet
 
+        ssl_sock = self._ssl_socket
+        write_deadline: float | None = None
         while True:
             buf = self._frame_decoder.get_buffer()
             try:
@@ -721,22 +720,28 @@ class ConnectionHandler:
                     buf
                 )
             except BlockingIOError:
-                if (
-                    self._socket_is_ssl
-                    and cast(ssl.SSLSocket, self._socket).pending() > 0
-                ):
+                if ssl_sock is not None and ssl_sock.pending() > 0:
                     continue
                 return None
             except ssl.SSLError as e:
                 if e.errno == ssl.SSL_ERROR_WANT_READ:
-                    if cast(ssl.SSLSocket, self._socket).pending() > 0:
+                    if ssl_sock is not None and ssl_sock.pending() > 0:
                         continue
                     return None
                 if e.errno == ssl.SSL_ERROR_WANT_WRITE:
-                    eff = self._read_timeout if timeout is None else timeout
-                    if not self.handler.select(
-                        [], [cast("Socket", self._socket)], [], eff
-                    )[1]:
+                    now = time.monotonic()
+                    if write_deadline is None:
+                        eff = (
+                            self._read_timeout if timeout is None else timeout
+                        )
+                        write_deadline = now + eff
+                    rem = write_deadline - now
+                    if (
+                        rem <= 0.0
+                        or not self.handler.select(
+                            [], [cast("Socket", self._socket)], [], rem
+                        )[1]
+                    ):
                         raise self.handler.timeout_exception(
                             "socket time-out during read"
                         )
@@ -784,67 +789,96 @@ class ConnectionHandler:
 
         sent = 0
         msg_length = len(msg)
-        view = memoryview(msg)
+        want_read = False
+        # Use .write() on SSL sockets so non-blocking gevent.ssl.SSLSocket
+        # re-raises SSLWantReadError/SSLWantWriteError instead of returning 0.
+        ssl_sock = self._ssl_socket
+        write_fn = (
+            ssl_sock.write
+            if ssl_sock is not None and hasattr(ssl_sock, "write")
+            else self._socket.send
+        )
 
-        # Fast-path: optimistic direct non-blocking send
-        try:
-            bytes_sent = self._socket.send(view)
-            if not bytes_sent:
-                raise ConnectionDropped("socket connection broken")
-            if bytes_sent >= msg_length:
-                return
-            sent = bytes_sent
-        except BlockingIOError:
-            pass
-        except ssl.SSLError as e:
-            if e.errno not in (
-                ssl.SSL_ERROR_WANT_READ,
-                ssl.SSL_ERROR_WANT_WRITE,
-            ):
-                raise
-        except OSError as e:
-            raise ConnectionDropped(f"socket connection error: {e}") from e
-
-        # Slow-path: partial write or buffer full, drain bounded by timeout
-        eff_timeout = self._connect_timeout if timeout is None else timeout
-        deadline = time.monotonic() + eff_timeout
-        write_sel: selectors.BaseSelector | None = None
-        if self._selector is not None:
-            if self._write_selector is None:
-                wsel = self.handler.create_selector()
-                wsel.register(self._socket, selectors.EVENT_WRITE)
-                self._write_selector = wsel
-            write_sel = self._write_selector
-
-        while sent < msg_length:
-            rem_timeout = max(0.0, deadline - time.monotonic())
-            if write_sel is not None:
-                is_ready = bool(write_sel.select(rem_timeout))
-            else:
-                is_ready = bool(
-                    self.handler.select([], [self._socket], [], rem_timeout)[1]
-                )
-            if not is_ready:
-                raise self.handler.timeout_exception(
-                    "socket time-out during write"
-                )
+        with memoryview(msg) as view:
+            # Fast-path: optimistic direct non-blocking send
             try:
-                bytes_sent = self._socket.send(view[sent:])
+                bytes_sent = write_fn(view)
+                if not bytes_sent:
+                    raise ConnectionDropped("socket connection broken")
+                if bytes_sent >= msg_length:
+                    return
+                sent = bytes_sent
             except BlockingIOError:
-                continue
+                pass
             except ssl.SSLError as e:
-                if e.errno in (
-                    ssl.SSL_ERROR_WANT_READ,
-                    ssl.SSL_ERROR_WANT_WRITE,
-                ):
-                    continue
-                else:
+                if e.errno == ssl.SSL_ERROR_WANT_READ:
+                    want_read = True
+                elif e.errno != ssl.SSL_ERROR_WANT_WRITE:
                     raise
             except OSError as e:
                 raise ConnectionDropped(f"socket connection error: {e}") from e
-            if not bytes_sent:
-                raise ConnectionDropped("socket connection broken")
-            sent += bytes_sent
+
+            # Slow-path: partial write or buffer full, drain bounded by timeout
+            eff_timeout = self._connect_timeout if timeout is None else timeout
+            deadline = time.monotonic() + eff_timeout
+            write_sel: selectors.BaseSelector | None = None
+            if self._selector is not None:
+                if self._write_selector is None:
+                    wsel = self.handler.create_selector()
+                    try:
+                        wsel.register(self._socket, selectors.EVENT_WRITE)
+                    except Exception:
+                        wsel.close()
+                        raise
+                    self._write_selector = wsel
+                write_sel = self._write_selector
+
+            while sent < msg_length:
+                rem_timeout = deadline - time.monotonic()
+                if rem_timeout <= 0.0:
+                    raise self.handler.timeout_exception(
+                        "socket time-out during write"
+                    )
+                if want_read:
+                    is_ready = bool(
+                        self.handler.select(
+                            [self._socket], [], [], rem_timeout
+                        )[0]
+                    )
+                elif write_sel is not None:
+                    is_ready = bool(write_sel.select(rem_timeout))
+                else:
+                    is_ready = bool(
+                        self.handler.select(
+                            [], [self._socket], [], rem_timeout
+                        )[1]
+                    )
+                if not is_ready:
+                    raise self.handler.timeout_exception(
+                        "socket time-out during write"
+                    )
+                try:
+                    with view[sent:] as chunk:
+                        bytes_sent = write_fn(chunk)
+                except BlockingIOError:
+                    want_read = False
+                    continue
+                except ssl.SSLError as e:
+                    if e.errno == ssl.SSL_ERROR_WANT_READ:
+                        want_read = True
+                        continue
+                    if e.errno == ssl.SSL_ERROR_WANT_WRITE:
+                        want_read = False
+                        continue
+                    raise
+                except OSError as e:
+                    raise ConnectionDropped(
+                        f"socket connection error: {e}"
+                    ) from e
+                if not bytes_sent:
+                    raise ConnectionDropped("socket connection broken")
+                want_read = False
+                sent += bytes_sent
 
     def _set_client_last_zxid(self, zxid: int) -> None:
         self.client.last_zxid = zxid
@@ -1282,7 +1316,11 @@ class ConnectionHandler:
                 retry.cur_delay,
             )
             self._socket.setblocking(False)
-            self._socket_is_ssl = hasattr(self._socket, "pending")
+            self._ssl_socket = (
+                cast("ssl.SSLSocket", self._socket)
+                if hasattr(self._socket, "pending")
+                else None
+            )
             if self._check_is_terminal():
                 return STOP_CONNECTING
             self._setup_selector()

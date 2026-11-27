@@ -1267,9 +1267,10 @@ class TestClientStateMachineDriver:
                 def pending(self) -> int:
                     return 64
 
+            fake_ssl = FakeSSLSocket()
             conn._selector = client.handler.create_selector()
-            conn._socket = FakeSSLSocket()  # type: ignore[assignment]
-            conn._socket_is_ssl = True
+            conn._socket = fake_ssl  # type: ignore[assignment]
+            conn._ssl_socket = fake_ssl  # type: ignore[assignment]
             conn._read_sock = s_wk_a
             conn._setup_selector()
 

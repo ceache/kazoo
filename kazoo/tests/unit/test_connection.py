@@ -1903,7 +1903,7 @@ class TestConnectionRecvIntoAndBurstScheduling:
         client = _make_mock_client()
         conn = ConnectionHandler(client, KazooRetry())
         conn._socket = Mock()
-        conn._socket_is_ssl = True
+        conn._ssl_socket = conn._socket
         conn._socket.pending.return_value = 0
         conn._socket.recv_into.side_effect = ssl.SSLWantReadError(
             ssl.SSL_ERROR_WANT_READ, "want read"
@@ -2889,3 +2889,139 @@ class TestWakeupOutsideSelect:
             gconn.connection_stopped.set()
             gconn._connection_routine = None
             gconn.close()
+
+    def test_write_ssl_want_read_gevent_write_and_deadline(self) -> None:
+        """[C-4][C-5] _write handles SSL WANT_READ, .write(), and deadline."""
+        import ssl
+
+        client = _make_mock_client()
+        conn = ConnectionHandler(client, KazooRetry())
+        mock_ssl = Mock()
+        # Simulate gevent's send()->0 quirk: send() must NOT be called on SSL.
+        mock_ssl.send.return_value = 0
+        mock_ssl.write.side_effect = [
+            ssl.SSLWantReadError(ssl.SSL_ERROR_WANT_READ, "want read"),
+            5,
+            ssl.SSLWantWriteError(ssl.SSL_ERROR_WANT_WRITE, "want write"),
+            5,
+        ]
+        conn._socket = mock_ssl
+        conn._ssl_socket = mock_ssl
+
+        select_calls: list[tuple[Any, Any]] = []
+
+        def fake_select(
+            r: Any, w: Any, x: Any, timeout: float | None = None
+        ) -> tuple[Any, Any, Any]:
+            select_calls.append((list(r), list(w)))
+            return (list(r), list(w), [])
+
+        conn.handler.select = fake_select  # type: ignore[assignment]
+        conn._write(b"0123456789", timeout=1.0)
+
+        mock_ssl.send.assert_not_called()
+        assert mock_ssl.write.call_count == 4
+        # First wait must be for readability (SSL_ERROR_WANT_READ), followed by
+        # writability waits for the remaining chunk and SSL_ERROR_WANT_WRITE.
+        assert select_calls == [
+            ([mock_ssl], []),
+            ([], [mock_ssl]),
+            ([], [mock_ssl]),
+        ]
+
+        # Post-deadline BlockingIOError must raise timeout instead of spinning.
+        mock_sock = Mock()
+        mock_sock.send.side_effect = BlockingIOError()
+        conn._socket = mock_sock
+        conn._ssl_socket = None
+        conn.handler.select = Mock(return_value=([], [mock_sock], []))  # type: ignore[assignment]
+        clock = iter([100.0, 100.5, 101.0])
+        with (
+            patch("time.monotonic", side_effect=lambda: next(clock)),
+            pytest.raises(conn.handler.timeout_exception),
+        ):
+            conn._write(b"abc", timeout=1.0)
+
+        # Failed wsel.register() closes wsel without leaking it.
+        conn._selector = Mock()
+        bad_wsel = Mock()
+        bad_wsel.register.side_effect = ValueError("closed fd")
+        conn.handler.create_selector = Mock(return_value=bad_wsel)  # type: ignore[assignment]
+        with pytest.raises(ValueError, match="closed fd"):
+            conn._write(b"abc", timeout=1.0)
+        bad_wsel.close.assert_called_once()
+        assert conn._write_selector is None
+
+    def test_write_releases_memoryview_before_batch_clear(self) -> None:
+        """[C-6] _write releases all memoryviews so bytearray.clear() works."""
+        client = _make_mock_client()
+        conn = ConnectionHandler(client, KazooRetry())
+        mock_sock = Mock()
+        conn._socket = mock_sock
+
+        captured_views: list[memoryview] = []
+
+        def fake_send(buf: memoryview) -> int:
+            # Verify buffer is alive during send(), and capture reference to
+            # verify it is released once _write() exits (PyPy BufferError fix).
+            captured_views.append(buf)
+            return len(buf) // 2 if len(captured_views) == 1 else len(buf)
+
+        mock_sock.send.side_effect = fake_send
+        conn.handler.select = Mock(return_value=([], [mock_sock], []))  # type: ignore[assignment]
+
+        buf = bytearray(b"abcdefghij")
+        conn._write(buf, timeout=1.0)
+        # All memoryviews exported by _write() must already be released.
+        for mv in captured_views:
+            with pytest.raises(ValueError, match="released"):
+                _ = mv[0]
+        buf.clear()
+        assert len(buf) == 0
+
+        # Error path also releases the memoryview cleanly.
+        captured_views.clear()
+        buf2 = bytearray(b"0123456789")
+
+        def fail_send(mv: memoryview) -> int:
+            captured_views.append(mv)
+            raise OSError("boom")
+
+        mock_sock.send.side_effect = fail_send
+        with pytest.raises(ConnectionDropped):
+            conn._write(buf2, timeout=1.0)
+        with pytest.raises(ValueError, match="released"):
+            _ = captured_views[0][0]
+        buf2.clear()
+
+    def test_read_packet_ssl_want_write_cumulative_deadline(self) -> None:
+        """[C-4] Repeated SSL_ERROR_WANT_WRITE uses cumulative deadline."""
+        import ssl
+
+        client = _make_mock_client()
+        conn = ConnectionHandler(client, KazooRetry())
+        mock_ssl = Mock()
+        mock_ssl.recv_into.side_effect = ssl.SSLWantWriteError(
+            ssl.SSL_ERROR_WANT_WRITE, "want write"
+        )
+        conn._socket = mock_ssl
+        conn._ssl_socket = mock_ssl
+
+        timeouts: list[float] = []
+
+        def fake_select(
+            r: Any, w: Any, x: Any, timeout: float | None = None
+        ) -> tuple[Any, Any, Any]:
+            assert timeout is not None
+            timeouts.append(timeout)
+            return ([], [mock_ssl], [])
+
+        conn.handler.select = fake_select  # type: ignore[assignment]
+        clock = iter([100.0, 100.6, 101.2])
+        with (
+            patch("time.monotonic", side_effect=lambda: next(clock)),
+            pytest.raises(conn.handler.timeout_exception),
+        ):
+            conn._read_packet(timeout=1.0)
+
+        assert timeouts == [pytest.approx(1.0), pytest.approx(0.4)]
