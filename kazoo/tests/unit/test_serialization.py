@@ -48,24 +48,17 @@ def _make_acl_list() -> list[ACL]:
 
 
 class TestUtils:
-    @pytest.mark.parametrize(
-        ("s",),
-        [
-            pytest.param("hello-\u03c0", id="non_empty_string"),
-            pytest.param(None, id="none_value"),
-        ],
-    )
-    def test_write_read_string_roundtrip(self, s: str | None) -> None:
-        b = serialization._write_string(s)
-        decoded, offset = serialization._read_string(b, 0)
-        assert decoded == s
+    def test_write_read_required_string_roundtrip(self) -> None:
+        b = serialization._write_string("hello-\u03c0")
+        decoded, offset = serialization._read_required_string(b, 0)
+        assert decoded == "hello-\u03c0"
         assert offset == len(b)
 
-    def test_write_read_empty_string_roundtrip(self) -> None:
-        b = serialization._write_string("")
-        decoded, offset = serialization._read_string(b, 0)
-        assert offset == len(b)
-        assert decoded is None
+    def test_write_empty_or_none_string_encodes_neg_one(self) -> None:
+        assert serialization._write_string(None) == _int_struct.pack(-1)
+        assert serialization._write_string("") == _int_struct.pack(-1)
+        with pytest.raises(MarshallingError, match="Invalid string length"):
+            serialization._read_required_string(_int_struct.pack(-1), 0)
 
     @pytest.mark.parametrize(
         ("data",),
@@ -2043,3 +2036,84 @@ class TestDataclassPacketsAndFrameDecoder:
         ) + serialization.multiheader_struct.pack(-1, 1, -1)
         with pytest.raises(MarshallingError, match="Unknown transaction"):
             serialization.Transaction.deserialize(tx_bad_op, 0)
+
+    def test_deferred_oversize_control_frame_flagged_immediately(self) -> None:
+        """[C-10] Coalesced oversize xid<=0 raises right after frame 1."""
+        dec = serialization.FrameDecoder(max_buffer=64)
+        # Valid PingResponse (16-byte payload) followed by 8 bytes of an
+        # oversize Watch frame (length > max_payload, xid = -1).
+        frame1_body = _reply_header_struct.pack(-2, 1, 0)
+        frame1 = _int_struct.pack(len(frame1_body)) + frame1_body
+        oversize_partial = _int_int_struct.pack(1024, -1)
+
+        dec._feed(frame1 + oversize_partial)
+        pkt1 = dec.pop_packet()
+        assert isinstance(pkt1, serialization.PingResponse)
+
+        # Immediately after popping frame 1, only 8 bytes of frame 2 exist
+        # (< 20), yet frame_ready, get_buffer, and pop_packet must reject it.
+        with pytest.raises(ConnectionDropped, match="non-request xid -1"):
+            _ = dec.frame_ready
+        with pytest.raises(ConnectionDropped, match="non-request xid -1"):
+            dec.get_buffer()
+        with pytest.raises(ConnectionDropped, match="non-request xid -1"):
+            dec.pop_packet()
+
+    def test_add_watch_deserialize_rejects_short_buffer(self) -> None:
+        """[C-10] AddWatch.deserialize validates 4-byte response length."""
+        with pytest.raises(struct.error):
+            serialization.AddWatch.deserialize(b"", 0)
+        with pytest.raises(struct.error):
+            serialization.AddWatch.deserialize(b"\x00\x00", 0)
+        res, offset = serialization.AddWatch.deserialize(
+            _int_struct.pack(0), 0
+        )
+        assert res is None
+        assert offset == 4
+
+    def test_serialize_into_parity_with_serialize(self) -> None:
+        """[E-1] _serialize_into matches serialize() across all requests."""
+        acls = _make_acl_list()
+        requests = [
+            serialization.Connect(0, 1, 10000, 42, b"pw", True),
+            serialization.Create("/a", b"data", acls, 1),
+            serialization.Create2("/a", b"data", acls, 1),
+            serialization.CreateContainer("/a", None, acls, 0),
+            serialization.CreateTTL("/a", b"x", acls, 5, 5000),
+            serialization.Delete("/a", 2),
+            serialization.Exists("/a", None),
+            serialization.GetData("/a", lambda ev: None),
+            serialization.SetData("/a", b"new", 3),
+            serialization.GetACL("/a"),
+            serialization.SetACL("/a", acls, 1),
+            serialization.GetChildren("/a", None),
+            serialization.GetChildren2("/a", lambda ev: None),
+            serialization.Sync("/a"),
+            serialization.CheckVersion("/a", 4),
+            serialization.Transaction(
+                [
+                    serialization.Create("/t", b"v", acls, 0),
+                    serialization.SetData("/t", b"v2", -1),
+                    serialization.CheckVersion("/t", 1),
+                    serialization.Delete("/t", -1),
+                ]
+            ),
+            serialization.Reconfig("j", "l", None, 9),
+            serialization.RemoveWatches("/a", 1),
+            serialization.Auth(0, "digest", "u:p"),
+            serialization.SASL(b"tok"),
+            serialization.AddWatch("/a", lambda ev: None, 0),
+        ]
+        for req in requests:
+            buf = bytearray()
+            req._serialize_into(buf)  # type: ignore[attr-defined]
+            assert bytes(buf) == bytes(req.serialize()), type(req).__name__
+            encoded = serialization.FrameDecoder.encode_request(req, 7)
+            expected_body = (
+                (_int_struct.pack(7) if True else b"")
+                + (_int_struct.pack(req.type) if req.type is not None else b"")
+                + bytes(req.serialize())
+            )
+            assert (
+                encoded == _int_struct.pack(len(expected_body)) + expected_body
+            )

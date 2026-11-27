@@ -84,6 +84,7 @@ class ReservedXID(IntEnum):
 bool_struct = struct.Struct("B")
 int_struct = struct.Struct("!i")
 int_int_struct = struct.Struct("!ii")
+_frame_xid_type_struct = struct.Struct("!iii")
 int_int_long_struct = struct.Struct("!iiq")
 
 int_long_int_long_struct = struct.Struct("!iqiq")
@@ -92,24 +93,6 @@ multiheader_struct = struct.Struct("!iBi")
 reply_header_struct = struct.Struct("!iqi")
 watch_header_struct = struct.Struct("!iqiii")
 stat_struct = struct.Struct("!qqqqiiiqiiq")
-
-
-def _read_string(buffer: bytes | memoryview, offset: int) -> tuple[str, int]:
-    """Reads an int specified buffer into a string and returns the
-    string and the new offset in the buffer"""
-    length = int_struct.unpack_from(buffer, offset)[0]
-    offset += int_struct.size
-    if length < -1:
-        raise MarshallingError(f"Invalid string length: {length}")
-    if length == -1:
-        # A note: write_str sends a length of -1 to indicate a value of None
-        # was passed. Not entirely sure where this happens because none of the
-        # callers of read_string seem to expect a None value.
-        return None, offset  # type: ignore[return-value]
-    else:
-        index = offset
-        offset += length
-        return str(buffer[index : index + length], "utf-8"), offset
 
 
 def _read_required_string(
@@ -133,13 +116,35 @@ def _read_acl(bytes: bytes | memoryview, offset: int) -> tuple[ACL, int]:
     return ACL(Permissions(perms), Id(scheme, id)), offset
 
 
+_NEG_ONE_INT = int_struct.pack(-1)
+
+
+def _write_string_into(buf: bytearray, value: str | None) -> None:
+    """Append a length-prefixed UTF-8 string directly into ``buf``."""
+    if not value:
+        buf.extend(_NEG_ONE_INT)
+    else:
+        utf8_str = value.encode("utf-8")
+        buf.extend(int_struct.pack(len(utf8_str)))
+        buf.extend(utf8_str)
+
+
+def _write_buffer_into(buf: bytearray, value: bytes | None) -> None:
+    """Append a length-prefixed bytes buffer directly into ``buf``."""
+    if value is None:
+        buf.extend(_NEG_ONE_INT)
+    else:
+        buf.extend(int_struct.pack(len(value)))
+        buf.extend(value)
+
+
 def _write_acls(buf: bytearray, acls: Sequence[ACL]) -> None:
     """Append a length-prefixed ACL sequence to ``buf``."""
     buf.extend(int_struct.pack(len(acls)))
     for acl in acls:
         buf.extend(int_struct.pack(acl.perms))
-        buf.extend(_write_string(acl.id.scheme))
-        buf.extend(_write_string(acl.id.id))
+        _write_string_into(buf, acl.id.scheme)
+        _write_string_into(buf, acl.id.id)
 
 
 def _write_string(bytes: str | None) -> bytes:
@@ -150,7 +155,7 @@ def _write_string(bytes: str | None) -> bytes:
     # write_buffer, which writes a length of 0 for an empty buffer and -1 for
     # None.
     if not bytes:
-        return int_struct.pack(-1)
+        return _NEG_ONE_INT
     else:
         utf8_str = bytes.encode("utf-8")
         return int_struct.pack(len(utf8_str)) + utf8_str
@@ -158,7 +163,7 @@ def _write_string(bytes: str | None) -> bytes:
 
 def _write_buffer(bytes: bytes | None) -> bytes:
     if bytes is None:
-        return int_struct.pack(-1)
+        return _NEG_ONE_INT
     else:
         return int_struct.pack(len(bytes)) + bytes
 
@@ -213,9 +218,8 @@ class Connect:
 
     type: ClassVar[int | None] = None
 
-    def serialize(self) -> bytearray:
-        b = bytearray()
-        b.extend(
+    def _serialize_into(self, buf: bytearray) -> None:
+        buf.extend(
             int_long_int_long_struct.pack(
                 self.protocol_version,
                 self.last_zxid_seen,
@@ -223,8 +227,12 @@ class Connect:
                 self.session_id,
             )
         )
-        b.extend(_write_buffer(self.passwd))
-        b.extend([1 if self.read_only else 0])
+        _write_buffer_into(buf, self.passwd)
+        buf.append(1 if self.read_only else 0)
+
+    def serialize(self) -> bytearray:
+        b = bytearray()
+        self._serialize_into(b)
         return b
 
     @classmethod
@@ -264,12 +272,15 @@ class Create:
 
     type: ClassVar[int] = 1
 
+    def _serialize_into(self, buf: bytearray) -> None:
+        _write_string_into(buf, self.path)
+        _write_buffer_into(buf, self.data)
+        _write_acls(buf, self.acl)
+        buf.extend(int_struct.pack(self.flags))
+
     def serialize(self) -> bytearray:
         b = bytearray()
-        b.extend(_write_string(self.path))
-        b.extend(_write_buffer(self.data))
-        _write_acls(b, self.acl)
-        b.extend(int_struct.pack(self.flags))
+        self._serialize_into(b)
         return b
 
     @classmethod
@@ -286,10 +297,13 @@ class Delete:
 
     type: ClassVar[int] = 2
 
+    def _serialize_into(self, buf: bytearray) -> None:
+        _write_string_into(buf, self.path)
+        buf.extend(int_struct.pack(self.version))
+
     def serialize(self) -> bytearray:
         b = bytearray()
-        b.extend(_write_string(self.path))
-        b.extend(int_struct.pack(self.version))
+        self._serialize_into(b)
         return b
 
     @classmethod
@@ -306,10 +320,13 @@ class Exists:
 
     type: ClassVar[int] = 3
 
+    def _serialize_into(self, buf: bytearray) -> None:
+        _write_string_into(buf, self.path)
+        buf.append(1 if self.watcher else 0)
+
     def serialize(self) -> bytearray:
         b = bytearray()
-        b.extend(_write_string(self.path))
-        b.extend([1 if self.watcher else 0])
+        self._serialize_into(b)
         return b
 
     @classmethod
@@ -328,10 +345,13 @@ class GetData:
 
     type: ClassVar[int] = 4
 
+    def _serialize_into(self, buf: bytearray) -> None:
+        _write_string_into(buf, self.path)
+        buf.append(1 if self.watcher else 0)
+
     def serialize(self) -> bytearray:
         b = bytearray()
-        b.extend(_write_string(self.path))
-        b.extend([1 if self.watcher else 0])
+        self._serialize_into(b)
         return b
 
     @classmethod
@@ -351,11 +371,14 @@ class SetData:
 
     type: ClassVar[int] = 5
 
+    def _serialize_into(self, buf: bytearray) -> None:
+        _write_string_into(buf, self.path)
+        _write_buffer_into(buf, self.data)
+        buf.extend(int_struct.pack(self.version))
+
     def serialize(self) -> bytearray:
         b = bytearray()
-        b.extend(_write_string(self.path))
-        b.extend(_write_buffer(self.data))
-        b.extend(int_struct.pack(self.version))
+        self._serialize_into(b)
         return b
 
     @classmethod
@@ -372,8 +395,13 @@ class GetACL:
 
     type: ClassVar[int] = 6
 
+    def _serialize_into(self, buf: bytearray) -> None:
+        _write_string_into(buf, self.path)
+
     def serialize(self) -> bytearray:
-        return bytearray(_write_string(self.path))
+        b = bytearray()
+        self._serialize_into(b)
+        return b
 
     @classmethod
     def deserialize(
@@ -404,11 +432,14 @@ class SetACL:
 
     type: ClassVar[int] = 7
 
+    def _serialize_into(self, buf: bytearray) -> None:
+        _write_string_into(buf, self.path)
+        _write_acls(buf, self.acls)
+        buf.extend(int_struct.pack(self.version))
+
     def serialize(self) -> bytearray:
         b = bytearray()
-        b.extend(_write_string(self.path))
-        _write_acls(b, self.acls)
-        b.extend(int_struct.pack(self.version))
+        self._serialize_into(b)
         return b
 
     @classmethod
@@ -426,10 +457,13 @@ class GetChildren:
 
     type: ClassVar[int] = 8
 
+    def _serialize_into(self, buf: bytearray) -> None:
+        _write_string_into(buf, self.path)
+        buf.append(1 if self.watcher else 0)
+
     def serialize(self) -> bytearray:
         b = bytearray()
-        b.extend(_write_string(self.path))
-        b.extend([1 if self.watcher else 0])
+        self._serialize_into(b)
         return b
 
     @classmethod
@@ -456,6 +490,9 @@ class Sync:
 
     type: ClassVar[int] = 9
 
+    def _serialize_into(self, buf: bytearray) -> None:
+        _write_string_into(buf, self.path)
+
     def serialize(self) -> bytes:
         return _write_string(self.path)
 
@@ -473,10 +510,13 @@ class GetChildren2:
 
     type: ClassVar[int] = 12
 
+    def _serialize_into(self, buf: bytearray) -> None:
+        _write_string_into(buf, self.path)
+        buf.append(1 if self.watcher else 0)
+
     def serialize(self) -> bytearray:
         b = bytearray()
-        b.extend(_write_string(self.path))
-        b.extend([1 if self.watcher else 0])
+        self._serialize_into(b)
         return b
 
     @classmethod
@@ -507,10 +547,13 @@ class CheckVersion:
 
     type: ClassVar[int] = 13
 
+    def _serialize_into(self, buf: bytearray) -> None:
+        _write_string_into(buf, self.path)
+        buf.extend(int_struct.pack(self.version))
+
     def serialize(self) -> bytearray:
         b = bytearray()
-        b.extend(_write_string(self.path))
-        b.extend(int_struct.pack(self.version))
+        self._serialize_into(b)
         return b
 
 
@@ -523,12 +566,15 @@ class Create2:
 
     type: ClassVar[int] = 15
 
+    def _serialize_into(self, buf: bytearray) -> None:
+        _write_string_into(buf, self.path)
+        _write_buffer_into(buf, self.data)
+        _write_acls(buf, self.acl)
+        buf.extend(int_struct.pack(self.flags))
+
     def serialize(self) -> bytearray:
         b = bytearray()
-        b.extend(_write_string(self.path))
-        b.extend(_write_buffer(self.data))
-        _write_acls(b, self.acl)
-        b.extend(int_struct.pack(self.flags))
+        self._serialize_into(b)
         return b
 
     @classmethod
@@ -549,12 +595,15 @@ class CreateContainer:
 
     type: ClassVar[int] = 19
 
+    def _serialize_into(self, buf: bytearray) -> None:
+        _write_string_into(buf, self.path)
+        _write_buffer_into(buf, self.data)
+        _write_acls(buf, self.acl)
+        buf.extend(int_struct.pack(self.flags))
+
     def serialize(self) -> bytearray:
         b = bytearray()
-        b.extend(_write_string(self.path))
-        b.extend(_write_buffer(self.data))
-        _write_acls(b, self.acl)
-        b.extend(int_struct.pack(self.flags))
+        self._serialize_into(b)
         return b
 
     @classmethod
@@ -576,13 +625,16 @@ class CreateTTL:
 
     type: ClassVar[int] = 21
 
+    def _serialize_into(self, buf: bytearray) -> None:
+        _write_string_into(buf, self.path)
+        _write_buffer_into(buf, self.data)
+        _write_acls(buf, self.acl)
+        buf.extend(int_struct.pack(self.flags))
+        buf.extend(long_struct.pack(self.ttl))
+
     def serialize(self) -> bytearray:
         b = bytearray()
-        b.extend(_write_string(self.path))
-        b.extend(_write_buffer(self.data))
-        _write_acls(b, self.acl)
-        b.extend(int_struct.pack(self.flags))
-        b.extend(long_struct.pack(self.ttl))
+        self._serialize_into(b)
         return b
 
     @classmethod
@@ -600,12 +652,15 @@ class Transaction:
 
     type: ClassVar[int] = 14
 
+    def _serialize_into(self, buf: bytearray) -> None:
+        for op in self.operations:
+            buf.extend(multiheader_struct.pack(op.type, False, -1))
+            op._serialize_into(buf)
+        buf.extend(multiheader_struct.pack(-1, True, -1))
+
     def serialize(self) -> bytearray:
         b = bytearray()
-        for op in self.operations:
-            b.extend(multiheader_struct.pack(op.type, False, -1))
-            b.extend(op.serialize())
-        b.extend(multiheader_struct.pack(-1, True, -1))
+        self._serialize_into(b)
         return b
 
     @classmethod
@@ -650,8 +705,7 @@ class Transaction:
                 raise MarshallingError(
                     f"Unknown transaction op_type: {op_type}"
                 )
-            if response is not None:
-                results.append(response)
+            results.append(response)
             op_type, done, _ = unpack_hdr(bytes, offset)
             offset += hdr_size
             if done not in (0, 1):
@@ -686,12 +740,15 @@ class Reconfig:
 
     type: ClassVar[int] = 16
 
+    def _serialize_into(self, buf: bytearray) -> None:
+        _write_string_into(buf, self.joining)
+        _write_string_into(buf, self.leaving)
+        _write_string_into(buf, self.new_members)
+        buf.extend(long_struct.pack(self.config_id))
+
     def serialize(self) -> bytearray:
         b = bytearray()
-        b.extend(_write_string(self.joining))
-        b.extend(_write_string(self.leaving))
-        b.extend(_write_string(self.new_members))
-        b.extend(long_struct.pack(self.config_id))
+        self._serialize_into(b)
         return b
 
     @classmethod
@@ -710,10 +767,13 @@ class RemoveWatches:
 
     type: ClassVar[int] = 18
 
+    def _serialize_into(self, buf: bytearray) -> None:
+        _write_string_into(buf, self.path)
+        buf.extend(int_struct.pack(self.watcher_type))
+
     def serialize(self) -> bytearray:
         b = bytearray()
-        b.extend(_write_string(self.path))
-        b.extend(int_struct.pack(self.watcher_type))
+        self._serialize_into(b)
         return b
 
     @classmethod
@@ -731,6 +791,11 @@ class Auth:
 
     type: ClassVar[int] = 100
 
+    def _serialize_into(self, buf: bytearray) -> None:
+        buf.extend(int_struct.pack(self.auth_type))
+        _write_string_into(buf, self.scheme)
+        _write_string_into(buf, self.auth)
+
     def serialize(self) -> bytes:
         return (
             int_struct.pack(self.auth_type)
@@ -745,9 +810,12 @@ class SASL:
 
     type: ClassVar[int] = 102
 
+    def _serialize_into(self, buf: bytearray) -> None:
+        _write_buffer_into(buf, self.challenge)
+
     def serialize(self) -> bytearray:
         b = bytearray()
-        b.extend(_write_buffer(self.challenge))
+        self._serialize_into(b)
         return b
 
     @classmethod
@@ -766,10 +834,13 @@ class AddWatch:
 
     type: ClassVar[int] = 106
 
+    def _serialize_into(self, buf: bytearray) -> None:
+        _write_string_into(buf, self.path)
+        buf.extend(int_struct.pack(self.mode))
+
     def serialize(self) -> bytearray:
         b = bytearray()
-        b.extend(_write_string(self.path))
-        b.extend(int_struct.pack(self.mode))
+        self._serialize_into(b)
         return b
 
     @classmethod
@@ -777,6 +848,7 @@ class AddWatch:
         cls, bytes: bytes | memoryview, offset: int
     ) -> tuple[None, int]:
         # The server replies with an ErrorResponse: a single int (always 0).
+        int_struct.unpack_from(bytes, offset)
         return None, offset + int_struct.size
 
 
@@ -839,7 +911,7 @@ class PingResponse:
     def deserialize(
         cls, buffer: bytes | memoryview, offset: int
     ) -> tuple[PingResponse, int]:
-        """Direct/test helper; bypassed by FrameDecoder._decode_packet()."""
+        """Deserialize a PingResponse packet from ``buffer`` at ``offset``."""
         _, zxid, err = reply_header_struct.unpack_from(buffer, offset)
         return cls(zxid=zxid, err=err), offset + reply_header_struct.size
 
@@ -855,7 +927,7 @@ class AuthResponse:
     def deserialize(
         cls, buffer: bytes | memoryview, offset: int
     ) -> tuple[AuthResponse, int]:
-        """Direct/test helper; bypassed by FrameDecoder._decode_packet()."""
+        """Deserialize an AuthResponse packet from ``buffer`` at ``offset``."""
         _, zxid, err = reply_header_struct.unpack_from(buffer, offset)
         return cls(zxid=zxid, err=err), offset + reply_header_struct.size
 
@@ -873,7 +945,7 @@ class WatchPacket:
     def deserialize(
         cls, buffer: bytes | memoryview, offset: int
     ) -> tuple[WatchPacket, int]:
-        """Direct/test helper; bypassed by FrameDecoder._decode_packet()."""
+        """Deserialize a WatchPacket from ``buffer`` at ``offset``."""
         _, zxid, _, watch_type, state = watch_header_struct.unpack_from(
             buffer, offset
         )
@@ -1062,6 +1134,12 @@ class FrameDecoder:
                 raise ConnectionDropped(f"Invalid frame length: {n}")
             self._frame_len = n
         if n > self._max_payload:
+            if avail >= 8:
+                xid = int_struct.unpack_from(self._buf, self._head + 4)[0]
+                if xid <= 0:
+                    raise ConnectionDropped(
+                        f"Oversize frame length {n} for non-request xid {xid}"
+                    )
             return avail >= 20
         return avail >= 4 + n
 
@@ -1118,11 +1196,16 @@ class FrameDecoder:
                     raise BufferError("pop frames before requesting a buffer")
                 raise ConnectionDropped(f"Invalid frame length: {msg_len}")
             if msg_len > self._max_payload:
-                if s > head and avail >= 8:
+                if avail >= 8:
                     xid = int_struct.unpack_from(self._buf, s + 4)[0]
                     if xid <= 0:
-                        raise BufferError(
-                            "pop frames before requesting a buffer"
+                        if s > head:
+                            raise BufferError(
+                                "pop frames before requesting a buffer"
+                            )
+                        raise ConnectionDropped(
+                            f"Oversize frame length {msg_len} for "
+                            f"non-request xid {xid}"
                         )
                 if avail >= 20:
                     raise BufferError("pop frames before requesting a buffer")
@@ -1437,12 +1520,20 @@ class FrameDecoder:
     ) -> None:
         """Append a 4-byte length-prefixed wire frame into ``buf``."""
         start = len(buf)
-        buf.extend(b"\x00\x00\x00\x00")
-        if xid is not None:
-            buf.extend(int_struct.pack(xid))
-        if request.type is not None:
-            buf.extend(int_struct.pack(request.type))
-        buf.extend(request.serialize())
+        req_type = request.type
+        if xid is not None and req_type is not None:
+            buf.extend(_frame_xid_type_struct.pack(0, xid, req_type))
+        else:
+            buf.extend(b"\x00\x00\x00\x00")
+            if xid is not None:
+                buf.extend(int_struct.pack(xid))
+            if req_type is not None:
+                buf.extend(int_struct.pack(req_type))
+        serialize_into = getattr(request, "_serialize_into", None)
+        if serialize_into is not None:
+            serialize_into(buf)
+        else:
+            buf.extend(request.serialize())
         int_struct.pack_into(buf, start, len(buf) - start - 4)
 
     @staticmethod
