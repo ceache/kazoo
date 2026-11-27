@@ -1539,8 +1539,20 @@ class TestConnectionIOLoopDecomposition:
                 assert fd_a in sel.get_map()
                 assert len(sel.get_map()) == 2
 
-                # CloseSocket unregisters _socket, keeping the selector open
-                conn.execute_effect(CloseSocket(reason="drop"))
+                # Off-routine CloseSocket while loop is active defers to wake
+                from kazoo.protocol.connection import _ACTIVE_CONNECTION_LOOP
+
+                conn.execute_effect(CloseSocket(reason="off-routine"))
+                assert conn._socket is s_a
+                assert s_a.fileno() == fd_a
+                conn._drain_wakeup()
+
+                # On-routine CloseSocket unregisters _socket, keeping sel open
+                token = _ACTIVE_CONNECTION_LOOP.set(conn)
+                try:
+                    conn.execute_effect(CloseSocket(reason="drop"))
+                finally:
+                    _ACTIVE_CONNECTION_LOOP.reset(token)
                 assert conn._selector is sel
                 assert conn._socket is None
                 assert s_a.fileno() == -1
@@ -2616,3 +2628,264 @@ class TestWakeupOutsideSelect:
 
             assert isinstance(client.state_machine, Connected)
             assert client.state_machine.ping_outstanding is False
+
+    def test_sasl_drop_and_timeout_clears_pending_before_reconnect(
+        self,
+    ) -> None:
+        """[C-2] Mid-SASL drop clears pending so reconnect keeps XIDs valid."""
+        from kazoo.protocol.connection import _ACTIVE_CONNECTION_LOOP
+        from kazoo.protocol.sasl import SASLConfig
+        from kazoo.protocol.serialization import (
+            Connect,
+            SASLResponse,
+            _write_buffer,
+        )
+        from kazoo.protocol.statemachine import (
+            ConnectAttemptStarted,
+            ConnectionLostEvent,
+            SocketConnected,
+            StartRequested,
+        )
+
+        class FakeSASLExchange:
+            def __init__(self, config: Any, host: str) -> None:
+                self.step = 0
+                self.is_complete = False
+
+            def next_token(self, challenge: bytes | None) -> bytes | None:
+                self.step += 1
+                if self.step == 1:
+                    return b"tok1"
+                if self.step == 2:
+                    return b"tok2"
+                self.is_complete = True
+                return None
+
+            def dispose(self) -> None:
+                pass
+
+        def make_sasl_wire(xid: int, zxid: int, challenge: bytes) -> bytes:
+            body = reply_header_struct.pack(xid, zxid, 0) + _write_buffer(
+                challenge
+            )
+            return int_struct.pack(len(body)) + body
+
+        client = KazooClient(
+            hosts="127.0.0.1:2181",
+            sasl_options={
+                "mechanism": "DIGEST-MD5",
+                "username": "u",
+                "password": "p",
+            },
+        )
+        conn = client._connection
+        conn.sasl_config = SASLConfig(
+            mechanism="DIGEST-MD5", username="u", password="p"
+        )
+
+        with patch("kazoo.protocol.connection.SASLExchange", FakeSASLExchange):
+            token = _ACTIVE_CONNECTION_LOOP.set(conn)
+            try:
+                # Attempt 1: send Connect -> receive Connect -> SASL step 1
+                # -> SASL step 2 -> socket drops mid-SASL (xid=2 pending).
+                conn._emit_event(StartRequested())
+                conn._socket = Mock()
+                conn._socket.send.side_effect = lambda v: len(v)
+                conn._requests.reset_xid(0)
+                conn._emit_event(
+                    ConnectAttemptStarted(host="127.0.0.1", port=2181)
+                )
+                conn._emit_event(
+                    SocketConnected(
+                        host="127.0.0.1",
+                        port=2181,
+                        num_hosts=1,
+                        session_id=0,
+                        session_passwd=b"\x00" * 16,
+                        session_timeout=10000,
+                        last_zxid=0,
+                        read_only=False,
+                        has_sasl=True,
+                        auth_data=(),
+                    )
+                )
+                conn._process_packet(Connect(0, 0, 10000, 1, b"p" * 16, False))
+                assert len(conn._requests.pending) == 1
+                assert conn._requests.pending[0][2] == 1
+
+                # Advance to SASL step 2 (xid=2 pending), then drop socket.
+                conn._frame_decoder._feed(make_sasl_wire(1, 1, b"ch1"))
+                conn._read_socket()
+                assert len(conn._requests.pending) == 1
+                assert conn._requests.pending[0][2] == 2
+
+                conn._emit_event(ConnectionLostEvent(reason="mid-sasl drop"))
+                assert len(conn._requests.pending) == 0
+
+                # Attempt 2: reconnect, complete full 2-step SASL + GetData.
+                conn._socket = Mock()
+                conn._socket.send.side_effect = lambda v: len(v)
+                conn._requests.reset_xid(0)
+                conn._emit_event(
+                    ConnectAttemptStarted(host="127.0.0.1", port=2181)
+                )
+                conn._emit_event(
+                    SocketConnected(
+                        host="127.0.0.1",
+                        port=2181,
+                        num_hosts=1,
+                        session_id=0,
+                        session_passwd=b"\x00" * 16,
+                        session_timeout=10000,
+                        last_zxid=0,
+                        read_only=False,
+                        has_sasl=True,
+                        auth_data=(),
+                    )
+                )
+                conn._process_packet(Connect(0, 0, 10000, 2, b"q" * 16, False))
+                conn._frame_decoder._feed(make_sasl_wire(1, 2, b"ch1"))
+                pkt1 = conn._frame_decoder.pop_packet()
+                assert isinstance(pkt1, SASLResponse)
+                conn._process_packet(pkt1)
+
+                conn._frame_decoder._feed(make_sasl_wire(2, 3, b"ch2"))
+                pkt2 = conn._frame_decoder.pop_packet()
+                assert isinstance(pkt2, SASLResponse)
+                conn._process_packet(pkt2)
+
+                assert isinstance(client.state_machine, Connected)
+                assert len(conn._requests.pending) == 0
+
+                # First post-connect user request (xid=3) succeeds cleanly.
+                res = client.handler.async_result()
+                conn._requests.enqueue(GetData("/ok", None), res)
+                conn._send_request(10.0)
+                assert conn._requests.pending[0][2] == 3
+                conn._frame_decoder._feed(
+                    TestConnectionRecvIntoAndBurstScheduling._make_getdata_wire(
+                        3, b"hello"
+                    )
+                )
+                conn._read_socket()
+                assert res.get_nowait()[0] == b"hello"
+            finally:
+                _ACTIVE_CONNECTION_LOOP.reset(token)
+
+    def test_cross_routine_stop_threading_and_gevent_write_selector(
+        self,
+    ) -> None:
+        """[C-3] Cross-routine client.stop() does not close active selector."""
+        import socket
+
+        from kazoo.protocol.statemachine import Handshaking
+
+        # 1. Threading handler: real zk_loop parked in Handshaking select()
+        # while main thread calls client.stop().
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        accepted: list[socket.socket] = []
+
+        def accept_one() -> None:
+            try:
+                c, _ = srv.accept()
+                accepted.append(c)
+            except OSError:
+                pass
+
+        accepter = threading.Thread(target=accept_one, daemon=True)
+        accepter.start()
+
+        client = KazooClient(hosts=f"127.0.0.1:{port}", timeout=5.0)
+        try:
+            client.start_async()
+            accepter.join(timeout=2.0)
+            assert len(accepted) == 1
+            deadline = time.monotonic() + 2.0
+            while (
+                not isinstance(client.state_machine, Handshaking)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            assert isinstance(client.state_machine, Handshaking)
+
+            client.stop()
+            assert client._connection.connection_stopped.is_set() is True
+            assert isinstance(client.state_machine, Inactive)
+        finally:
+            client.stop()
+            for s in accepted:
+                s.close()
+            srv.close()
+            client.close()
+
+        # 2. Gevent handler: zk_loop parked in _write_selector.select() while
+        # another greenlet calls client.stop() during Handshaking.
+        gevent = pytest.importorskip("gevent")
+        from kazoo.handlers.gevent import SequentialGeventHandler
+
+        gclient = KazooClient(
+            hosts="127.0.0.1:2181", handler=SequentialGeventHandler()
+        )
+        gconn = gclient._connection
+        try:
+            gconn.connection_closed.clear()
+            gconn._read_sock, gconn._write_sock = (
+                gclient.handler.create_socket_pair()
+            )
+            gconn._read_sock.setblocking(False)
+            gconn._write_sock.setblocking(False)
+            gconn._selector = gclient.handler.create_selector()
+            gconn.connection_stopped.clear()
+            gclient._state_machine.state = Handshaking(
+                host="127.0.0.1", port=2181
+            )
+
+            s_a, s_b = gclient.handler.create_socket_pair()
+            s_a.setblocking(False)
+            s_b.setblocking(False)
+            try:
+                gconn._socket = s_a
+                wsel = gclient.handler.create_selector()
+                wsel.register(s_a, selectors.EVENT_READ)
+                gconn._write_selector = wsel
+
+                entered = gevent.event.Event()
+                loop_errors: list[BaseException] = []
+
+                def fake_loop_wait() -> None:
+                    from kazoo.protocol.connection import (
+                        _ACTIVE_CONNECTION_LOOP,
+                    )
+
+                    tok = _ACTIVE_CONNECTION_LOOP.set(gconn)
+                    try:
+                        entered.set()
+                        wsel.select(0.1)
+                    except BaseException as exc:
+                        loop_errors.append(exc)
+                    finally:
+                        gconn._close_socket()
+                        _ACTIVE_CONNECTION_LOOP.reset(tok)
+                        gconn.connection_stopped.set()
+
+                g = gevent.spawn(fake_loop_wait)
+                entered.wait(timeout=1.0)
+                gevent.sleep(0.01)
+
+                # Another greenlet triggers CloseRequested -> must NOT close
+                # wsel directly while fake_loop_wait is inside wsel.select().
+                gclient.stop()
+                g.join(timeout=2.0)
+                assert loop_errors == []
+                assert gconn._write_selector is None
+            finally:
+                s_a.close()
+                s_b.close()
+        finally:
+            gconn.connection_stopped.set()
+            gconn._connection_routine = None
+            gconn.close()

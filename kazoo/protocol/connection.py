@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import random
 import selectors
@@ -22,6 +23,7 @@ from typing import (
 from kazoo.exceptions import (
     AuthFailedError,
     ConnectionDropped,
+    ConnectionLoss,
     InvalidStateTransitionError,
     SASLException,
     SessionClosedRequireSaslError,
@@ -132,6 +134,12 @@ _PingInstance = Ping()
 _PING_FRAME = FrameDecoder.encode_request(_PingInstance, ReservedXID.PING)
 # Cap per-write coalesced outbound frame batch size at 64 KiB
 _SEND_BATCH_MAX = 64 * 1024
+
+# Tracks which ConnectionHandler owns the currently executing zk_loop routine
+# (works across OS threads, Gevent greenlets, and Eventlet greenthreads).
+_ACTIVE_CONNECTION_LOOP: contextvars.ContextVar[ConnectionHandler | None] = (
+    contextvars.ContextVar("_ACTIVE_CONNECTION_LOOP", default=None)
+)
 
 
 class RWPinger:
@@ -358,6 +366,13 @@ class ConnectionHandler:
                 pass
             self._selector = None
 
+    def _is_on_loop_routine(self) -> bool:
+        """Return True if safe to mutate socket, selector, and decoder."""
+        return (
+            self.connection_stopped.is_set()
+            or _ACTIVE_CONNECTION_LOOP.get() is self
+        )
+
     def _close_socket(self) -> None:
         """Unregister and close the active transport socket."""
         self._close_write_selector()
@@ -374,6 +389,7 @@ class ConnectionHandler:
         self._heartbeat_deadline = None
         self._heartbeat_cache_key = None
         self._frame_decoder.reset()
+        self._requests.fail_in_flight(ConnectionLoss())
 
     def _update_io_interest(
         self, interest_mask: int, target: Literal["zk_socket", "wakeup"]
@@ -484,7 +500,10 @@ class ConnectionHandler:
                 self.wake()
 
             case CloseSocket():
-                self._close_socket()
+                if self._is_on_loop_routine():
+                    self._close_socket()
+                else:
+                    self.wake()
 
             case SessionEstablished():
                 self._phase_deadline = None
@@ -494,9 +513,12 @@ class ConnectionHandler:
                     self.wake()
 
             case ResetSessionData():
-                self._frame_decoder.reset()
-                if self._current_retry is not None:
-                    self._current_retry.reset()
+                if self._is_on_loop_routine():
+                    self._frame_decoder.reset()
+                    if self._current_retry is not None:
+                        self._current_retry.reset()
+                else:
+                    self.wake()
 
             case StopConnectionLoop():
                 self.wake()
@@ -941,6 +963,7 @@ class ConnectionHandler:
         self.logger.log(BLATHER, "ZK loop started")
 
         self.connection_stopped.clear()
+        loop_token = _ACTIVE_CONNECTION_LOOP.set(self)
 
         retry = self.retry_sleeper.copy()
         try:
@@ -963,6 +986,7 @@ class ConnectionHandler:
                 # StopConnectionLoop wrote a wake byte; nothing selects after
                 # this routine returns.
                 self._release_wakeup()
+                _ACTIVE_CONNECTION_LOOP.reset(loop_token)
                 self.connection_stopped.set()
                 self.logger.log(BLATHER, "Connection stopped")
 
