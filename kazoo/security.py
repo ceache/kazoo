@@ -31,7 +31,7 @@ _ATOMIC_PERMISSIONS = (
 )
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(frozen=True, slots=True, order=True)
 class Id:
     """Represents a Zookeeper ID and ACL object"""
 
@@ -64,7 +64,7 @@ class Id:
         return True
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(frozen=True, slots=True, order=True)
 class ACL:
     """An ACL for a Zookeeper Node
 
@@ -78,6 +78,10 @@ class ACL:
     id: Id
 
     def __post_init__(self) -> None:
+        if self.perms < 0:
+            raise ValueError(
+                f"ACL permissions must be non-negative, got {self.perms!r}"
+            )
         if not isinstance(self.perms, Permissions):
             object.__setattr__(self, "perms", Permissions(self.perms))
 

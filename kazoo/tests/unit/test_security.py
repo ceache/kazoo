@@ -173,3 +173,34 @@ class TestACL:
             assert (True if ident else False) is True
             assert (True if acl else False) is True
             assert (True if acl_none else False) is True
+
+    def test_ordering_and_negative_perms_rejected(self) -> None:
+        import pytest
+
+        from kazoo.security import Id
+
+        id_a = Id("digest", "alice")
+        id_b = Id("world", "anyone")
+        assert sorted([id_b, id_a]) == [id_a, id_b]
+
+        acl_low = ACL(Permissions.READ, id_b)
+        acl_high = ACL(Permissions.WRITE, id_a)
+        assert sorted([acl_high, acl_low]) == [acl_low, acl_high]
+
+        with pytest.raises(ValueError, match="non-negative"):
+            ACL(-1, id_b)
+
+        # Positive unknown bits continue to round-trip via IntFlag.
+        assert int(ACL(64, id_b).perms) == 64
+
+    def test_invalid_state_transition_error_pickle_roundtrip(self) -> None:
+        import pickle
+
+        from kazoo.exceptions import InvalidStateTransitionError
+
+        err = InvalidStateTransitionError("Connected", "UnexpectedEvent")
+        restored = pickle.loads(pickle.dumps(err))
+        assert isinstance(restored, InvalidStateTransitionError)
+        assert restored.state == "Connected"
+        assert restored.event == "UnexpectedEvent"
+        assert str(restored) == str(err)

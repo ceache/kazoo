@@ -73,6 +73,11 @@ class InvalidStateTransitionError(KazooException):
             f"in state {type(state).__name__}"
         )
 
+    def __reduce__(
+        self,
+    ) -> tuple[type[InvalidStateTransitionError], tuple[object, object]]:
+        return (type(self), (self.state, self.event))
+
 
 def _invalid_error_code() -> type[ZookeeperError]:
     raise RuntimeError("Invalid error code")
