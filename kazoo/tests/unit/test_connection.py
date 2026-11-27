@@ -864,7 +864,7 @@ class TestRWServerSelection:
         )
 
     def test_rw_pinger_last_attempt_setter_invalidates_backoff_until(
-        self,
+        self, patch_connection_random: Callable[[int], Mock]
     ) -> None:
         """[C-11] Mutating RWPinger.last_attempt clears cached backoff."""
         ro_sock = Mock()
@@ -885,10 +885,8 @@ class TestRWServerSelection:
             [("ro1.example", "10.0.0.1", 2181)], fake_connect, no_error
         )
         it = iter(pinger)
-        with (
-            patch("time.monotonic", return_value=100.0),
-            patch("random.randint", return_value=0),
-        ):
+        patch_connection_random(0)
+        with patch("time.monotonic", return_value=100.0):
             assert next(it) is False
             assert len(dialed) == 1
             # Enter backoff window, caching _backoff_until = 100.5.
