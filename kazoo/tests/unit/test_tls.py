@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ssl
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -177,3 +178,49 @@ class TestBuildSSLContext:
             mock_wrap.assert_called_once()
             mock_wrap.call_args.args[0].close()
             wrapped.connect.assert_called_once_with(("127.0.0.1", 2181))
+
+    def test_client_ssl_context_reloads_when_cert_or_ca_rotates(
+        self, tmp_path: Path
+    ) -> None:
+        """[M-2] Rewriting or replacing TLS files invalidates the cache."""
+        import os
+
+        ca_file = tmp_path / "ca.pem"
+        ca_file.write_text("v1")
+        client = KazooClient(
+            hosts="127.0.0.1:2181",
+            use_ssl=True,
+            ca=str(ca_file),
+            verify_certs=True,
+            check_hostname=False,
+        )
+        built: list[ssl.SSLContext] = []
+
+        def fake_build(cfg: TLSConfig) -> ssl.SSLContext:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            built.append(ctx)
+            return ctx
+
+        with patch("kazoo.client.build_ssl_context", side_effect=fake_build):
+            ctx1 = client._get_ssl_context()
+            ctx2 = client._get_ssl_context()
+            assert ctx1 is ctx2
+            assert len(built) == 1
+
+            # Rewrite in place and advance mtime_ns deterministically.
+            ca_file.write_text("v2")
+            st = os.stat(ca_file)
+            os.utime(ca_file, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+            ctx3 = client._get_ssl_context()
+            assert ctx3 is not ctx1
+            assert len(built) == 2
+
+            # Atomic rename rotation (new inode) also invalidates cache.
+            tmp_ca = tmp_path / "ca.pem.new"
+            tmp_ca.write_text("v3")
+            os.replace(tmp_ca, ca_file)
+            ctx4 = client._get_ssl_context()
+            assert ctx4 is not ctx3
+            assert len(built) == 3

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import re
 import ssl
 import warnings
@@ -398,7 +399,12 @@ class KazooClient:
         self.keyfile = keyfile
         self.keyfile_password = keyfile_password
         self.ca = ca
-        self._ssl_context_cache: tuple[TLSConfig, ssl.SSLContext] | None = None
+        self._ssl_context_cache: (
+            tuple[
+                TLSConfig, tuple[tuple[int, int] | None, ...], ssl.SSLContext
+            ]
+            | None
+        ) = None
         # Validate TLS configuration eagerly on construction.
         _ = self.tls_config
         if concurrent_request_limit is not None and (
@@ -679,16 +685,38 @@ class KazooClient:
             check_hostname=self.check_hostname,
         )
 
+    @staticmethod
+    def _tls_file_stamps(
+        cfg: TLSConfig,
+    ) -> tuple[tuple[int, int] | None, ...]:
+        """Return ``(st_mtime_ns, st_ino)`` stamps for configured TLS files."""
+        stamps: list[tuple[int, int] | None] = []
+        for path in (cfg.ca, cfg.certfile, cfg.keyfile):
+            if not path:
+                stamps.append(None)
+                continue
+            try:
+                st = os.stat(path)
+                stamps.append((st.st_mtime_ns, st.st_ino))
+            except OSError:
+                stamps.append(None)
+        return tuple(stamps)
+
     def _get_ssl_context(self) -> ssl.SSLContext | None:
-        """Return a cached :class:`ssl.SSLContext` for current TLS settings."""
+        """Return a cached :class:`ssl.SSLContext` for current TLS settings.
+
+        Automatically rebuilds the context if any TLS attribute changes or if
+        the ``ca``, ``certfile``, or ``keyfile`` on disk is modified/rotated.
+        """
         if not self.use_ssl:
             return None
         cfg = self.tls_config
+        stamps = self._tls_file_stamps(cfg)
         cached = self._ssl_context_cache
-        if cached is not None and cached[0] == cfg:
-            return cached[1]
+        if cached is not None and cached[0] == cfg and cached[1] == stamps:
+            return cached[2]
         ctx = build_ssl_context(cfg)
-        self._ssl_context_cache = (cfg, ctx)
+        self._ssl_context_cache = (cfg, stamps, ctx)
         return ctx
 
     @property

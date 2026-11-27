@@ -221,7 +221,12 @@ class IHandler(Protocol):
     # FIXME This should have a proper set of parameters.
     def create_connection(self, *args: Any, **kwargs: Any) -> Socket:
         """A socket method that implements Python's socket.create_connection
-        API"""
+        API.
+
+        When ``use_ssl=True``, Kazoo passes a pre-built ``ssl_context``
+        keyword argument (:class:`ssl.SSLContext`) alongside the legacy TLS
+        keyword arguments so custom handlers can reuse the cached context.
+        """
 
     def create_socket_pair(self) -> tuple[Socket, Socket]:
         """A socket method that implements Python's socket.socketpair API"""
