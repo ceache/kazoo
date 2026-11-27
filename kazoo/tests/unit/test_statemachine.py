@@ -728,7 +728,6 @@ class TestPureTransitionMatrix:
         )
         assert next_state == ExpiredSession(session_id=42)
         assert effects == (
-            CloseSocket(reason="Session has expired"),
             LogStateTransition(
                 logging.INFO,
                 "Zookeeper session closed, state: %s",
@@ -737,6 +736,7 @@ class TestPureTransitionMatrix:
             EmitKazooStateChange(KazooState.LOST),
             FailPendingRequests(KeeperState.EXPIRED_SESSION),
             ResetSessionData(),
+            CloseSocket(reason="Session has expired"),
         )
 
     def test_connecting_to_auth_failed_preserves_cause(self) -> None:
@@ -1818,19 +1818,19 @@ _EFF_CONNECT_OK = (
     ConfigureReadOnlyMode,
 ) + _EFF_FINALIZE
 _EFF_EXPIRED = (
-    CloseSocket,
     LogStateTransition,
     EmitKazooStateChange,
     FailPendingRequests,
     ResetSessionData,
+    CloseSocket,
 )
 _EFF_AUTH_FAILED = (
-    CloseSocket,
     LogStateTransition,
     ResolveConnectResult,
     EmitKazooStateChange,
     FailPendingRequests,
     ResetSessionData,
+    CloseSocket,
     StopConnectionLoop,
 )
 _EFF_CLOSED = (
@@ -2353,3 +2353,53 @@ class TestWatcherManager:
         remaining = mgr.reset()
         assert remaining == [w_prec]
         assert len(mgr.persistent_recursive_watchers) == 0
+
+
+def test_driver_post_dispatch_runs_outside_lock_and_is_terminal_state() -> (
+    None
+):
+    """[M-4][C-5] post_dispatch runs after _dispatch_lock is released."""
+    import threading
+
+    from kazoo.protocol.statemachine import is_terminal_state
+
+    lock = threading.RLock()
+    lock_held_in_effect: list[bool] = []
+    lock_held_in_post: list[bool] = []
+
+    def check_held_from_other_thread() -> bool:
+        acquired: list[bool] = []
+
+        def probe() -> None:
+            got = lock.acquire(blocking=False)
+            acquired.append(got)
+            if got:
+                lock.release()
+
+        t = threading.Thread(target=probe)
+        t.start()
+        t.join()
+        return not acquired[0]
+
+    def executor(_effect: SideEffect) -> None:
+        lock_held_in_effect.append(check_held_from_other_thread())
+
+    def post_dispatch() -> None:
+        lock_held_in_post.append(check_held_from_other_thread())
+
+    driver = StateMachineDriver(
+        executor,
+        lock=lock,
+        initial_state=Connecting(),
+        post_dispatch=post_dispatch,
+    )
+    driver.send_event(CloseRequested())
+    assert len(lock_held_in_effect) > 0
+    assert all(lock_held_in_effect)
+    assert lock_held_in_post == [False]
+
+    assert is_terminal_state(Inactive()) is True
+    assert is_terminal_state(AuthFailed()) is True
+    assert is_terminal_state(Connected(is_connecting_allowed=False)) is True
+    assert is_terminal_state(Connected(is_connecting_allowed=True)) is False
+    assert is_terminal_state(Connecting()) is False

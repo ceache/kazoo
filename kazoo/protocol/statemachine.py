@@ -903,10 +903,7 @@ def transition(
                 ),
             )
 
-        case (
-            AuthFailed() | Handshaking(is_connecting_allowed=False),
-            ConnectResponseReceived(),
-        ):
+        case (AuthFailed(), ConnectResponseReceived()):
             return state, _NO_EFFECTS
 
         case (
@@ -1102,7 +1099,6 @@ def transition(
         case (_, AuthFailedEvent(error=error)):
             auth_exc = _build_auth_exception(error)
             auth_failed_effects: tuple[SideEffect, ...] = (
-                CloseSocket("Authentication failed"),
                 LogStateTransition(
                     logging.INFO,
                     "Zookeeper session closed, state: %s",
@@ -1112,6 +1108,7 @@ def transition(
                 EmitKazooStateChange(KazooState.LOST),
                 FailPendingRequests(KeeperState.AUTH_FAILED),
                 ResetSessionData(),
+                CloseSocket("Authentication failed"),
                 StopConnectionLoop(),
             )
             return AuthFailed(error=error), auth_failed_effects
@@ -1121,7 +1118,6 @@ def transition(
 
         case (_, SessionExpiredEvent(session_id=session_id)):
             session_expired_effects: tuple[SideEffect, ...] = (
-                CloseSocket("Session has expired"),
                 LogStateTransition(
                     logging.INFO,
                     "Zookeeper session closed, state: %s",
@@ -1130,6 +1126,7 @@ def transition(
                 EmitKazooStateChange(KazooState.LOST),
                 FailPendingRequests(KeeperState.EXPIRED_SESSION),
                 ResetSessionData(),
+                CloseSocket("Session has expired"),
             )
             return (
                 ExpiredSession(
@@ -1288,12 +1285,18 @@ def transition(
 # =====================================================================
 
 
+def is_terminal_state(state: ClientState) -> bool:
+    """Return True if ``state`` is terminal or forbids reconnection."""
+    return state.is_terminal or not state.is_connecting_allowed
+
+
 class StateMachineDriver:
     """Serialized event driver for ClientState."""
 
     __slots__ = (
         "state",
         "_effect_executor",
+        "_post_dispatch",
         "_event_queue",
         "_dispatch_lock",
         "_processing_events",
@@ -1305,9 +1308,11 @@ class StateMachineDriver:
         *,
         lock: AbstractContextManager[Any] | None = None,
         initial_state: ClientState | None = None,
+        post_dispatch: Callable[[], None] | None = None,
     ) -> None:
         self.state: ClientState = initial_state or Inactive()
         self._effect_executor = effect_executor
+        self._post_dispatch = post_dispatch
         self._event_queue: deque[ClientEvent] = deque()
         self._dispatch_lock: AbstractContextManager[Any] = (
             lock if lock is not None else nullcontext()
@@ -1325,26 +1330,38 @@ class StateMachineDriver:
         onto ``_event_queue``. If an effect raises, the remaining effects of
         that transition and any same-thread re-entrant events are discarded;
         the caller is expected to drop the connection.
+
+        If ``post_dispatch`` was supplied, it is invoked *after* releasing
+        ``_dispatch_lock`` when the outermost dispatch finishes (for example to
+        deliver user state listeners without holding the driver lock).
         """
-        with self._dispatch_lock:
-            if self._processing_events:
-                self._event_queue.append(event)
-                return
-            self._processing_events = True
+        is_outermost = False
+        try:
+            with self._dispatch_lock:
+                if self._processing_events:
+                    self._event_queue.append(event)
+                    return
+                self._processing_events = True
+                is_outermost = True
 
-            current_event: ClientEvent | None = event
-            try:
-                while current_event is not None:
-                    next_state, effects = transition(self.state, current_event)
-                    self.state = next_state
-                    for effect in effects:
-                        self._effect_executor(effect)
+                current_event: ClientEvent | None = event
+                try:
+                    while current_event is not None:
+                        next_state, effects = transition(
+                            self.state, current_event
+                        )
+                        self.state = next_state
+                        for effect in effects:
+                            self._effect_executor(effect)
 
-                    if self._event_queue:
-                        current_event = self._event_queue.popleft()
-                    else:
-                        current_event = None
-            finally:
-                if current_event is not None:
-                    self._event_queue.clear()
-                self._processing_events = False
+                        if self._event_queue:
+                            current_event = self._event_queue.popleft()
+                        else:
+                            current_event = None
+                finally:
+                    if current_event is not None:
+                        self._event_queue.clear()
+                    self._processing_events = False
+        finally:
+            if is_outermost and self._post_dispatch is not None:
+                self._post_dispatch()
