@@ -47,7 +47,6 @@ from kazoo.protocol.serialization import (
     ReplyHeader,
     ResponsePacket,
     WatchPacket,
-    _write_buffer,
     int_int_long_struct,
     int_struct,
     reply_header_struct,
@@ -74,6 +73,12 @@ from kazoo.protocol.statemachine import (
 )
 from kazoo.protocol.states import KeeperState
 from kazoo.retry import KazooRetry, RetryFailedError
+
+
+def _write_buffer(data: bytes | None) -> bytes:
+    if data is None:
+        return int_struct.pack(-1)
+    return int_struct.pack(len(data)) + data
 
 
 def _make_mock_client(**kwargs: Any) -> Mock:
@@ -316,7 +321,10 @@ class TestConnectionXidMismatch:
             mock_submit.assert_called_once_with(connect_packet, 5.0)
 
     def test_execute_effect_read_connect_response_packet(self) -> None:
+        from kazoo.protocol.statemachine import Handshaking
+
         client = _make_mock_client()
+        client._state_machine.state = Handshaking(host="127.0.0.1", port=2181)
         connection = ConnectionHandler(client, KazooRetry())
         body = bytearray()
         body.extend(int_int_long_struct.pack(0, 30000, 12345))
@@ -1121,9 +1129,8 @@ class TestConnectionIOLoopDecomposition:
         client = _make_mock_client()
         conn = ConnectionHandler(client, KazooRetry())
         conn._connect_timeout = 5.0
-        timeout, deadline = conn._compute_poll_timeout()
+        timeout = conn._compute_poll_timeout()
         assert timeout == 5.0
-        assert deadline is None
 
     def test_compute_poll_timeout_session_active(self) -> None:
         client = _make_mock_client()
@@ -1134,8 +1141,7 @@ class TestConnectionIOLoopDecomposition:
         conn._last_send = 100.0
 
         with patch("time.monotonic", return_value=102.0):
-            timeout, deadline = conn._compute_poll_timeout()
-            assert deadline is not None
+            timeout = conn._compute_poll_timeout()
             assert timeout > 0
 
     def test_dispatch_ready_events(self) -> None:
@@ -1145,13 +1151,13 @@ class TestConnectionIOLoopDecomposition:
         conn._emit_event = events.append  # type: ignore[method-assign]
 
         # 1. Empty ready set -> PollTimeoutExpired
-        conn._dispatch_ready_events(set(), None)
+        conn._dispatch_ready_events(set())
         assert len(events) == 1
         assert isinstance(events[0], PollTimeoutExpired)
 
         # 2. zk_socket in ready -> SocketReadable
         events.clear()
-        conn._dispatch_ready_events({"zk_socket"}, None)
+        conn._dispatch_ready_events({"zk_socket"})
         assert len(events) == 1
         assert isinstance(events[0], SocketReadable)
 
@@ -1161,8 +1167,7 @@ class TestConnectionIOLoopDecomposition:
         conn._read_sock = Mock()
         conn._read_sock.recv.side_effect = BlockingIOError
         conn._selector.get_key.return_value = Mock(events=1)
-        res = conn._dispatch_ready_events({"wakeup"}, None)
-        assert res is True
+        conn._dispatch_ready_events({"wakeup"})
         assert len(events) == 1
         assert isinstance(events[0], WakeUpSignaled)
 
@@ -1174,7 +1179,7 @@ class TestConnectionIOLoopDecomposition:
         conn._last_send = 95.0
         conn._last_recv = 95.0
         with patch("time.monotonic", return_value=105.0):
-            conn._dispatch_ready_events(set(), 100.0)
+            conn._dispatch_ready_events(set())
             assert any(isinstance(e, PollTimeoutExpired) for e in events)
             assert any(isinstance(e, HeartbeatDeadlineReached) for e in events)
 
@@ -1190,7 +1195,7 @@ class TestConnectionIOLoopDecomposition:
         conn._last_send = 105.0
         conn._last_recv = 105.0
         with patch("time.monotonic", return_value=105.0):
-            conn._dispatch_ready_events({"zk_socket"}, None)
+            conn._dispatch_ready_events({"zk_socket"})
         assert read_called is True
         assert len(events) == 0
 
@@ -1204,8 +1209,7 @@ class TestConnectionIOLoopDecomposition:
 
         conn._send_request = fake_send_request  # type: ignore[method-assign]
         with patch("time.monotonic", return_value=105.0):
-            res = conn._dispatch_ready_events({"wakeup"}, None)
-        assert res is True
+            conn._dispatch_ready_events({"wakeup"})
         assert send_called is True
         assert len(events) == 0
 
@@ -1656,7 +1660,9 @@ class TestConnectionIOLoopDecomposition:
                 conn._drain_wakeup()
 
                 # On-routine CloseSocket unregisters _socket, keeping sel open
-                token = _ACTIVE_CONNECTION_LOOP.set(conn)
+                token = _ACTIVE_CONNECTION_LOOP.set(
+                    (conn, threading.get_ident())
+                )
                 try:
                     conn.execute_effect(CloseSocket(reason="drop"))
                 finally:
@@ -1957,16 +1963,17 @@ class TestConnectionRecvIntoAndBurstScheduling:
         assert len(dec._buf) == 0
         assert dec._view is None
 
-        # First get_buffer allocates full capacity; close() frees it.
+        # First get_buffer allocates initial capacity; close() frees it.
         dec.get_buffer()
-        assert len(dec._buf) == dec._capacity
+        assert len(dec._buf) == dec._initial_capacity
+        assert dec._initial_capacity < dec._capacity
         client.close()
         assert len(dec._buf) == 0
         assert dec._view is None
 
         # Decoder reallocates cleanly on subsequent use (e.g., restart).
         dec.get_buffer()
-        assert len(dec._buf) == dec._capacity
+        assert len(dec._buf) == dec._initial_capacity
         client.close()
         assert len(dec._buf) == 0
 
@@ -2541,15 +2548,14 @@ class TestWakeupOutsideSelect:
         conn._connect_timeout = 5.0
         conn._phase_deadline = 100.0
         with patch("time.monotonic", return_value=98.0):
-            timeout, deadline = conn._compute_poll_timeout()
+            timeout = conn._compute_poll_timeout()
             assert timeout == pytest.approx(2.0)
-            assert deadline is None
 
         with (
             patch("time.monotonic", return_value=101.0),
             patch.object(conn, "_read_packet", return_value=None),
         ):
-            conn._dispatch_ready_events({"zk_socket"}, None)
+            conn._dispatch_ready_events({"zk_socket"})
         assert isinstance(client.state_machine, Connecting)
 
     def test_unknown_header_error_resolves_async_result_without_crashing(
@@ -2629,8 +2635,8 @@ class TestWakeupOutsideSelect:
         # _last_send, heartbeat ping must still be emitted.
         conn._requests.enqueue(GetData("/a", None), Mock())
         with patch("time.monotonic", return_value=106.0):
-            _, deadline = conn._compute_poll_timeout()
-            conn._dispatch_ready_events({"wakeup"}, deadline)
+            conn._compute_poll_timeout()
+            conn._dispatch_ready_events({"wakeup"})
         assert isinstance(client.state_machine, Connected)
         assert client.state_machine.ping_outstanding is True
 
@@ -2638,9 +2644,9 @@ class TestWakeupOutsideSelect:
         # ready, connection must raise timeout_exception.
         conn._requests.enqueue(GetData("/b", None), Mock())
         with patch("time.monotonic", return_value=111.0):
-            _, deadline = conn._compute_poll_timeout()
+            conn._compute_poll_timeout()
             with pytest.raises(client.handler.timeout_exception):
-                conn._dispatch_ready_events({"wakeup"}, deadline)
+                conn._dispatch_ready_events({"wakeup"})
 
     def test_auth_response_transient_vs_permanent_errors(self) -> None:
         """AuthResponse separates transient drops from permanent AuthFailed."""
@@ -2738,8 +2744,8 @@ class TestWakeupOutsideSelect:
         # Deterministic minimal jitter (0.01s) — worst case for the C-1 bug.
         patch_connection_random(1)
         with patch("time.monotonic", return_value=1003.33):
-            _, deadline = conn._compute_poll_timeout()
-            conn._dispatch_ready_events(set(), deadline)
+            conn._compute_poll_timeout()
+            conn._dispatch_ready_events(set())
 
         assert isinstance(client.state_machine, Connected)
         assert client.state_machine.ping_outstanding is True
@@ -2748,7 +2754,7 @@ class TestWakeupOutsideSelect:
         # Immediately after sending the ping, the next poll timeout must
         # be ~read_timeout/2 - jitter (~3.325s), NOT jitter (0.01s).
         with patch("time.monotonic", return_value=1003.33):
-            timeout, _ = conn._compute_poll_timeout()
+            timeout = conn._compute_poll_timeout()
             assert timeout == pytest.approx(6.67 / 2.0 - 0.01, abs=1e-3)
 
         # A Watch arriving while ping_outstanding=True advances _last_recv
@@ -2758,7 +2764,7 @@ class TestWakeupOutsideSelect:
             conn._process_packet(
                 WatchPacket(zxid=1, type=3, state=3, path="/w")
             )
-            timeout_after_watch, _ = conn._compute_poll_timeout()
+            timeout_after_watch = conn._compute_poll_timeout()
             assert timeout_after_watch == pytest.approx(
                 (1003.33 + 6.67 / 2.0 - 0.01) - 1003.83, abs=1e-3
             )
@@ -2774,7 +2780,7 @@ class TestWakeupOutsideSelect:
                     conn._process_packet(PingResponse(zxid=2, err=0)),
                 ),
             ):
-                conn._dispatch_ready_events({"zk_socket"}, deadline)
+                conn._dispatch_ready_events({"zk_socket"})
 
         assert isinstance(client.state_machine, Connected)
         assert client.state_machine.ping_outstanding is False
@@ -2788,7 +2794,6 @@ class TestWakeupOutsideSelect:
         from kazoo.protocol.serialization import (
             Connect,
             SASLResponse,
-            _write_buffer,
         )
         from kazoo.protocol.statemachine import (
             ConnectAttemptStarted,
@@ -2834,7 +2839,7 @@ class TestWakeupOutsideSelect:
         )
 
         with patch("kazoo.protocol.connection.SASLExchange", FakeSASLExchange):
-            token = _ACTIVE_CONNECTION_LOOP.set(conn)
+            token = _ACTIVE_CONNECTION_LOOP.set((conn, threading.get_ident()))
             try:
                 # Attempt 1: send Connect -> receive Connect -> SASL step 1
                 # -> SASL step 2 -> socket drops mid-SASL (xid=2 pending).
@@ -3009,7 +3014,9 @@ class TestWakeupOutsideSelect:
                         _ACTIVE_CONNECTION_LOOP,
                     )
 
-                    tok = _ACTIVE_CONNECTION_LOOP.set(gconn)
+                    tok = _ACTIVE_CONNECTION_LOOP.set(
+                        (gconn, threading.get_ident())
+                    )
                     try:
                         entered.set()
                         assert gconn._selector is not None
@@ -3238,3 +3245,195 @@ class TestWakeupOutsideSelect:
             (Mock(data="wakeup"), 1),
         ]
         assert conn._select(0.0) is conn_mod._READY_BOTH
+
+    def test_short_session_timeout_heartbeat_stays_positive(
+        self, patch_connection_random: Callable[[int], Mock]
+    ) -> None:
+        """[H-1] Short session_timeout (<=1.2s) never yields 0.0 ping wait."""
+        patch_connection_random(40)  # max raw jitter 0.40s
+        for session_timeout in (1.0, 0.3):
+            client = KazooClient(
+                hosts="127.0.0.1:2181", timeout=session_timeout
+            )
+            conn = client._connection
+            read_timeout = session_timeout * 2.0 / 3.0
+            conn._read_timeout = read_timeout
+            conn._last_send = 100.0
+            conn._last_recv = 100.0
+            client._state_machine.state = Connected(
+                host="127.0.0.1",
+                port=2181,
+                ping_outstanding=True,
+                read_timeout=read_timeout,
+            )
+            with patch("time.monotonic", return_value=100.0):
+                timeout = conn._compute_poll_timeout()
+            assert timeout == pytest.approx(read_timeout / 4.0, rel=1e-3)
+            assert timeout > 0.0
+
+    def test_in_flight_requests_get_terminal_exception(self) -> None:
+        """[M-1] In-flight pending/auth match queued terminal errors."""
+        from kazoo.exceptions import AuthFailedError, SessionExpiredError
+        from kazoo.protocol.connection import _ACTIVE_CONNECTION_LOOP
+        from kazoo.protocol.statemachine import SessionExpiredEvent
+
+        for event, expected_exc in (
+            (SessionExpiredEvent(session_id=1), SessionExpiredError),
+            (AuthFailedEvent(error=AuthFailedError("bad")), AuthFailedError),
+        ):
+            client = KazooClient(hosts="127.0.0.1:2181")
+            conn = client._connection
+            conn.connection_stopped.clear()
+            client._state_machine.state = Connected(
+                host="127.0.0.1", port=2181, session_id=1
+            )
+            a_pending = client.handler.async_result()
+            a_auth = client.handler.async_result()
+            a_queued = client.handler.async_result()
+            conn._requests.pending.append((GetData("/a", None), a_pending, 1))
+            conn._requests.auth_pending.append(a_auth)
+            conn._requests.enqueue(GetData("/b", None), a_queued)
+
+            tok = _ACTIVE_CONNECTION_LOOP.set((conn, threading.get_ident()))
+            try:
+                client.send_event(event)
+            finally:
+                _ACTIVE_CONNECTION_LOOP.reset(tok)
+                conn.connection_stopped.set()
+
+            assert isinstance(a_pending.exception, expected_exc)
+            assert isinstance(a_auth.exception, expected_exc)
+            assert isinstance(a_queued.exception, expected_exc)
+
+    def test_non_active_wakeup_still_enforces_phase_deadline(self) -> None:
+        """[L-1] Wakeups in Handshaking/Authenticating still time out."""
+        from kazoo.protocol.statemachine import Authenticating, Handshaking
+
+        for init_state in (
+            Handshaking(host="127.0.0.1", port=2181),
+            Authenticating(host="127.0.0.1", port=2181),
+        ):
+            client = KazooClient(hosts="127.0.0.1:2181")
+            conn = client._connection
+            client._state_machine.state = init_state
+            conn._phase_deadline = 100.0
+            with patch("time.monotonic", return_value=200.0):
+                conn._dispatch_ready_events({"wakeup"})
+            assert isinstance(client.state_machine, Connecting)
+
+    def test_is_on_loop_routine_rejects_inherited_context_on_foreign_thread(
+        self,
+    ) -> None:
+        """[L-5] Inherited _ACTIVE_CONNECTION_LOOP on another thread fails."""
+        import contextvars
+
+        from kazoo.protocol.connection import _ACTIVE_CONNECTION_LOOP
+
+        client = KazooClient(hosts="127.0.0.1:2181")
+        conn = client._connection
+        conn.connection_stopped.clear()
+        tok = _ACTIVE_CONNECTION_LOOP.set((conn, threading.get_ident()))
+        try:
+            assert conn._is_on_loop_routine() is True
+            copied = contextvars.copy_context()
+            result: list[bool] = []
+
+            def foreign() -> None:
+                result.append(copied.run(conn._is_on_loop_routine))
+
+            t = threading.Thread(target=foreign)
+            t.start()
+            t.join()
+            assert result == [False]
+        finally:
+            _ACTIVE_CONNECTION_LOOP.reset(tok)
+            conn.connection_stopped.set()
+
+    def test_start_auth_failed_and_closing_window_rejects_calls(self) -> None:
+        """[M-5][L-8] start() keeps AuthFailed; closing Connected rejects."""
+        from kazoo.exceptions import AuthFailedError, ConnectionClosedError
+        from kazoo.protocol.states import KeeperState
+
+        # [M-5] start() failing with AuthFailedError preserves AuthFailed.
+        client = KazooClient(hosts="127.0.0.1:2181")
+        res = client.handler.async_result()
+        err = AuthFailedError("bad creds")
+        res.set_exception(err)
+
+        def fake_start_async() -> Any:
+            client._state_machine.state = AuthFailed(error=err)
+            return res
+
+        with (
+            patch.object(client, "start_async", side_effect=fake_start_async),
+            pytest.raises(AuthFailedError),
+        ):
+            client.start(timeout=1.0)
+        assert isinstance(client.state_machine, AuthFailed)
+        assert client.client_state == KeeperState.AUTH_FAILED
+        follow_up = client.handler.async_result()
+        assert client._call(GetData("/x", None), follow_up) is False
+        assert isinstance(follow_up.exception, AuthFailedError)
+
+        # [L-8] Connected(is_connecting_allowed=False) rejects _call() and
+        # does not short-circuit start_async() to True.
+        client2 = KazooClient(hosts="127.0.0.1:2181")
+        client2._state_machine.state = Connected(
+            host="127.0.0.1", port=2181, is_connecting_allowed=False
+        )
+        closing_res = client2.handler.async_result()
+        assert client2._call(GetData("/x", None), closing_res) is False
+        assert isinstance(closing_res.exception, ConnectionClosedError)
+
+        with (
+            patch.object(client2, "_safe_close") as mock_close,
+            patch.object(client2.handler, "start"),
+            patch.object(client2._connection, "start"),
+        ):
+            started = client2.start_async()
+            assert started.ready() is False
+            mock_close.assert_called_once()
+
+    def test_listener_runs_outside_dispatch_lock_no_deadlock(self) -> None:
+        """[M-4] Listener taking app_lock does not deadlock send_event."""
+        from kazoo.protocol.states import KazooState
+
+        client = KazooClient(hosts="127.0.0.1:2181")
+        client._state_machine.state = Connected(
+            host="127.0.0.1", port=2181, session_id=1
+        )
+        client._last_notified_state = KazooState.CONNECTED
+
+        app_lock = threading.Lock()
+        in_listener = threading.Event()
+        seen: list[KazooState] = []
+
+        def listener(state: KazooState) -> None:
+            seen.append(state)
+            if state == KazooState.SUSPENDED:
+                in_listener.set()
+                with app_lock:
+                    pass
+
+        client.add_listener(listener)
+
+        def trigger_drop() -> None:
+            from kazoo.protocol.statemachine import ConnectionLostEvent
+
+            client.send_event(ConnectionLostEvent(reason="drop"))
+
+        other_done = threading.Event()
+
+        with app_lock:
+            t = threading.Thread(target=trigger_drop)
+            t.start()
+            assert in_listener.wait(timeout=2.0)
+            # While t is blocked on app_lock inside listener, calling
+            # send_event from this thread (holding app_lock) must not deadlock.
+            client.send_event(CloseRequested())
+            other_done.set()
+
+        t.join(timeout=2.0)
+        assert not t.is_alive()
+        assert other_done.is_set()
+        assert seen == [KazooState.SUSPENDED, KazooState.LOST]

@@ -69,10 +69,11 @@ class TestUtils:
         ],
     )
     def test_write_read_buffer_roundtrip(self, data: bytes | None) -> None:
-        b = serialization._write_buffer(data)
-        decoded, offset = serialization._read_buffer(b, 0)
+        buf = bytearray()
+        serialization._write_buffer_into(buf, data)
+        decoded, offset = serialization._read_buffer(buf, 0)
         assert decoded == data
-        assert offset == len(b)
+        assert offset == len(buf)
 
     def test_read_acl(self) -> None:
         perms = 7
@@ -636,34 +637,30 @@ class TestServerPacketDeserializers:
     def test_close_deserialize(self) -> None:
         assert serialization.Close.deserialize(b"", 0) == (None, 0)
 
-    def test_ping_response_deserialize(self) -> None:
-        data = b"pad" + _reply_header_struct.pack(-2, 42, 0)
-        assert serialization.PingResponse.deserialize(data, 3) == (
-            serialization.PingResponse(zxid=42, err=0),
-            len(data),
+    def test_ping_response_decode(self) -> None:
+        dec = serialization.FrameDecoder()
+        data = _reply_header_struct.pack(-2, 42, 0)
+        assert dec._decode_packet(data) == serialization.PingResponse(
+            zxid=42, err=0
         )
 
-    def test_auth_response_deserialize(self) -> None:
-        data = b"pad" + _reply_header_struct.pack(-4, 99, -115)
-        assert serialization.AuthResponse.deserialize(data, 3) == (
-            serialization.AuthResponse(zxid=99, err=-115),
-            len(data),
+    def test_auth_response_decode(self) -> None:
+        dec = serialization.FrameDecoder()
+        data = _reply_header_struct.pack(-4, 99, -115)
+        assert dec._decode_packet(data) == serialization.AuthResponse(
+            zxid=99, err=-115
         )
 
-    def test_watch_packet_deserialize(self) -> None:
-        data = (
-            b"pad"
-            + struct.Struct("!iqiii").pack(-1, 777, 0, 3, 3)
-            + _write_string("/watched/node")
+    def test_watch_packet_decode(self) -> None:
+        dec = serialization.FrameDecoder()
+        data = struct.Struct("!iqiii").pack(-1, 777, 0, 3, 3) + _write_string(
+            "/watched/node"
         )
-        assert serialization.WatchPacket.deserialize(data, 3) == (
-            serialization.WatchPacket(
-                zxid=777,
-                type=3,
-                state=3,
-                path="/watched/node",
-            ),
-            len(data),
+        assert dec._decode_packet(data) == serialization.WatchPacket(
+            zxid=777,
+            type=3,
+            state=3,
+            path="/watched/node",
         )
 
 
@@ -796,7 +793,7 @@ class TestDataclassPacketsAndFrameDecoder:
         assert decoder._head == 0
         assert decoder._tail == 0
         assert decoder._scan == 0
-        assert len(decoder._buf) == decoder._capacity
+        assert len(decoder._buf) == decoder._initial_capacity
         assert decoder.frame_ready is False
 
     def test_frame_decoder_large_payload_getdata(self) -> None:
@@ -950,11 +947,15 @@ class TestDataclassPacketsAndFrameDecoder:
                         serialization.Connect.deserialize(frame, 0)[0]
                     )
                 elif xid == -1:
-                    pkt = serialization.WatchPacket.deserialize(frame, 0)[0]
+                    wtype, wstate = struct.Struct("!ii").unpack_from(frame, 16)
+                    wpath, _ = serialization._read_required_string(frame, 24)
+                    pkt = serialization.WatchPacket(
+                        zxid=zxid, type=wtype, state=wstate, path=wpath
+                    )
                 elif xid == -2:
-                    pkt = serialization.PingResponse.deserialize(frame, 0)[0]
+                    pkt = serialization.PingResponse(zxid=zxid, err=err)
                 elif xid == -4:
-                    pkt = serialization.AuthResponse.deserialize(frame, 0)[0]
+                    pkt = serialization.AuthResponse(zxid=zxid, err=err)
                 else:
                     req, _, exp_xid = reqs[req_idx]
                     req_idx += 1
@@ -1035,7 +1036,7 @@ class TestDataclassPacketsAndFrameDecoder:
                 buf[:take] = src[pos : pos + take]
                 dec.buffer_updated(take)
                 pos += take
-                assert dec._buf is main and len(main) == dec._capacity
+                assert dec._initial_capacity <= len(dec._buf) <= dec._capacity
                 assert_invariants(dec)
                 drain(dec, out, rng, always=not lazy_pop)
             drain(dec, out, rng, always=True)
@@ -1077,7 +1078,7 @@ class TestDataclassPacketsAndFrameDecoder:
                 assert_invariants(dec)
                 drain(dec, out, rng, always=not lazy_pop)
             drain(dec, out, rng, always=True)
-            assert len(dec._buf) == dec._capacity
+            assert dec._initial_capacity <= len(dec._buf) <= dec._capacity
             return out
 
         configs = [
@@ -1552,7 +1553,7 @@ class TestDataclassPacketsAndFrameDecoder:
         assert dec._view is None
         assert dec.pop_packet() is None
         dec.get_buffer()
-        assert len(dec._buf) == dec._capacity
+        assert len(dec._buf) == dec._initial_capacity
         buf_id = id(dec._buf)
 
         def make_reply_wire(xid: int) -> bytes:
@@ -1588,8 +1589,58 @@ class TestDataclassPacketsAndFrameDecoder:
         assert dec._view is None
         assert dec._empty_view is None
         dec._feed(_int_struct.pack(len(ping_b)) + ping_b)
-        assert len(dec._buf) == dec._capacity
+        assert len(dec._buf) == dec._initial_capacity
         assert isinstance(dec.pop_packet(), serialization.PingResponse)
+
+    def test_frame_decoder_lazy_growth_and_shrink_for_large_max_buffer(
+        self,
+    ) -> None:
+        """[E-1] Large max_buffer starts at initial cap, grows, shrinks."""
+        pending: collections.deque[tuple[object, object, int]] = (
+            collections.deque()
+        )
+        dec = serialization.FrameDecoder(
+            max_buffer=64 * 1024 * 1024, pop_pending=pending.popleft
+        )
+        # First get_buffer only allocates READ_WINDOW + MOVE_MAX (320 KiB),
+        # not 64 MiB.
+        dec.get_buffer()
+        assert (
+            len(dec._buf) == serialization.READ_WINDOW + serialization.MOVE_MAX
+        )
+        assert len(dec._buf) < dec._capacity
+
+        # A 512 KiB reply triggers on-demand growth up to fit the frame.
+        big_data = b"z" * (512 * 1024)
+        stat_b = serialization.stat_struct.pack(
+            1, 2, 3, 4, 5, 6, 7, 8, len(big_data), 0, 1
+        )
+        body = _reply_header_struct.pack(1, 10, 0) + _write_buffer(big_data)
+        body += stat_b
+        pending.append((serialization.GetData("/big", None), None, 1))
+        dec._feed(_int_struct.pack(len(body)) + body)
+        assert len(dec._buf) > dec._initial_capacity
+        assert len(dec._buf) <= dec._capacity
+        pkt = dec.pop_packet()
+        assert isinstance(pkt, serialization.ResponsePacket)
+        assert pkt.response[0] == big_data
+
+        # Subsequent small frame draining the buffer shrinks back to initial.
+        ping_b = _reply_header_struct.pack(
+            serialization.ReservedXID.PING, 11, 0
+        )
+        dec._feed(_int_struct.pack(len(ping_b)) + ping_b)
+        assert isinstance(dec.pop_packet(), serialization.PingResponse)
+        assert len(dec._buf) == dec._initial_capacity
+
+        # Growing and calling reset() also shrinks back to initial capacity.
+        pending.append((serialization.GetData("/big2", None), None, 2))
+        body2 = _reply_header_struct.pack(2, 12, 0) + _write_buffer(big_data)
+        body2 += stat_b
+        dec._feed(_int_struct.pack(len(body2)) + body2)
+        assert len(dec._buf) > dec._initial_capacity
+        dec.reset()
+        assert len(dec._buf) == dec._initial_capacity
 
     def test_frame_decoder_short_or_negative_length_rejected(self) -> None:
         for bad_len in (-1, 0, 15):

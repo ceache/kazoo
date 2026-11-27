@@ -8,6 +8,7 @@ import random
 import selectors
 import socket
 import ssl
+import threading
 import time
 from binascii import hexlify
 from collections.abc import Callable, Iterator
@@ -70,6 +71,7 @@ from kazoo.protocol.statemachine import (
     Authenticating,
     AuthFailed,
     ClientEvent,
+    ClientState,
     CloseSocket,
     ConfigureReadOnlyMode,
     ConfigureTimeouts,
@@ -96,6 +98,7 @@ from kazoo.protocol.statemachine import (
     StepSASLHandshake,
     StopConnectionLoop,
     UpdateSessionData,
+    is_terminal_state,
 )
 from kazoo.retry import (
     ForceRetryError,
@@ -137,11 +140,13 @@ _READY_ZK: frozenset[str] = frozenset(("zk_socket",))
 _READY_WAKEUP: frozenset[str] = frozenset(("wakeup",))
 _READY_BOTH: frozenset[str] = frozenset(("zk_socket", "wakeup"))
 
-# Tracks which ConnectionHandler owns the currently executing zk_loop routine
-# (works across OS threads, Gevent greenlets, and Eventlet greenthreads).
-_ACTIVE_CONNECTION_LOOP: contextvars.ContextVar[ConnectionHandler | None] = (
-    contextvars.ContextVar("_ACTIVE_CONNECTION_LOOP", default=None)
-)
+# Tracks which (ConnectionHandler, OS thread ident) owns the currently
+# executing zk_loop routine. Pairing the handler with threading.get_ident()
+# distinguishes both greenlets (separate ContextVar contexts) and child OS
+# threads spawned with inherited contexts (e.g. Python 3.14t).
+_ACTIVE_CONNECTION_LOOP: contextvars.ContextVar[
+    tuple[ConnectionHandler, int] | None
+] = contextvars.ContextVar("_ACTIVE_CONNECTION_LOOP", default=None)
 
 
 class RWPinger:
@@ -291,7 +296,8 @@ class ConnectionHandler:
         self._phase_deadline: float | None = None
         self._heartbeat_deadline: float | None = None
         self._heartbeat_jitter: float = 0.0
-        self._heartbeat_cache_key: tuple[float, float] | None = None
+        self._heartbeat_ref_time: float = -1.0
+        self._heartbeat_read_timeout: float = -1.0
 
         self.sasl_config: SASLConfig | None = sasl_config
         self._sasl_exchange: SASLExchange | None = None
@@ -312,12 +318,11 @@ class ConnectionHandler:
         # a bool property to False after ``if self._is_terminal: return``
         # and then reports the later re-check as unreachable, although
         # another thread can change the state in between.
-        state = self.client._state_machine.state
-        return state.is_terminal or not state.is_connecting_allowed
+        return is_terminal_state(self.client._state_machine.state)
 
     @property
     def _wakeup_registered(self) -> bool:
-        """Internal helper (used by tests) to inspect wakeup registration."""
+        """Return True if the wakeup socket is registered on the selector."""
         if self._selector is None or self._read_sock is None:
             return False
         try:
@@ -356,9 +361,13 @@ class ConnectionHandler:
 
     def _is_on_loop_routine(self) -> bool:
         """Return True if safe to mutate socket, selector, and decoder."""
+        if self.connection_stopped.is_set():
+            return True
+        active = _ACTIVE_CONNECTION_LOOP.get()
         return (
-            self.connection_stopped.is_set()
-            or _ACTIVE_CONNECTION_LOOP.get() is self
+            active is not None
+            and active[0] is self
+            and active[1] == threading.get_ident()
         )
 
     def _close_socket(self) -> None:
@@ -374,7 +383,8 @@ class ConnectionHandler:
         self._replies_since_select = 0
         self._phase_deadline = None
         self._heartbeat_deadline = None
-        self._heartbeat_cache_key = None
+        self._heartbeat_ref_time = -1.0
+        self._heartbeat_read_timeout = -1.0
         self._frame_decoder.reset()
         self._requests.fail_in_flight(ConnectionLoss())
 
@@ -1036,7 +1046,7 @@ class ConnectionHandler:
         self.logger.log(BLATHER, "ZK loop started")
 
         self.connection_stopped.clear()
-        loop_token = _ACTIVE_CONNECTION_LOOP.set(self)
+        loop_token = _ACTIVE_CONNECTION_LOOP.set((self, threading.get_ident()))
 
         retry = self.retry_sleeper.copy()
         try:
@@ -1116,30 +1126,37 @@ class ConnectionHandler:
             if self._last_recv > 0.0
             else self._last_send
         )
-        key = (ref_time, self._read_timeout)
+        read_timeout = self._read_timeout
         if (
-            self._heartbeat_cache_key != key
-            or self._heartbeat_deadline is None
+            self._heartbeat_deadline is None
+            or self._heartbeat_ref_time != ref_time
+            or self._heartbeat_read_timeout != read_timeout
         ):
-            jitter = random.randint(1, 40) / 100.0
+            # Cap jitter to read_timeout / 4 so read_timeout / 2 - jitter stays
+            # strictly positive even for short session timeouts (<= 1.2s).
+            jitter = min(random.randint(1, 40) / 100.0, read_timeout / 4.0)
             self._heartbeat_jitter = jitter
-            self._heartbeat_deadline = (
-                ref_time + self._read_timeout / 2.0 - jitter
-            )
-            self._heartbeat_cache_key = key
+            self._heartbeat_deadline = ref_time + read_timeout / 2.0 - jitter
+            self._heartbeat_ref_time = ref_time
+            self._heartbeat_read_timeout = read_timeout
         return self._heartbeat_deadline, self._heartbeat_jitter
 
-    def _compute_poll_timeout(self) -> tuple[float, float | None]:
-        """Compute the selector timeout and optional heartbeat deadline."""
-        if not self._is_session_active:
+    def _compute_poll_timeout(
+        self,
+        state: ClientState | None = None,
+        now: float | None = None,
+    ) -> float:
+        """Compute the next selector timeout in seconds."""
+        if state is None:
+            state = self.client._state_machine.state
+        if not state.is_connected:
             if self._phase_deadline is not None:
-                rem = max(0.0, self._phase_deadline - time.monotonic())
-                return rem, None
-            return self._connect_timeout, None
+                cur = time.monotonic() if now is None else now
+                return max(0.0, self._phase_deadline - cur)
+            return self._connect_timeout
 
-        now = time.monotonic()
+        cur = time.monotonic() if now is None else now
         deadline, jitter_time = self._get_heartbeat_deadline()
-        state = self.client._state_machine.state
         if (
             isinstance(state, (Connected, ConnectedReadOnly))
             and state.ping_outstanding
@@ -1147,33 +1164,34 @@ class ConnectionHandler:
             ping_rem = max(
                 0.0,
                 (self._last_send + self._read_timeout / 2.0 - jitter_time)
-                - now,
+                - cur,
             )
             if self._last_recv > 0.0:
                 recv_rem = max(
-                    0.0, (self._last_recv + self._read_timeout) - now
+                    0.0, (self._last_recv + self._read_timeout) - cur
                 )
-                return min(ping_rem, recv_rem), deadline
-            return ping_rem, deadline
+                return min(ping_rem, recv_rem)
+            return ping_rem
 
-        timeout = max(deadline - now, jitter_time)
+        timeout = max(deadline - cur, jitter_time)
         if (
             self._last_recv > 0.0
             and isinstance(state, (Connected, ConnectedReadOnly))
             and (self._requests.pending or self._requests.auth_pending)
         ):
-            recv_rem = max(0.0, (self._last_recv + self._read_timeout) - now)
+            recv_rem = max(0.0, (self._last_recv + self._read_timeout) - cur)
             if recv_rem < timeout:
                 timeout = recv_rem
-        return timeout, deadline
+        return timeout
 
     def _check_session_health(
         self,
-        deadline: float | None = None,
         now: float | None = None,
+        state: ClientState | None = None,
     ) -> None:
         """Send heartbeat pings and drop half-open connections past timeout."""
-        state = self.client._state_machine.state
+        if state is None:
+            state = self.client._state_machine.state
         if not isinstance(state, (Connected, ConnectedReadOnly)):
             return
         if now is None:
@@ -1195,14 +1213,8 @@ class ConnectionHandler:
             if now >= fresh_deadline:
                 self._emit_event(HEARTBEAT_DEADLINE_REACHED)
 
-    def _dispatch_ready_events(
-        self, ready: AbstractSet[str], deadline: float | None
-    ) -> bool:
-        """Translate ready selector handles into state machine events.
-
-        Returns True if processing should immediately skip to the next
-        iteration.
-        """
+    def _dispatch_ready_events(self, ready: AbstractSet[str]) -> None:
+        """Translate ready selector handles into state machine events."""
         if not ready:
             self._emit_event(POLL_TIMEOUT_EXPIRED)
         else:
@@ -1211,14 +1223,14 @@ class ConnectionHandler:
                     self._read_socket()
                     # Spelled out for mypy; see _check_is_terminal.
                     if not self.client._state_machine.state.is_connected:
-                        return False
+                        return
                 else:
                     self._emit_event(SOCKET_READABLE)
                     if isinstance(
                         self.client._state_machine.state,
                         (Inactive, AuthFailed),
                     ):
-                        return False
+                        return
 
             # Check if any requests need sending before proceeding
             # to process more responses. Otherwise the responses
@@ -1228,29 +1240,28 @@ class ConnectionHandler:
                     self._drain_wakeup()
                     self._send_request(self._connect_timeout)
                     self._check_session_health()
-                    return True
-                else:
-                    # WAKEUP_SIGNALED runs DrainWakeupPipe via state machine.
-                    self._emit_event(WAKEUP_SIGNALED)
-                    return True
+                    return
+                # WAKEUP_SIGNALED runs DrainWakeupPipe via state machine;
+                # fall through so _phase_deadline is still enforced.
+                self._emit_event(WAKEUP_SIGNALED)
 
-        if self._is_session_active:
-            self._check_session_health()
+        state = self.client._state_machine.state
+        if state.is_connected:
+            self._check_session_health(state=state)
         elif (
             self._phase_deadline is not None
             and time.monotonic() >= self._phase_deadline
         ):
             self._emit_event(POLL_TIMEOUT_EXPIRED)
 
-        return False
-
     def _poll_step(self) -> None:
         """Execute a single cycle of the selector I/O loop."""
+        state = self.client._state_machine.state
         if (
-            self._is_session_active
+            state.is_connected
             and self._requests.queue
             and (
-                self._is_terminal
+                is_terminal_state(state)
                 or self._requests.has_send_capacity(
                     self.client.concurrent_request_limit
                 )
@@ -1259,6 +1270,7 @@ class ConnectionHandler:
             if self._wakeup_signaled:
                 self._drain_wakeup()
             self._send_request(self._connect_timeout)
+            state = self.client._state_machine.state
 
         if self._frame_decoder.frame_ready:
             self._replies_since_select += 1
@@ -1268,21 +1280,20 @@ class ConnectionHandler:
             if should_yield:
                 self._replies_since_select = 0
                 self._yield_control()
-            if self._is_session_active:
+            if state.is_connected:
                 self._read_socket()
-                if (
-                    should_yield
-                    and self.client._state_machine.state.is_connected
-                ):
-                    self._check_session_health()
+                if should_yield:
+                    post_state = self.client._state_machine.state
+                    if post_state.is_connected:
+                        self._check_session_health(state=post_state)
             else:
                 self._emit_event(SOCKET_READABLE)
             return
 
         self._replies_since_select = 0
-        timeout, deadline = self._compute_poll_timeout()
+        timeout = self._compute_poll_timeout(state)
         ready = self._select(timeout)
-        self._dispatch_ready_events(ready, deadline)
+        self._dispatch_ready_events(ready)
 
     def _run_io_loop(self) -> None:
         """Drive selector loop while in an active-socket state."""

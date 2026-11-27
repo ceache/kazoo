@@ -44,7 +44,6 @@ from kazoo.protocol.serialization import (
     ReservedXID,
     ResponsePacket,
     SASLResponse,
-    _write_buffer,
     int_int_long_struct,
     int_struct,
     reply_header_struct,
@@ -1665,7 +1664,7 @@ class TestFrameDecoderAndRequestManager:
         decoder = FrameDecoder(pop_pending=pending.popleft)
         body = bytearray()
         body.extend(int_int_long_struct.pack(0, 30000, 12345))
-        body.extend(_write_buffer(b"password12345678"))
+        body.extend(int_struct.pack(16) + b"password12345678")
         body.extend([0])
         wire = int_struct.pack(len(body)) + bytes(body)
 
@@ -1679,7 +1678,8 @@ class TestFrameDecoderAndRequestManager:
         # Ping (-2), Auth (-4), SASL (xid=3)
         f_ping = reply_header_struct.pack(-2, 200, 0)
         f_auth = reply_header_struct.pack(-4, 201, 0)
-        f_sasl = reply_header_struct.pack(3, 202, 0) + _write_buffer(b"tok")
+        f_sasl = reply_header_struct.pack(3, 202, 0) + int_struct.pack(3)
+        f_sasl += b"tok"
         for f in (f_ping, f_auth, f_sasl):
             decoder._feed(int_struct.pack(len(f)) + f)
 

@@ -161,13 +161,6 @@ def _write_string(bytes: str | None) -> bytes:
         return int_struct.pack(len(utf8_str)) + utf8_str
 
 
-def _write_buffer(bytes: bytes | None) -> bytes:
-    if bytes is None:
-        return _NEG_ONE_INT
-    else:
-        return int_struct.pack(len(bytes)) + bytes
-
-
 def _read_buffer(
     buffer: bytes | memoryview, offset: int
 ) -> tuple[bytes | None, int]:
@@ -493,8 +486,10 @@ class Sync:
     def _serialize_into(self, buf: bytearray) -> None:
         _write_string_into(buf, self.path)
 
-    def serialize(self) -> bytes:
-        return _write_string(self.path)
+    def serialize(self) -> bytearray:
+        b = bytearray()
+        self._serialize_into(b)
+        return b
 
     @classmethod
     def deserialize(
@@ -796,12 +791,10 @@ class Auth:
         _write_string_into(buf, self.scheme)
         _write_string_into(buf, self.auth)
 
-    def serialize(self) -> bytes:
-        return (
-            int_struct.pack(self.auth_type)
-            + _write_string(self.scheme)
-            + _write_string(self.auth)
-        )
+    def serialize(self) -> bytearray:
+        b = bytearray()
+        self._serialize_into(b)
+        return b
 
 
 @_packet
@@ -907,14 +900,6 @@ class PingResponse:
     zxid: int
     err: int = 0
 
-    @classmethod
-    def deserialize(
-        cls, buffer: bytes | memoryview, offset: int
-    ) -> tuple[PingResponse, int]:
-        """Deserialize a PingResponse packet from ``buffer`` at ``offset``."""
-        _, zxid, err = reply_header_struct.unpack_from(buffer, offset)
-        return cls(zxid=zxid, err=err), offset + reply_header_struct.size
-
 
 @_packet
 class AuthResponse:
@@ -922,14 +907,6 @@ class AuthResponse:
 
     zxid: int
     err: int = 0
-
-    @classmethod
-    def deserialize(
-        cls, buffer: bytes | memoryview, offset: int
-    ) -> tuple[AuthResponse, int]:
-        """Deserialize an AuthResponse packet from ``buffer`` at ``offset``."""
-        _, zxid, err = reply_header_struct.unpack_from(buffer, offset)
-        return cls(zxid=zxid, err=err), offset + reply_header_struct.size
 
 
 @_packet
@@ -940,22 +917,6 @@ class WatchPacket:
     type: int
     state: int
     path: str
-
-    @classmethod
-    def deserialize(
-        cls, buffer: bytes | memoryview, offset: int
-    ) -> tuple[WatchPacket, int]:
-        """Deserialize a WatchPacket from ``buffer`` at ``offset``."""
-        _, zxid, _, watch_type, state = watch_header_struct.unpack_from(
-            buffer, offset
-        )
-        path, offset = _read_required_string(
-            buffer, offset + watch_header_struct.size
-        )
-        return (
-            cls(zxid=zxid, type=watch_type, state=state, path=path),
-            offset,
-        )
 
 
 @_packet
@@ -1009,6 +970,7 @@ class FrameDecoder:
         "_max_payload",
         "_max_frame",
         "_capacity",
+        "_initial_capacity",
         "_buf",
         "_view",
         "_empty_view",
@@ -1032,6 +994,7 @@ class FrameDecoder:
         self._max_payload = max_buffer + REPLY_OVERHEAD
         self._max_frame = 4 + self._max_payload
         self._capacity = READ_WINDOW + self._max_frame
+        self._initial_capacity = min(self._capacity, READ_WINDOW + MOVE_MAX)
         self._buf = bytearray()
         self._view: memoryview | None = None
         self._empty_view: memoryview | None = None
@@ -1046,12 +1009,39 @@ class FrameDecoder:
         self._pop_pending = pop_pending
 
     def _ensure_buffer(self) -> memoryview:
-        """Lazily allocate the fixed frame buffer and its cached views."""
+        """Lazily allocate the initial frame buffer and its cached views."""
         if self._view is None:
-            self._buf = bytearray(self._capacity)
+            self._buf = bytearray(self._initial_capacity)
             self._view = memoryview(self._buf)
             self._empty_view = self._view[:READ_WINDOW]
         return self._view
+
+    def _grow_buffer(self, min_size: int) -> memoryview:
+        """Grow buffer up to ``_capacity``, preserving ``[head:tail]``."""
+        new_size = min(self._capacity, max(min_size, len(self._buf) * 2))
+        new_buf = bytearray(new_size)
+        head = self._head
+        tail = self._tail
+        if tail > head:
+            new_buf[head:tail] = self._buf[head:tail]
+        if self._empty_view is not None:
+            self._empty_view.release()
+        if self._view is not None:
+            self._view.release()
+        self._buf = new_buf
+        self._view = memoryview(self._buf)
+        self._empty_view = self._view[:READ_WINDOW]
+        return self._view
+
+    def _shrink_to_initial(self) -> None:
+        """Shrink an over-initial buffer back to ``_initial_capacity``."""
+        if self._empty_view is not None:
+            self._empty_view.release()
+        if self._view is not None:
+            self._view.release()
+        self._buf = bytearray(self._initial_capacity)
+        self._view = memoryview(self._buf)
+        self._empty_view = self._view[:READ_WINDOW]
 
     def reset(self) -> None:
         """Clear buffered bytes and any pending oversize skip count."""
@@ -1060,6 +1050,8 @@ class FrameDecoder:
         self._scan = 0
         self._frame_len = -1
         self._skip = 0
+        if len(self._buf) > self._initial_capacity:
+            self._shrink_to_initial()
 
     def release(self) -> None:
         """Release cached views and free the backing buffer.
@@ -1239,6 +1231,8 @@ class FrameDecoder:
 
         if end <= tail:
             raise BufferError("pop frames before requesting a buffer")
+        if end > len(self._buf):
+            view = self._grow_buffer(end)
         return view[tail:end]
 
     def buffer_updated(self, nbytes: int) -> None:
@@ -1263,7 +1257,7 @@ class FrameDecoder:
             self._frame_len = -1
             self._advance_scan()
             return
-        if self._tail + nbytes > self._capacity:
+        if self._tail + nbytes > len(self._buf):
             raise ValueError("nbytes exceeds main frame buffer capacity")
         self._tail += nbytes
         self._advance_scan()
@@ -1396,6 +1390,12 @@ class FrameDecoder:
             return self._decode_packet(frame_view)
         finally:
             frame_view.release()
+            if (
+                self._head == self._tail
+                and n <= MOVE_MAX
+                and len(self._buf) > self._initial_capacity
+            ):
+                self._shrink_to_initial()
 
     def _decode_packet(self, frame: bytes | memoryview) -> ServerPacket:
         """Internal helper to decode a complete raw frame into a ServerPacket.

@@ -426,8 +426,13 @@ class KazooClient:
 
         # Curator like simplified state tracking, and listeners for
         # state transitions
+        self._listener_lock = self.handler.lock_object()
+        self._pending_state_changes: deque[KazooState] = deque()
+        self._notifying_listeners: bool = False
         self._state_machine = StateMachineDriver(
-            self._execute_effect, lock=self.handler.rlock_object()
+            self._execute_effect,
+            lock=self.handler.rlock_object(),
+            post_dispatch=self._drain_state_changes,
         )
         self._request_manager = RequestManager()
         self._watcher_manager = WatcherManager()
@@ -527,7 +532,6 @@ class KazooClient:
             sasl_config=sasl_config,
             max_buffer=max_buffer,
         )
-        self._conn_retry.interrupt = lambda: self._connection._is_terminal
 
         # Every retry call should have its own copy of the retry helper
         # to avoid shared retry counts
@@ -813,6 +817,10 @@ class KazooClient:
             might need data or a value that could result in blocking
             than the :meth:`~kazoo.interfaces.IHandler.spawn` method
             should be used so that the listener can return immediately.
+            Listeners execute synchronously on whichever thread/greenlet
+            triggered the state transition (for example the connection
+            loop or a thread calling :meth:`stop`), after Kazoo releases
+            its internal state-machine dispatch lock.
 
         """
         # This check should be unnecessary but protects against people who are
@@ -828,12 +836,14 @@ class KazooClient:
         """Remove a listener function"""
         self.state_listeners.discard(listener)
 
-    def _make_state_change(self, state: KazooState) -> None:
-        if state == self._last_notified_state:
-            return
+    def _enqueue_state_change(self, state: KazooState) -> None:
+        with self._listener_lock:
+            if state == self._last_notified_state:
+                return
+            self._last_notified_state = state
+            self._pending_state_changes.append(state)
 
-        self._last_notified_state = state
-
+    def _dispatch_state_change(self, state: KazooState) -> None:
         # Create copy of listeners for iteration in case one needs to
         # remove itself
         for listener in list(self.state_listeners):
@@ -843,6 +853,28 @@ class KazooClient:
                     self.remove_listener(listener)
             except Exception:
                 self.logger.exception("Error in connection state listener")
+
+    def _drain_state_changes(self) -> None:
+        with self._listener_lock:
+            if self._notifying_listeners:
+                return
+            self._notifying_listeners = True
+        try:
+            while True:
+                with self._listener_lock:
+                    if not self._pending_state_changes:
+                        self._notifying_listeners = False
+                        return
+                    state = self._pending_state_changes.popleft()
+                self._dispatch_state_change(state)
+        except BaseException:
+            with self._listener_lock:
+                self._notifying_listeners = False
+            raise
+
+    def _make_state_change(self, state: KazooState) -> None:
+        self._enqueue_state_change(state)
+        self._drain_state_changes()
 
     def send_event(self, event: ClientEvent) -> None:
         """Thread/Greenlet-safe entry point for state machine events."""
@@ -870,7 +902,7 @@ class KazooClient:
                     self._conn_result.set_exception(exc)
 
             case EmitKazooStateChange(new_state=new_state):
-                self._make_state_change(new_state)
+                self._enqueue_state_change(new_state)
 
             case FailPendingRequests(keeper_state=keeper_state):
                 self._notify_pending(keeper_state)
@@ -918,13 +950,13 @@ class KazooClient:
         if isinstance(state, AuthFailed):
             async_object.set_exception(AuthFailedError())
             return False
-        elif isinstance(state, Inactive):
+        elif isinstance(state, ExpiredSession):
+            async_object.set_exception(SessionExpiredError())
+            return False
+        elif isinstance(state, Inactive) or not state.is_connecting_allowed:
             async_object.set_exception(
                 ConnectionClosedError("Connection has been closed")
             )
-            return False
-        elif isinstance(state, ExpiredSession):
-            async_object.set_exception(SessionExpiredError())
             return False
 
         self._request_manager.enqueue(request, async_object)
@@ -961,7 +993,10 @@ class KazooClient:
         try:
             async_result.get(timeout=timeout)
         except Exception:
-            self.stop()
+            if isinstance(self._state_machine.state, AuthFailed):
+                self._safe_close()
+            else:
+                self.stop()
             self.close()
             raise
 
@@ -979,15 +1014,16 @@ class KazooClient:
                   exception on terminal failure.
 
         """
-        # If we're already connected, return an already-completed result
-        if self.connected:
+        # If we're already connected (and not shutting down), return an
+        # already-completed result.
+        state = self._state_machine.state
+        if state.is_connected and state.is_connecting_allowed:
             if self._conn_result is None or self._conn_result.ready():
                 result = self.handler.async_result()
                 result.set(True)
                 return result
             return self._conn_result
 
-        state = self._state_machine.state
         if (
             state.is_connecting_allowed
             and not self._connection.connection_stopped.is_set()
@@ -996,7 +1032,7 @@ class KazooClient:
                 return self._conn_result
             with self._state_machine._dispatch_lock:
                 cur_state = self._state_machine.state
-                if cur_state.is_connected:
+                if cur_state.is_connected and cur_state.is_connecting_allowed:
                     result = self.handler.async_result()
                     result.set(True)
                     return result
