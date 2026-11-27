@@ -29,9 +29,9 @@ from kazoo.exceptions import (
 )
 from kazoo.protocol.connection import _CONNECTION_DROP
 from kazoo.protocol.statemachine import (
-    AuthFailedEvent,
+    AuthFailed,
     Connected,
-    SessionExpiredEvent,
+    ExpiredSession,
 )
 from kazoo.protocol.states import (
     AddWatchMode,
@@ -510,12 +510,15 @@ class TestClient:
 
     def test_create_on_broken_connection(self, zkclient):
         client = zkclient
+        # Stop zk_loop first so background reconnection cannot race between
+        # setting ExpiredSession and calling create().
+        client.stop()
 
-        client.send_event(SessionExpiredEvent())
+        client._state_machine.state = ExpiredSession()
         with pytest.raises(SessionExpiredError):
             client.create("/closedpath", b"bar")
 
-        client.send_event(AuthFailedEvent(error=AuthFailedError()))
+        client._state_machine.state = AuthFailed(error=AuthFailedError())
         with pytest.raises(AuthFailedError):
             client.create("/closedpath", b"bar")
 
