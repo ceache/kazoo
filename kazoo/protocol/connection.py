@@ -625,18 +625,23 @@ class ConnectionHandler:
         timeout: float | None,
     ) -> Socket:
         client = self.client
-        return self.handler.create_connection(
-            address=(hostip, port),
-            hostname=host,
-            timeout=timeout,
-            use_ssl=client.use_ssl,
-            keyfile=client.keyfile,
-            certfile=client.certfile,
-            ca=client.ca,
-            keyfile_password=client.keyfile_password,
-            verify_certs=client.verify_certs,
-            check_hostname=client.check_hostname,
-        )
+        kwargs: dict[str, Any] = {
+            "address": (hostip, port),
+            "hostname": host,
+            "timeout": timeout,
+            "use_ssl": client.use_ssl,
+            "keyfile": client.keyfile,
+            "certfile": client.certfile,
+            "ca": client.ca,
+            "keyfile_password": client.keyfile_password,
+            "verify_certs": client.verify_certs,
+            "check_hostname": client.check_hostname,
+        }
+        if client.use_ssl:
+            ssl_ctx = client._get_ssl_context()
+            if ssl_ctx is not None:
+                kwargs["ssl_context"] = ssl_ctx
+        return self.handler.create_connection(**kwargs)
 
     def wake(self) -> bool:
         """Wake the connection loop by sending a byte on the wakeup pipe.

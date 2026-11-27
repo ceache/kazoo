@@ -236,6 +236,7 @@ def create_tcp_connection(
     check_hostname: bool = False,
     options: ssl.Options | None = None,
     ciphers: str | None = None,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> Socket:
     end = None
     if timeout is None:
@@ -245,8 +246,7 @@ def create_tcp_connection(
     if timeout is not None:
         end = time.monotonic() + timeout
     sock: Socket | None = None
-    ssl_context: ssl.SSLContext | None = None
-    if use_ssl:
+    if use_ssl and ssl_context is None:
         ssl_context = build_ssl_context(
             TLSConfig(
                 use_ssl=True,
@@ -260,6 +260,8 @@ def create_tcp_connection(
                 ciphers=ciphers,
             )
         )
+    elif not use_ssl:
+        ssl_context = None
 
     while True:
         timeout_at = end if end is None else end - time.monotonic()

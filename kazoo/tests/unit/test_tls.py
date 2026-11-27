@@ -113,3 +113,65 @@ class TestBuildSSLContext:
                 keyfile="/fake/key.pem",
                 password="pw",
             )
+
+    def test_client_tls_config_dynamic_and_ssl_context_cached(self) -> None:
+        """[L-3][E-3] tls_config reflects mutations; SSLContext is cached."""
+        client = KazooClient(
+            hosts="127.0.0.1:2181",
+            use_ssl=True,
+            verify_certs=True,
+            check_hostname=False,
+        )
+        with patch(
+            "kazoo.client.build_ssl_context", wraps=build_ssl_context
+        ) as spy_build:
+            ctx1 = client._get_ssl_context()
+            ctx2 = client._get_ssl_context()
+            assert ctx1 is not None
+            assert ctx1 is ctx2
+            assert spy_build.call_count == 1
+
+            # Mutating a TLS attribute updates tls_config and rebuilds cache.
+            client.verify_certs = False
+            assert client.tls_config.verify_certs is False
+            ctx3 = client._get_ssl_context()
+            assert ctx3 is not None
+            assert ctx3 is not ctx1
+            assert ctx3.verify_mode == ssl.CERT_NONE
+            assert spy_build.call_count == 2
+
+            # Disabling use_ssl returns None without calling build_ssl_context.
+            client.use_ssl = False
+            assert client._get_ssl_context() is None
+            assert spy_build.call_count == 2
+
+    def test_create_tcp_connection_reuses_supplied_ssl_context(self) -> None:
+        """[E-3] create_tcp_connection reuses supplied ssl_context."""
+        import socket
+        from unittest.mock import Mock
+
+        from kazoo.handlers.utils import create_tcp_connection
+
+        prebuilt = build_ssl_context(TLSConfig(use_ssl=True))
+        wrapped = Mock()
+        with (
+            patch(
+                "kazoo.handlers.utils.build_ssl_context",
+                side_effect=AssertionError("should not rebuild"),
+            ),
+            patch("kazoo.handlers.utils._set_default_tcpsock_options"),
+            patch.object(
+                prebuilt, "wrap_socket", return_value=wrapped
+            ) as mock_wrap,
+        ):
+            sock = create_tcp_connection(
+                socket,
+                ("127.0.0.1", 2181),
+                hostname="zk.example",
+                timeout=1.0,
+                use_ssl=True,
+                ssl_context=prebuilt,
+            )
+            assert sock is wrapped
+            mock_wrap.assert_called_once()
+            wrapped.connect.assert_called_once_with(("127.0.0.1", 2181))

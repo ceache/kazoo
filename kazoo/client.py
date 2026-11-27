@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import logging
 import re
+import ssl
 import warnings
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -83,7 +84,7 @@ from kazoo.protocol.states import (
     WatchedEvent,
     WatcherType,
 )
-from kazoo.protocol.tls import TLSConfig
+from kazoo.protocol.tls import TLSConfig, build_ssl_context
 
 # convenience API
 from kazoo.recipe.barrier import Barrier, DoubleBarrier
@@ -390,15 +391,6 @@ class KazooClient:
         self.chroot: str = None  # type: ignore[assignment]
         self.set_hosts(hosts)
 
-        self.tls_config = TLSConfig(
-            use_ssl=use_ssl,
-            ca=ca,
-            certfile=certfile,
-            keyfile=keyfile,
-            keyfile_password=keyfile_password,
-            verify_certs=verify_certs,
-            check_hostname=check_hostname,
-        )
         self.use_ssl = use_ssl
         self.verify_certs = verify_certs
         self.check_hostname = check_hostname
@@ -406,6 +398,9 @@ class KazooClient:
         self.keyfile = keyfile
         self.keyfile_password = keyfile_password
         self.ca = ca
+        self._ssl_context_cache: tuple[TLSConfig, ssl.SSLContext] | None = None
+        # Validate TLS configuration eagerly on construction.
+        _ = self.tls_config
         if concurrent_request_limit is not None and (
             isinstance(concurrent_request_limit, bool)
             or concurrent_request_limit <= 0
@@ -670,6 +665,31 @@ class KazooClient:
 
         """
         return self._state_machine.state.keeper_state
+
+    @property
+    def tls_config(self) -> TLSConfig:
+        """Typed TLS configuration derived dynamically from client fields."""
+        return TLSConfig(
+            use_ssl=self.use_ssl,
+            ca=self.ca,
+            certfile=self.certfile,
+            keyfile=self.keyfile,
+            keyfile_password=self.keyfile_password,
+            verify_certs=self.verify_certs,
+            check_hostname=self.check_hostname,
+        )
+
+    def _get_ssl_context(self) -> ssl.SSLContext | None:
+        """Return a cached :class:`ssl.SSLContext` for current TLS settings."""
+        if not self.use_ssl:
+            return None
+        cfg = self.tls_config
+        cached = self._ssl_context_cache
+        if cached is not None and cached[0] == cfg:
+            return cached[1]
+        ctx = build_ssl_context(cfg)
+        self._ssl_context_cache = (cfg, ctx)
+        return ctx
 
     @property
     def client_id(self) -> tuple[int | None, bytes] | None:
@@ -1029,18 +1049,20 @@ class KazooClient:
         assert sock_obj is not None
         peer = sock_obj.getpeername()[:2]
         peer_host = peer[0]
-        sock = self.handler.create_connection(
-            peer,
-            hostname=peer_host,
-            timeout=self._session_timeout / 1000.0,
-            use_ssl=self.use_ssl,
-            ca=self.ca,
-            certfile=self.certfile,
-            keyfile=self.keyfile,
-            keyfile_password=self.keyfile_password,
-            verify_certs=self.verify_certs,
-            check_hostname=self.check_hostname,
-        )
+        cmd_kwargs: dict[str, Any] = {
+            "hostname": peer_host,
+            "timeout": self._session_timeout / 1000.0,
+            "use_ssl": self.use_ssl,
+            "ca": self.ca,
+            "certfile": self.certfile,
+            "keyfile": self.keyfile,
+            "keyfile_password": self.keyfile_password,
+            "verify_certs": self.verify_certs,
+            "check_hostname": self.check_hostname,
+        }
+        if self.use_ssl:
+            cmd_kwargs["ssl_context"] = self._get_ssl_context()
+        sock = self.handler.create_connection(peer, **cmd_kwargs)
         sock.sendall(cmd)
         result = sock.recv(8192)
         sock.close()

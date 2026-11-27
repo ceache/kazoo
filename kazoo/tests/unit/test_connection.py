@@ -881,6 +881,8 @@ class TestRWServerSelection:
             verify_certs=True,
             check_hostname=True,
         )
+        fake_ctx = Mock()
+        client._get_ssl_context = Mock(return_value=fake_ctx)
         client.handler.create_connection.return_value = sock
         connection = ConnectionHandler(client, KazooRetry())
         connection._host_ports = [("rw.example", "10.0.0.2", 2182)]
@@ -900,6 +902,7 @@ class TestRWServerSelection:
             keyfile_password="pw",
             verify_certs=True,
             check_hostname=True,
+            ssl_context=fake_ctx,
         )
         sock.settimeout.assert_called_once_with(1.0)
         sock.close.assert_called_once()
