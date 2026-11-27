@@ -429,7 +429,7 @@ class KazooClient:
         # Curator like simplified state tracking, and listeners for
         # state transitions
         self._state_machine = StateMachineDriver(
-            self.handler, self._execute_effect
+            self._execute_effect, lock=self.handler.rlock_object()
         )
         self._request_manager = RequestManager()
         self._watcher_manager = WatcherManager()

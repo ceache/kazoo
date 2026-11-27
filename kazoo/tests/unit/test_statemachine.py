@@ -1179,8 +1179,8 @@ class TestClientStateMachineDriver:
                 events_executed.append("close_enqueued")
 
         driver = StateMachineDriver(
-            handler,
             executor,
+            lock=handler.rlock_object(),
             initial_state=Connected(host="127.0.0.1", port=2181),
         )
 
@@ -1481,7 +1481,9 @@ class TestClientStateMachineDriver:
                 raise BoomError("Effect failed")
 
         handler = SequentialThreadingHandler()
-        driver = StateMachineDriver(handler, reentrant_exploding_executor)
+        driver = StateMachineDriver(
+            reentrant_exploding_executor, lock=handler.rlock_object()
+        )
         driver.state = Handshaking(host="127.0.0.1", port=2181, num_hosts=1)
 
         # When effect raises BoomError, queued events must be discarded
@@ -1493,6 +1495,22 @@ class TestClientStateMachineDriver:
 
         # Next event succeeds without replaying the discarded event
         driver.send_event(ConnectionLostEvent())
+        assert isinstance(driver.state, Connecting)
+
+    def test_driver_without_lock_serializes_reentrant_events(self) -> None:
+        """StateMachineDriver works with lock=None (no IHandler dependency)."""
+        seen: list[str] = []
+
+        def executor(effect: SideEffect) -> None:
+            if isinstance(effect, SendConnectPacket):
+                seen.append("connect")
+                driver.send_event(ConnectionLostEvent(reason="reentrant"))
+            elif isinstance(effect, CloseSocket):
+                seen.append("close")
+
+        driver = StateMachineDriver(executor, initial_state=Connecting())
+        driver.send_event(SocketConnected(host="127.0.0.1", port=2181))
+        assert seen == ["connect", "close"]
         assert isinstance(driver.state, Connecting)
 
     def test_inactive_absorbs_late_events(self) -> None:

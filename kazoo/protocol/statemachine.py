@@ -5,9 +5,10 @@ from __future__ import annotations
 import logging
 from collections import deque
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import Any, TypeAlias
 
 from kazoo.exceptions import (
     AuthFailedError,
@@ -17,10 +18,6 @@ from kazoo.exceptions import (
 from kazoo.loggingsupport import BLATHER
 from kazoo.protocol.serialization import Connect
 from kazoo.protocol.states import KazooState, KeeperState
-
-if TYPE_CHECKING:
-    from kazoo.interfaces import IHandler
-
 
 # =====================================================================
 # 1. States (Immutable Dataclasses representing all valid configurations)
@@ -1285,7 +1282,7 @@ def transition(
 
 
 class StateMachineDriver:
-    """Thread/Greenlet-safe serialized event driver for ClientState."""
+    """Serialized event driver for ClientState."""
 
     __slots__ = (
         "state",
@@ -1297,14 +1294,17 @@ class StateMachineDriver:
 
     def __init__(
         self,
-        handler: IHandler,
         effect_executor: Callable[[SideEffect], None],
+        *,
+        lock: AbstractContextManager[Any] | None = None,
         initial_state: ClientState | None = None,
     ) -> None:
         self.state: ClientState = initial_state or Inactive()
         self._effect_executor = effect_executor
         self._event_queue: deque[ClientEvent] = deque()
-        self._dispatch_lock = handler.rlock_object()
+        self._dispatch_lock: AbstractContextManager[Any] = (
+            lock if lock is not None else nullcontext()
+        )
         self._processing_events = False
 
     def send_event(self, event: ClientEvent) -> None:
