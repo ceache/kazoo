@@ -106,6 +106,68 @@ def _make_mock_client(**kwargs: Any) -> Mock:
     return client
 
 
+def _attach_fake_selector(
+    conn: ConnectionHandler,
+    sock: Any,
+    *,
+    ready: bool = True,
+    read_sock: Any = None,
+) -> Any:
+    """Attach a stateful fake BaseSelector mirroring _setup_selector()."""
+
+    class _FakeSelector:
+        def __init__(self) -> None:
+            self.keys: dict[Any, selectors.SelectorKey] = {}
+            self.modifies: list[tuple[Any, int, Any]] = []
+            self.select_calls: list[tuple[float | None, int]] = []
+            self.ready = ready
+
+        def register(
+            self, fileobj: Any, events: int, data: Any = None
+        ) -> selectors.SelectorKey:
+            if fileobj in self.keys:
+                raise KeyError(fileobj)
+            key = selectors.SelectorKey(fileobj, 0, events, data)
+            self.keys[fileobj] = key
+            return key
+
+        def modify(
+            self, fileobj: Any, events: int, data: Any = None
+        ) -> selectors.SelectorKey:
+            if fileobj not in self.keys:
+                raise KeyError(fileobj)
+            self.modifies.append((fileobj, events, data))
+            key = selectors.SelectorKey(fileobj, 0, events, data)
+            self.keys[fileobj] = key
+            return key
+
+        def unregister(self, fileobj: Any) -> selectors.SelectorKey:
+            return self.keys.pop(fileobj)
+
+        def get_key(self, fileobj: Any) -> selectors.SelectorKey:
+            return self.keys[fileobj]
+
+        def select(
+            self, timeout: float | None = None
+        ) -> list[tuple[selectors.SelectorKey, int]]:
+            zk_key = self.keys[sock]
+            self.select_calls.append((timeout, zk_key.events))
+            if not self.ready:
+                return []
+            return [(zk_key, zk_key.events)]
+
+        def close(self) -> None:
+            self.keys.clear()
+
+    sel = _FakeSelector()
+    conn._selector = sel  # type: ignore[assignment]
+    conn._socket = sock
+    if read_sock is not None:
+        conn._read_sock = read_sock
+    conn._setup_selector()
+    return sel
+
+
 class TestConnectionAuthExceptions:
     def test_connect_attempt_sasl_exception(self) -> None:
         client = _make_mock_client()
@@ -1221,8 +1283,10 @@ class TestConnectionIOLoopDecomposition:
         client = _make_mock_client()
         conn = ConnectionHandler(client, KazooRetry())
         mock_sock = Mock()
-        conn._socket = mock_sock
-        conn.handler.select = Mock(return_value=([], [mock_sock], []))  # type: ignore[assignment]
+        mock_wakeup = Mock()
+        sel = _attach_fake_selector(
+            conn, mock_sock, ready=True, read_sock=mock_wakeup
+        )
 
         # Send 10 of 20 bytes initially, then remaining 10
         mock_sock.send.side_effect = [10, 10]
@@ -1230,20 +1294,30 @@ class TestConnectionIOLoopDecomposition:
         conn._write(payload)
 
         assert mock_sock.send.call_count == 2
-        conn.handler.select.assert_called_once()  # type: ignore[attr-defined]
+        assert len(sel.select_calls) == 1
+        assert sel.select_calls[0][1] == selectors.EVENT_WRITE
+        # Selector restored to EVENT_READ on zk_socket and wakeup re-registered
+        assert sel.get_key(mock_sock).events == selectors.EVENT_READ
+        assert conn._wakeup_registered is True
 
     def test_write_timeout_during_drain(self) -> None:
         client = _make_mock_client()
         conn = ConnectionHandler(client, KazooRetry())
         mock_sock = Mock()
-        conn._socket = mock_sock
-        conn.handler.select = Mock(return_value=([], [], []))  # type: ignore[assignment]
+        mock_wakeup = Mock()
+        sel = _attach_fake_selector(
+            conn, mock_sock, ready=False, read_sock=mock_wakeup
+        )
 
         # Send 10 of 20 bytes initially, then select times out
         mock_sock.send.return_value = 10
         payload = b"0123456789abcdefghij"
         with pytest.raises(conn.handler.timeout_exception):
             conn._write(payload, timeout=0.1)
+
+        # Even on timeout, zk_socket EVENT_READ and wakeup must be restored.
+        assert sel.get_key(mock_sock).events == selectors.EVENT_READ
+        assert conn._wakeup_registered is True
 
     def test_write_raises_connection_dropped_when_socket_is_none(self) -> None:
         client = _make_mock_client()
@@ -1777,29 +1851,71 @@ class TestConnectionRecvIntoAndBurstScheduling:
         conn._close_socket()
         assert conn._replies_since_select == 0
 
-    def test_write_reuses_lazy_write_selector_and_closes_it(self) -> None:
-        """_write() slow path reuses a lazy write selector across chunks."""
-        client = _make_mock_client()
-        conn = ConnectionHandler(client, KazooRetry())
-        mock_sock = Mock()
-        conn._socket = mock_sock
-        conn._selector = Mock()
-        mock_wsel = Mock()
-        mock_wsel.select.return_value = [(Mock(), selectors.EVENT_WRITE)]
-        client.handler.create_selector = Mock(return_value=mock_wsel)
+    def test_write_reuses_persistent_selector_and_preserves_wakeup(
+        self,
+    ) -> None:
+        """_write() reuses self._selector with 0 extra selectors."""
+        import socket
 
-        mock_sock.send.side_effect = [5, 5, 5, 5]
-        conn._write(b"0123456789")
-        conn._write(b"abcdefghij")
+        client = KazooClient(hosts="127.0.0.1:2181")
+        conn = client._connection
+        s_a, s_b = socket.socketpair()
+        try:
+            s_a.setblocking(False)
+            s_b.setblocking(False)
+            conn._read_sock, conn._write_sock = (
+                client.handler.create_socket_pair()
+            )
+            conn._read_sock.setblocking(False)
+            conn._write_sock.setblocking(False)
+            conn._selector = client.handler.create_selector()
+            conn._socket = s_a
+            conn._setup_selector()
 
-        client.handler.create_selector.assert_called_once()
-        mock_wsel.register.assert_called_once_with(
-            mock_sock, selectors.EVENT_WRITE
-        )
-        assert mock_wsel.select.call_count == 2
-        conn._close_socket()
-        mock_wsel.close.assert_called_once()
-        assert conn._write_selector is None
+            # Write a wake byte BEFORE entering _write() slow path: must NOT
+            # cause busy-spin and must remain readable after _write() exits.
+            conn.wake()
+            create_spy = Mock(wraps=client.handler.create_selector)
+            client.handler.create_selector = create_spy  # type: ignore[method-assign]
+
+            real_sel = conn._selector
+            modifies: list[int] = []
+            orig_modify = real_sel.modify
+
+            def spy_modify(
+                fileobj: Any, events: int, data: Any = None
+            ) -> selectors.SelectorKey:
+                modifies.append(events)
+                return orig_modify(fileobj, events, data)
+
+            mock_sock = Mock(wraps=s_a)
+            # 3 chunks -> 1 modify to EVENT_WRITE, 0 between chunks, 1 restore
+            mock_sock.send.side_effect = [3, 3, 4]
+            conn._socket = mock_sock
+            real_sel.unregister(s_a)
+            real_sel.register(
+                mock_sock, selectors.EVENT_READ, data="zk_socket"
+            )
+
+            with patch.object(real_sel, "modify", side_effect=spy_modify):
+                conn._write(b"0123456789", timeout=1.0)
+
+            create_spy.assert_not_called()
+            assert modifies == [selectors.EVENT_WRITE, selectors.EVENT_READ]
+            assert conn._wakeup_registered is True
+            # Wake byte was left intact and immediately visible to _select().
+            assert "wakeup" in conn._select(0.0)
+        finally:
+            conn._close_socket()
+            conn._close_selector()
+            if conn._read_sock is not None:
+                conn._read_sock.close()
+                conn._read_sock = None
+            if conn._write_sock is not None:
+                conn._write_sock.close()
+                conn._write_sock = None
+            s_a.close()
+            s_b.close()
 
     def test_frame_decoder_buffer_lazy_init_and_released_on_close(
         self,
@@ -1898,7 +2014,6 @@ class TestConnectionRecvIntoAndBurstScheduling:
         assert isinstance(pkt, ResponsePacket)
         assert pkt.header.xid == 7
         assert pkt.response[0] == b"x" * 100
-        client.handler.select.assert_not_called()
 
     def test_read_packet_ssl_want_read_returns_none(self) -> None:
         import ssl
@@ -1913,7 +2028,6 @@ class TestConnectionRecvIntoAndBurstScheduling:
         )
 
         assert conn._read_packet(timeout=2.5) is None
-        client.handler.select.assert_not_called()
 
     def test_oversize_reply_over_read_window_drains_without_blocking(
         self,
@@ -2775,7 +2889,7 @@ class TestWakeupOutsideSelect:
             finally:
                 _ACTIVE_CONNECTION_LOOP.reset(token)
 
-    def test_cross_routine_stop_threading_and_gevent_write_selector(
+    def test_cross_routine_stop_threading_and_gevent_selector(
         self,
     ) -> None:
         """[C-3] Cross-routine client.stop() does not close active selector."""
@@ -2825,7 +2939,7 @@ class TestWakeupOutsideSelect:
             srv.close()
             client.close()
 
-        # 2. Gevent handler: zk_loop parked in _write_selector.select() while
+        # 2. Gevent handler: zk_loop parked in _selector.select() while
         # another greenlet calls client.stop() during Handshaking.
         gevent = pytest.importorskip("gevent")
         from kazoo.handlers.gevent import SequentialGeventHandler
@@ -2852,9 +2966,7 @@ class TestWakeupOutsideSelect:
             s_b.setblocking(False)
             try:
                 gconn._socket = s_a
-                wsel = gclient.handler.create_selector()
-                wsel.register(s_a, selectors.EVENT_READ)
-                gconn._write_selector = wsel
+                gconn._setup_selector()
 
                 entered = gevent.event.Event()
                 loop_errors: list[BaseException] = []
@@ -2867,7 +2979,8 @@ class TestWakeupOutsideSelect:
                     tok = _ACTIVE_CONNECTION_LOOP.set(gconn)
                     try:
                         entered.set()
-                        wsel.select(0.1)
+                        assert gconn._selector is not None
+                        gconn._selector.select(0.1)
                     except BaseException as exc:
                         loop_errors.append(exc)
                     finally:
@@ -2880,11 +2993,11 @@ class TestWakeupOutsideSelect:
                 gevent.sleep(0.01)
 
                 # Another greenlet triggers CloseRequested -> must NOT close
-                # wsel directly while fake_loop_wait is inside wsel.select().
+                # socket/selector while fake_loop_wait is inside select().
                 gclient.stop()
                 g.join(timeout=2.0)
                 assert loop_errors == []
-                assert gconn._write_selector is None
+                assert gconn._socket is None
             finally:
                 s_a.close()
                 s_b.close()
@@ -2908,59 +3021,41 @@ class TestWakeupOutsideSelect:
             ssl.SSLWantWriteError(ssl.SSL_ERROR_WANT_WRITE, "want write"),
             5,
         ]
-        conn._socket = mock_ssl
+        sel = _attach_fake_selector(conn, mock_ssl, ready=True)
         conn._ssl_socket = mock_ssl
 
-        select_calls: list[tuple[Any, Any]] = []
-
-        def fake_select(
-            r: Any, w: Any, x: Any, timeout: float | None = None
-        ) -> tuple[Any, Any, Any]:
-            select_calls.append((list(r), list(w)))
-            return (list(r), list(w), [])
-
-        conn.handler.select = fake_select  # type: ignore[assignment]
         conn._write(b"0123456789", timeout=1.0)
 
         mock_ssl.send.assert_not_called()
         assert mock_ssl.write.call_count == 4
-        # First wait must be for readability (SSL_ERROR_WANT_READ), followed by
-        # writability waits for the remaining chunk and SSL_ERROR_WANT_WRITE.
-        assert select_calls == [
-            ([mock_ssl], []),
-            ([], [mock_ssl]),
-            ([], [mock_ssl]),
+        # First wait must be EVENT_READ (SSL_ERROR_WANT_READ), followed by
+        # EVENT_WRITE waits for remaining chunk and SSL_ERROR_WANT_WRITE.
+        assert [ev for _, ev in sel.select_calls] == [
+            selectors.EVENT_READ,
+            selectors.EVENT_WRITE,
+            selectors.EVENT_WRITE,
         ]
+        assert sel.get_key(mock_ssl).events == selectors.EVENT_READ
 
         # Post-deadline BlockingIOError must raise timeout instead of spinning.
         mock_sock = Mock()
         mock_sock.send.side_effect = BlockingIOError()
-        conn._socket = mock_sock
+        sel2 = _attach_fake_selector(conn, mock_sock, ready=True)
         conn._ssl_socket = None
-        conn.handler.select = Mock(return_value=([], [mock_sock], []))  # type: ignore[assignment]
         clock = iter([100.0, 100.5, 101.0])
         with (
             patch("time.monotonic", side_effect=lambda: next(clock)),
             pytest.raises(conn.handler.timeout_exception),
         ):
             conn._write(b"abc", timeout=1.0)
-
-        # Failed wsel.register() closes wsel without leaking it.
-        conn._selector = Mock()
-        bad_wsel = Mock()
-        bad_wsel.register.side_effect = ValueError("closed fd")
-        conn.handler.create_selector = Mock(return_value=bad_wsel)  # type: ignore[assignment]
-        with pytest.raises(ValueError, match="closed fd"):
-            conn._write(b"abc", timeout=1.0)
-        bad_wsel.close.assert_called_once()
-        assert conn._write_selector is None
+        assert sel2.get_key(mock_sock).events == selectors.EVENT_READ
 
     def test_write_releases_memoryview_before_batch_clear(self) -> None:
         """[C-6] _write releases all memoryviews so bytearray.clear() works."""
         client = _make_mock_client()
         conn = ConnectionHandler(client, KazooRetry())
         mock_sock = Mock()
-        conn._socket = mock_sock
+        _attach_fake_selector(conn, mock_sock, ready=True)
 
         captured_views: list[memoryview] = []
 
@@ -2971,7 +3066,6 @@ class TestWakeupOutsideSelect:
             return len(buf) // 2 if len(captured_views) == 1 else len(buf)
 
         mock_sock.send.side_effect = fake_send
-        conn.handler.select = Mock(return_value=([], [mock_sock], []))  # type: ignore[assignment]
 
         buf = bytearray(b"abcdefghij")
         conn._write(buf, timeout=1.0)
@@ -3007,19 +3101,11 @@ class TestWakeupOutsideSelect:
         mock_ssl.recv_into.side_effect = ssl.SSLWantWriteError(
             ssl.SSL_ERROR_WANT_WRITE, "want write"
         )
-        conn._socket = mock_ssl
+        sel = _attach_fake_selector(
+            conn, mock_ssl, ready=True, read_sock=Mock()
+        )
         conn._ssl_socket = mock_ssl
 
-        timeouts: list[float] = []
-
-        def fake_select(
-            r: Any, w: Any, x: Any, timeout: float | None = None
-        ) -> tuple[Any, Any, Any]:
-            assert timeout is not None
-            timeouts.append(timeout)
-            return ([], [mock_ssl], [])
-
-        conn.handler.select = fake_select  # type: ignore[assignment]
         clock = iter([100.0, 100.6, 101.2])
         with (
             patch("time.monotonic", side_effect=lambda: next(clock)),
@@ -3027,7 +3113,13 @@ class TestWakeupOutsideSelect:
         ):
             conn._read_packet(timeout=1.0)
 
-        assert timeouts == [pytest.approx(1.0), pytest.approx(0.4)]
+        assert [t for t, _ in sel.select_calls] == [
+            pytest.approx(1.0),
+            pytest.approx(0.4),
+        ]
+        assert all(ev == selectors.EVENT_WRITE for _, ev in sel.select_calls)
+        assert sel.get_key(mock_ssl).events == selectors.EVENT_READ
+        assert conn._wakeup_registered is True
 
     def test_call_wake_failure_after_request_consumed_preserves_result(
         self,

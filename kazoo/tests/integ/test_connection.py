@@ -202,6 +202,8 @@ class TestConnectionHandler:
         write_sock.getsockname()
 
     def test_dirty_sock(self, zkclient):
+        import selectors
+
         read_sock = zkclient._connection._read_sock
         write_sock = zkclient._connection._write_sock
 
@@ -212,7 +214,9 @@ class TestConnectionHandler:
         write_sock.send(b"\0")
 
         # eventually this byte should disappear from socket
-        wait(lambda: zkclient.handler.select([read_sock], [], [], 0)[0] == [])
+        with zkclient.handler.create_selector() as sel:
+            sel.register(read_sock, selectors.EVENT_READ)
+            wait(lambda: sel.select(0) == [])
 
     def test_reply_too_large_keeps_session_and_raised_limit_succeeds(
         self, zkclient, zkensemble

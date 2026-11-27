@@ -17,12 +17,10 @@ from eventlet.green import threading as green_threading
 from eventlet.green import time as green_time
 
 from kazoo.handlers import utils
-from kazoo.handlers.utils import selector_select
 
 if TYPE_CHECKING:
     from kazoo.interfaces import (
         Event,
-        FdLike,
         IHandler,
         Lockable,
         ReentrantLock,
@@ -254,19 +252,6 @@ class SequentialEventletHandler:
     # FIXME fix parameters
     def create_connection(self, *args: Any, **kwargs: Any) -> Socket:
         return utils.create_tcp_connection(green_socket, *args, **kwargs)
-
-    # FIXME fix parameters
-    def select(
-        self, *args: Any, **kwargs: Any
-    ) -> tuple[list[FdLike], list[FdLike], list[FdLike]]:
-        with _yield_before_after():
-            # Following appears to be a bug in mypy (see
-            # https://github.com/python/mypy/issues/6799)
-            return selector_select(
-                *args,
-                selectors_module=green_selectors,  # type: ignore[misc]
-                **kwargs,
-            )
 
     def create_selector(self) -> selectors.BaseSelector:
         return _EventletSelector()

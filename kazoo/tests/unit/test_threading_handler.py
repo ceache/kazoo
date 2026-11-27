@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import selectors
 import socket
 import threading
 from typing import Any
@@ -61,10 +62,15 @@ class TestThreadingHandler:
             socks.append(sock)
         h = self._makeOne()
         h.start()
-        h.select(socks, [], [], 0)
-        h.stop()
-        for sock in socks:
-            sock.close()
+        try:
+            with h.create_selector() as sel:
+                for sock in socks:
+                    sel.register(sock, selectors.EVENT_READ)
+                sel.select(0)
+        finally:
+            h.stop()
+            for sock in socks:
+                sock.close()
 
 
 class TestThreadingAsync:

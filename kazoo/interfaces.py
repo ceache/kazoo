@@ -11,8 +11,8 @@
 from __future__ import annotations
 
 import selectors
-from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, TypeVar
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 from typing_extensions import Buffer
 
@@ -44,9 +44,6 @@ class HasUnchroot(Protocol):
     """Protocol for stripping a chroot prefix from ZooKeeper paths."""
 
     def unchroot(self, path: str) -> str: ...
-
-
-FdLike: TypeAlias = int | HasFileNo
 
 
 class Socket(HasFileNo, Protocol):
@@ -199,18 +196,13 @@ class IHandler(Protocol):
         """Stop the handler. Should block until the handler is safely
         stopped."""
 
-    def select(
-        self,
-        rlist: Iterable[FdLike],
-        wlist: Iterable[FdLike],
-        xlist: Iterable[FdLike],
-        timeout: float | None = None,
-    ) -> tuple[Iterable[FdLike], Iterable[FdLike], Iterable[FdLike]]:
-        """A select method that implements Python's select.select
-        API"""
-
     def create_selector(self) -> selectors.BaseSelector:
-        """Return a new selector instance appropriate for this handler."""
+        """Return a new persistent :class:`selectors.BaseSelector` appropriate
+        for this handler.
+
+        This is the sole socket readiness-polling primitive on
+        :class:`IHandler`.
+        """
         return selectors.DefaultSelector()
 
     def yield_control(self) -> None:

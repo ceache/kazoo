@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import selectors
 import sys
 from collections.abc import Generator
 from typing import TYPE_CHECKING, Any, Literal
@@ -187,12 +188,15 @@ class TestEventletHandler:
             sock = create_tcp_socket(socket)
             fd = sock.fileno()
             socks.append(sock)
-        with start_stop_one() as h:
-            h.start()
-            h.select(socks, [], [], 0)
-            h.stop()
-        for sock in socks:
-            sock.close()
+        try:
+            with start_stop_one() as h:
+                with h.create_selector() as sel:
+                    for sock in socks:
+                        sel.register(sock, selectors.EVENT_READ)
+                    sel.select(0)
+        finally:
+            for sock in socks:
+                sock.close()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="does not run on windows")

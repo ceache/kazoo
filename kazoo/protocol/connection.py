@@ -256,7 +256,6 @@ class ConnectionHandler:
         self._socket: Socket | None = None
         self._ssl_socket: ssl.SSLSocket | None = None
         self._selector: selectors.BaseSelector | None = None
-        self._write_selector: selectors.BaseSelector | None = None
         self._requests: RequestManager = client._request_manager
         self._watchers: WatcherManager = client._watcher_manager
         self._packet_router = PacketRouter(
@@ -347,18 +346,8 @@ class ConnectionHandler:
         self._update_io_interest(selectors.EVENT_READ, "zk_socket")
         self._update_io_interest(selectors.EVENT_READ, "wakeup")
 
-    def _close_write_selector(self) -> None:
-        """Close the lazy write-readiness selector if active."""
-        if self._write_selector is not None:
-            try:
-                self._write_selector.close()
-            except Exception:
-                pass
-            self._write_selector = None
-
     def _close_selector(self) -> None:
         """Close the persistent selector if active."""
-        self._close_write_selector()
         if self._selector is not None:
             try:
                 self._selector.close()
@@ -375,7 +364,6 @@ class ConnectionHandler:
 
     def _close_socket(self) -> None:
         """Unregister and close the active transport socket."""
-        self._close_write_selector()
         self._update_io_interest(0, "zk_socket")
         if self._socket is not None:
             try:
@@ -434,6 +422,47 @@ class ConnectionHandler:
         if has_zk:
             return _READY_BOTH if has_wakeup else _READY_ZK
         return _READY_WAKEUP if has_wakeup else _READY_EMPTY
+
+    @contextmanager
+    def _socket_io_wait(self) -> Iterator[Callable[[int, float], bool]]:
+        """Temporarily dedicate ``self._selector`` to single-socket waiting.
+
+        Unregisters ``wakeup`` for the duration of a blocking partial-write or
+        TLS renegotiation wait (leaving unread wake bytes untouched in
+        ``_read_sock`` so they neither busy-spin the level-triggered selector
+        nor get lost), switches ``self._socket`` between ``EVENT_WRITE`` and
+        ``EVENT_READ`` via ``modify()`` only when direction changes, and
+        restores ``zk_socket`` (``EVENT_READ``) and ``wakeup`` on exit.
+        """
+        sel = self._selector
+        sock = self._socket
+        if sock is None:
+            raise ConnectionDropped("socket closed")
+        assert sel is not None
+
+        wakeup_was_registered = self._wakeup_registered
+        if wakeup_was_registered:
+            self._update_io_interest(0, "wakeup")
+
+        current_events = selectors.EVENT_READ
+
+        def wait(events: int, timeout: float) -> bool:
+            nonlocal current_events
+            if events != current_events:
+                sel.modify(sock, events, data="zk_socket")
+                current_events = events
+            return bool(sel.select(timeout))
+
+        try:
+            yield wait
+        finally:
+            if current_events != selectors.EVENT_READ and self._socket is sock:
+                try:
+                    sel.modify(sock, selectors.EVENT_READ, data="zk_socket")
+                except (KeyError, ValueError, OSError):
+                    pass
+            if wakeup_was_registered and self._read_sock is not None:
+                self._update_io_interest(selectors.EVENT_READ, "wakeup")
 
     def _dispose_sasl(self) -> None:
         """Dispose of active SASL exchange if present."""
@@ -758,15 +787,15 @@ class ConnectionHandler:
                         )
                         write_deadline = now + eff
                     rem = write_deadline - now
-                    if (
-                        rem <= 0.0
-                        or not self.handler.select(
-                            [], [cast("Socket", self._socket)], [], rem
-                        )[1]
-                    ):
+                    if rem <= 0.0:
                         raise self.handler.timeout_exception(
                             "socket time-out during read"
                         )
+                    with self._socket_io_wait() as wait:
+                        if not wait(selectors.EVENT_WRITE, rem):
+                            raise self.handler.timeout_exception(
+                                "socket time-out during read"
+                            )
                     continue
                 raise
 
@@ -802,9 +831,9 @@ class ConnectionHandler:
     ) -> None:
         """Write raw bytes to the socket.
 
-        Attempts an optimistic non-blocking send first for the fast-path.
-        If a partial send occurs or socket buffer is full, drains the
-        remainder using handler.select bounded by timeout.
+        Attempts an optimistic non-blocking write first for the fast-path.
+        If a partial write occurs or socket buffer is full, drains the
+        remainder using the persistent selector bounded by timeout.
         """
         if self._socket is None:
             raise ConnectionDropped("socket closed")
@@ -843,64 +872,44 @@ class ConnectionHandler:
             # Slow-path: partial write or buffer full, drain bounded by timeout
             eff_timeout = self._connect_timeout if timeout is None else timeout
             deadline = time.monotonic() + eff_timeout
-            write_sel: selectors.BaseSelector | None = None
-            if self._selector is not None:
-                if self._write_selector is None:
-                    wsel = self.handler.create_selector()
+            with self._socket_io_wait() as wait:
+                while sent < msg_length:
+                    rem_timeout = deadline - time.monotonic()
+                    if rem_timeout <= 0.0:
+                        raise self.handler.timeout_exception(
+                            "socket time-out during write"
+                        )
+                    events = (
+                        selectors.EVENT_READ
+                        if want_read
+                        else selectors.EVENT_WRITE
+                    )
+                    if not wait(events, rem_timeout):
+                        raise self.handler.timeout_exception(
+                            "socket time-out during write"
+                        )
                     try:
-                        wsel.register(self._socket, selectors.EVENT_WRITE)
-                    except Exception:
-                        wsel.close()
-                        raise
-                    self._write_selector = wsel
-                write_sel = self._write_selector
-
-            while sent < msg_length:
-                rem_timeout = deadline - time.monotonic()
-                if rem_timeout <= 0.0:
-                    raise self.handler.timeout_exception(
-                        "socket time-out during write"
-                    )
-                if want_read:
-                    is_ready = bool(
-                        self.handler.select(
-                            [self._socket], [], [], rem_timeout
-                        )[0]
-                    )
-                elif write_sel is not None:
-                    is_ready = bool(write_sel.select(rem_timeout))
-                else:
-                    is_ready = bool(
-                        self.handler.select(
-                            [], [self._socket], [], rem_timeout
-                        )[1]
-                    )
-                if not is_ready:
-                    raise self.handler.timeout_exception(
-                        "socket time-out during write"
-                    )
-                try:
-                    with view[sent:] as chunk:
-                        bytes_sent = write_fn(chunk)
-                except BlockingIOError:
-                    want_read = False
-                    continue
-                except ssl.SSLError as e:
-                    if e.errno == ssl.SSL_ERROR_WANT_READ:
-                        want_read = True
-                        continue
-                    if e.errno == ssl.SSL_ERROR_WANT_WRITE:
+                        with view[sent:] as chunk:
+                            bytes_sent = write_fn(chunk)
+                    except BlockingIOError:
                         want_read = False
                         continue
-                    raise
-                except OSError as e:
-                    raise ConnectionDropped(
-                        f"socket connection error: {e}"
-                    ) from e
-                if not bytes_sent:
-                    raise ConnectionDropped("socket connection broken")
-                want_read = False
-                sent += bytes_sent
+                    except ssl.SSLError as e:
+                        if e.errno == ssl.SSL_ERROR_WANT_READ:
+                            want_read = True
+                            continue
+                        if e.errno == ssl.SSL_ERROR_WANT_WRITE:
+                            want_read = False
+                            continue
+                        raise
+                    except OSError as e:
+                        raise ConnectionDropped(
+                            f"socket connection error: {e}"
+                        ) from e
+                    if not bytes_sent:
+                        raise ConnectionDropped("socket connection broken")
+                    want_read = False
+                    sent += bytes_sent
 
     def _set_client_last_zxid(self, zxid: int) -> None:
         self.client.last_zxid = zxid
