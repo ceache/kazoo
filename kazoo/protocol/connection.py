@@ -9,7 +9,6 @@ import socket
 import ssl
 import time
 from binascii import hexlify
-from collections import defaultdict, deque
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from typing import (
@@ -21,21 +20,12 @@ from typing import (
 )
 
 from kazoo.exceptions import (
-    EXCEPTIONS,
     AuthFailedError,
     ConnectionDropped,
-    ConnectionLoss,
     InvalidStateTransitionError,
-    KazooException,
-    NoNodeError,
-    OperationTimeoutError,
-    ReplyTooLargeError,
     SASLException,
     SessionClosedRequireSaslError,
     SessionExpiredError,
-    SessionMovedError,
-    ThrottledOpError,
-    _error_for_code,
 )
 from kazoo.loggingsupport import BLATHER
 from kazoo.protocol.sasl import (
@@ -45,35 +35,38 @@ from kazoo.protocol.sasl import (
 from kazoo.protocol.serialization import (
     JUTE_MAX_BUFFER,
     SASL,
-    AddWatch,
     Auth,
-    AuthResponse,
     Close,
     Connect,
-    Exists,
     FrameDecoder,
-    GetChildren,
-    GetChildren2,
     Ping,
-    PingResponse,
-    RemoveWatches,
     ReservedXID,
     ResponsePacket,
-    SASLResponse,
-    Transaction,
     WatchPacket,
+)
+from kazoo.protocol.session import (
+    _CONNECTION_DROP,
+    _SESSION_EXPIRED,
+    CHANGED_EVENT,
+    CHILD_EVENT,
+    CLOSE_RESPONSE,
+    CREATED_EVENT,
+    DELETED_EVENT,
+    STOP_CONNECTING,
+    PacketRouter,
+    RequestManager,
+    RWProbeSchedule,
+    RWServerAvailable,
+    WatcherManager,
+    _exception_to_event,
 )
 from kazoo.protocol.statemachine import (
     HEARTBEAT_DEADLINE_REACHED,
-    PING_RECEIVED,
     POLL_TIMEOUT_EXPIRED,
     SOCKET_READABLE,
     WAKEUP_SIGNALED,
     Authenticating,
     AuthFailed,
-    AuthFailedEvent,
-    AuthPacketCompleted,
-    AuthStage,
     ClientEvent,
     CloseSocket,
     ConfigureReadOnlyMode,
@@ -81,8 +74,6 @@ from kazoo.protocol.statemachine import (
     ConnectAttemptStarted,
     Connected,
     ConnectedReadOnly,
-    ConnectionLostEvent,
-    ConnectResponseReceived,
     DrainWakeupPipe,
     EnqueueCloseRequest,
     Handshaking,
@@ -90,15 +81,12 @@ from kazoo.protocol.statemachine import (
     ReadConnectResponsePacket,
     ReadSocketPacket,
     ResetSessionData,
-    RWServerFoundEvent,
-    SASLChallengeReceived,
     SASLCompleted,
     SendAuthPacket,
     SendConnectPacket,
     SendHeartbeatPing,
     SessionClosedEvent,
     SessionEstablished,
-    SessionExpiredEvent,
     SideEffect,
     SocketConnected,
     StartRequested,
@@ -106,14 +94,6 @@ from kazoo.protocol.statemachine import (
     StepSASLHandshake,
     StopConnectionLoop,
     UpdateSessionData,
-)
-from kazoo.protocol.states import (
-    EVENT_TYPE_MAP,
-    AddWatchMode,
-    Callback,
-    KeeperState,
-    WatchedEvent,
-    WatcherType,
 )
 from kazoo.retry import (
     ForceRetryError,
@@ -123,267 +103,35 @@ from kazoo.retry import (
 
 if TYPE_CHECKING:
     from kazoo.client import KazooClient, WatchFunc
-    from kazoo.interfaces import IAsyncResult, Socket, Threadlike
+    from kazoo.interfaces import Socket, Threadlike
     from kazoo.protocol.serialization import ServerPacket
 
 
 log = logging.getLogger(__name__)
 
-
-# Special testing hook objects used to force a session expired error as
-# if it came from the server
-_SESSION_EXPIRED = object()
-_CONNECTION_DROP = object()
-
-STOP_CONNECTING = object()
-
-CREATED_EVENT = 1
-DELETED_EVENT = 2
-CHANGED_EVENT = 3
-CHILD_EVENT = 4
-
-CLOSE_RESPONSE = Close.type
+# Re-exported from kazoo.protocol.session for backwards compatibility
+__all__ = (
+    "CHANGED_EVENT",
+    "CHILD_EVENT",
+    "CLOSE_RESPONSE",
+    "CREATED_EVENT",
+    "DELETED_EVENT",
+    "STOP_CONNECTING",
+    "ConnectionHandler",
+    "RequestManager",
+    "RWPinger",
+    "RWServerAvailable",
+    "WatcherManager",
+    "_CONNECTION_DROP",
+    "_SESSION_EXPIRED",
+    "_exception_to_event",
+)
 
 # Micro-optimization: reuse ping instance and pre-encoded ping wire frame
 _PingInstance = Ping()
 _PING_FRAME = FrameDecoder.encode_request(_PingInstance, ReservedXID.PING)
 # Cap per-write coalesced outbound frame batch size at 64 KiB
 _SEND_BATCH_MAX = 64 * 1024
-
-
-class RequestManager:
-    """Encapsulates client request queuing, in-flight pending requests, and
-    XID sequence generation.
-    """
-
-    __slots__ = ("queue", "pending", "auth_pending", "xid")
-
-    def __init__(self) -> None:
-        self.queue: deque[tuple[Any, IAsyncResult | None]] = deque()
-        self.pending: deque[tuple[Any, IAsyncResult | None, int]] = deque()
-        self.auth_pending: deque[IAsyncResult | None] = deque()
-        self.xid: int | None = None
-
-    def reset_xid(self, value: int = 0) -> None:
-        """Reset the XID counter for a new connection attempt."""
-        self.xid = value
-
-    def next_xid(self) -> int:
-        """Advance and return the next positive 31-bit XID."""
-        self.xid = ((self.xid or 0) % 2147483647) + 1
-        return self.xid
-
-    def enqueue(
-        self, request: Any, async_object: IAsyncResult | None = None
-    ) -> None:
-        """Append a request and its completion handle to the send queue."""
-        self.queue.append((request, async_object))
-
-    def remove_queued(
-        self, request: Any, async_object: IAsyncResult | None
-    ) -> None:
-        """Remove a specific request pair from the send queue if present.
-
-        Uses O(n) ``deque.remove``; for rare wake-failure cleanup only.
-        """
-        try:
-            self.queue.remove((request, async_object))
-        except ValueError:
-            pass
-
-    def peek_queued(self) -> tuple[Any, IAsyncResult | None]:
-        """Return the head of the send queue without removing it."""
-        return self.queue[0]
-
-    def dequeue_to_pending(self, xid: int) -> tuple[Any, IAsyncResult | None]:
-        """Pop the oldest queued request and record it as pending with xid."""
-        request, async_object = self.queue.popleft()
-        if xid == ReservedXID.AUTH:
-            self.auth_pending.append(async_object)
-        else:
-            self.pending.append((request, async_object, xid))
-        return request, async_object
-
-    def pop_pending(self) -> tuple[Any, IAsyncResult | None, int]:
-        """Pop and return the oldest in-flight pending request."""
-        return self.pending.popleft()
-
-    def pop_auth_pending(
-        self, auth_xid: int = ReservedXID.AUTH
-    ) -> IAsyncResult | None:
-        """Pop the oldest pending Auth request (or fallback scan pending)."""
-        if self.auth_pending:
-            return self.auth_pending.popleft()
-        pending = self.pending
-        for idx, (_, a_obj, xid) in enumerate(pending):
-            if xid == auth_xid:
-                del pending[idx]
-                return a_obj
-        return None
-
-    def has_send_capacity(self, limit: int | None) -> bool:
-        """Return True if the number of pending requests is below limit."""
-        return (
-            limit is None or len(self.pending) + len(self.auth_pending) < limit
-        )
-
-    def fail_all(self, state: KeeperState) -> None:
-        """Fail all pending and queued requests with the state's exception."""
-        exc: KazooException
-        if state == KeeperState.AUTH_FAILED:
-            exc = AuthFailedError()
-        elif state == KeeperState.EXPIRED_SESSION:
-            exc = SessionExpiredError()
-        else:
-            exc = ConnectionLoss()
-
-        pending = self.pending
-        while True:
-            try:
-                _, async_object, _ = pending.popleft()
-                if async_object:
-                    async_object.set_exception(exc)
-            except IndexError:
-                break
-
-        auth_pending = self.auth_pending
-        while True:
-            try:
-                async_object = auth_pending.popleft()
-                if async_object:
-                    async_object.set_exception(exc)
-            except IndexError:
-                break
-
-        queue = self.queue
-        while True:
-            try:
-                _, async_object = queue.popleft()
-                if async_object:
-                    async_object.set_exception(exc)
-            except IndexError:
-                break
-
-    def reset(self, state: KeeperState | None = None) -> None:
-        """Fail any remaining requests and reinitialize fresh deques."""
-        if state is not None:
-            self.fail_all(state)
-        self.queue = deque()
-        self.pending = deque()
-        self.auth_pending = deque()
-
-
-class WatcherManager:
-    """Encapsulates client data, child, persistent, and recursive watchers."""
-
-    __slots__ = (
-        "child_watchers",
-        "data_watchers",
-        "persistent_watchers",
-        "persistent_recursive_watchers",
-    )
-
-    def __init__(self) -> None:
-        self.child_watchers: defaultdict[str, set[WatchFunc]] = defaultdict(
-            set
-        )
-        self.data_watchers: defaultdict[str, set[WatchFunc]] = defaultdict(set)
-        self.persistent_watchers: defaultdict[str, set[WatchFunc]] = (
-            defaultdict(set)
-        )
-        self.persistent_recursive_watchers: defaultdict[
-            str, set[WatchFunc]
-        ] = defaultdict(set)
-
-    def find_persistent_recursive(self, path: str) -> list[WatchFunc]:
-        """Return persistent recursive watchers matching path or ancestors."""
-        pr_watchers = self.persistent_recursive_watchers
-        if not pr_watchers:
-            return []
-        watchers: list[WatchFunc] = []
-        candidates = ["/"]
-        stripped = path.strip("/")
-        if stripped:
-            parts = stripped.split("/")
-            candidates.extend(
-                "/" + "/".join(parts[: i + 1]) for i in range(len(parts))
-            )
-        for candidate in candidates:
-            watchers.extend(pr_watchers.get(candidate, []))
-        return watchers
-
-    def collect_for_event(
-        self, watch_type: int, path: str
-    ) -> list[WatchFunc] | None:
-        """Pop one-shot watchers and collect persistent watchers for event."""
-        watchers: list[WatchFunc] = []
-        if watch_type in (CREATED_EVENT, CHANGED_EVENT):
-            watchers.extend(self.data_watchers.pop(path, []))
-            watchers.extend(self.persistent_watchers.get(path, []))
-            watchers.extend(self.find_persistent_recursive(path))
-        elif watch_type == DELETED_EVENT:
-            watchers.extend(self.data_watchers.pop(path, []))
-            watchers.extend(self.child_watchers.pop(path, []))
-            watchers.extend(self.persistent_watchers.get(path, []))
-            watchers.extend(self.find_persistent_recursive(path))
-        elif watch_type == CHILD_EVENT:
-            watchers.extend(self.child_watchers.pop(path, []))
-            watchers.extend(self.persistent_watchers.get(path, []))
-        else:
-            return None
-        return watchers
-
-    def update_for_response(self, request: Any) -> None:
-        """Register or remove watchers after a successful request response."""
-        watcher = getattr(request, "watcher", None)
-        if watcher:
-            if isinstance(request, AddWatch):
-                if request.mode == AddWatchMode.PERSISTENT:
-                    self.persistent_watchers[request.path].add(watcher)
-                elif request.mode == AddWatchMode.PERSISTENT_RECURSIVE:
-                    self.persistent_recursive_watchers[request.path].add(
-                        watcher
-                    )
-                else:
-                    raise ValueError(
-                        f"Unexpected AddWatchMode: {request.mode}"
-                    )
-            elif isinstance(request, (GetChildren, GetChildren2)):
-                self.child_watchers[request.path].add(watcher)
-            else:
-                self.data_watchers[request.path].add(watcher)
-        if isinstance(request, RemoveWatches):
-            if request.watcher_type == WatcherType.CHILDREN:
-                self.child_watchers.pop(request.path, None)
-            elif request.watcher_type == WatcherType.DATA:
-                self.data_watchers.pop(request.path, None)
-            elif request.watcher_type == WatcherType.ANY:
-                self.child_watchers.pop(request.path, None)
-                self.data_watchers.pop(request.path, None)
-                self.persistent_watchers.pop(request.path, None)
-                self.persistent_recursive_watchers.pop(request.path, None)
-            else:
-                raise ValueError(
-                    f"Unexpected WatcherType: {request.watcher_type}"
-                )
-
-    def reset(self) -> list[WatchFunc]:
-        """Clear all watcher tables and return previously registered ones."""
-        watchers: list[WatchFunc] = []
-        for child_w in self.child_watchers.values():
-            watchers.extend(child_w)
-        for data_w in self.data_watchers.values():
-            watchers.extend(data_w)
-        for pers_w in self.persistent_watchers.values():
-            watchers.extend(pers_w)
-        for pr_w in self.persistent_recursive_watchers.values():
-            watchers.extend(pr_w)
-
-        self.child_watchers = defaultdict(set)
-        self.data_watchers = defaultdict(set)
-        self.persistent_watchers = defaultdict(set)
-        self.persistent_recursive_watchers = defaultdict(set)
-        return watchers
 
 
 class RWPinger:
@@ -410,100 +158,62 @@ class RWPinger:
     ):
         self.hosts = hosts
         self.connection = connection_func
-        self.last_attempt: float | None = None
+        self.schedule = RWProbeSchedule(hosts)
         self.socket_handling = socket_handling
         self.timeout = timeout
         self.logger = logger or log
 
+    @property
+    def last_attempt(self) -> float | None:
+        return self.schedule.last_attempt
+
+    @last_attempt.setter
+    def last_attempt(self, value: float | None) -> None:
+        self.schedule.last_attempt = value
+
     def __iter__(
         self,
     ) -> Iterator[tuple[str, str, int] | Literal[False]]:
-        delay = 0.5
+        sched = self.schedule
         while True:
-            if self.last_attempt is not None:
-                jitter = random.randint(0, 100) / 100.0
-                while time.monotonic() < self.last_attempt + delay + jitter:
-                    # Skip rw ping checks if its too soon
-                    yield False
-                delay = min(delay * 2, 60.0)
-            for idx, (host, hostip, port) in enumerate(self.hosts):
-                self.logger.debug(
-                    "Pinging server for r/w: %s(%s):%s",
-                    host,
-                    hostip,
-                    port,
-                )
-                self.last_attempt = time.monotonic()
-                rw_host: tuple[str, str, int] | None = None
-                try:
-                    with self.socket_handling():
-                        sock = self.connection(
-                            host, hostip, port, self.timeout
-                        )
-                        try:
-                            sock.settimeout(self.timeout)
-                            sock.sendall(b"isro")
-                            result = sock.recv(8192)
-                        finally:
-                            sock.close()
-                        if result == b"rw":
-                            rw_host = (host, hostip, port)
-                except (OSError, ConnectionDropped):
-                    pass
+            endpoint = sched.next_host(
+                time.monotonic(), lambda: random.randint(0, 100) / 100.0
+            )
+            if endpoint is None:
+                yield False
+                continue
+            host, hostip, port = endpoint
+            self.logger.debug(
+                "Pinging server for r/w: %s(%s):%s",
+                host,
+                hostip,
+                port,
+            )
+            rw_host: tuple[str, str, int] | None = None
+            try:
+                with self.socket_handling():
+                    sock = self.connection(host, hostip, port, self.timeout)
+                    try:
+                        sock.settimeout(self.timeout)
+                        sock.sendall(b"isro")
+                        result = sock.recv(8192)
+                    finally:
+                        sock.close()
+                    if result == b"rw":
+                        rw_host = (host, hostip, port)
+            except (OSError, ConnectionDropped):
+                pass
 
-                if rw_host is not None:
-                    delay = 0.5
-                    yield rw_host
-                elif idx < len(self.hosts) - 1:
-                    # Probe at most one endpoint per heartbeat tick.
-                    yield False
-            # No RW server found in this pass; retry after back-off.
-            self.last_attempt = time.monotonic()
-            yield False
-
-
-class RWServerAvailable(Exception):
-    """Thrown if a RW Server becomes available"""
+            if rw_host is not None:
+                sched.mark_found()
+                sched.finish_probe(time.monotonic())
+                yield rw_host
+            else:
+                sched.finish_probe(time.monotonic())
+                yield False
 
 
 ReturnValue = TypeVar("ReturnValue")
-
-
-def _exception_to_event(
-    exc: BaseException,
-    timeout_exception: type[BaseException],
-    session_id: int | None,
-    rw_server: tuple[str, int] | None,
-    logger: logging.Logger,
-) -> tuple[ClientEvent, bool, bool] | None:
-    """Map an I/O error to ``(event, reset_retry, stop_connecting)``.
-
-    Returns ``None`` if ``exc`` is not a handled connection exception.
-    """
-    if isinstance(exc, timeout_exception):
-        logger.warning("Connection time-out: %s", exc)
-        return ConnectionLostEvent(reason=str(exc)), False, False
-    if isinstance(exc, (OSError, ConnectionDropped)):
-        logger.warning("Connection dropped: %s", exc)
-        return ConnectionLostEvent(reason=str(exc)), False, False
-    if isinstance(
-        exc,
-        (AuthFailedError, SASLException, SessionClosedRequireSaslError),
-    ):
-        if isinstance(exc, SessionClosedRequireSaslError):
-            logger.warning(
-                "AUTH_FAILED closing (server requires SASL auth): %s", exc
-            )
-        else:
-            logger.warning("AUTH_FAILED closing: %s", exc)
-        return AuthFailedEvent(error=exc), True, True
-    if isinstance(exc, SessionExpiredError):
-        logger.warning("Session has expired")
-        return SessionExpiredEvent(session_id=session_id), True, False
-    if isinstance(exc, RWServerAvailable):
-        logger.warning("Found a RW server, dropping connection")
-        return RWServerFoundEvent(server=rw_server), True, False
-    return None
 
 
 class ConnectionHandler:
@@ -540,6 +250,19 @@ class ConnectionHandler:
         self._write_selector: selectors.BaseSelector | None = None
         self._requests: RequestManager = client._request_manager
         self._watchers: WatcherManager = client._watcher_manager
+        self._packet_router = PacketRouter(
+            requests=self._requests,
+            watchers=self._watchers,
+            get_state=lambda: self.client._state_machine.state,
+            get_keeper_state=lambda: self.client.client_state,
+            set_last_zxid=self._set_client_last_zxid,
+            unchroot=lambda path: self.client.unchroot(path),
+            emit_event=lambda ev: self._emit_event(ev),
+            dispatch_watch=lambda cb: self.client.handler.dispatch_callback(
+                cb
+            ),
+            logger=self.logger,
+        )
         self._frame_decoder = FrameDecoder(
             max_buffer=max_buffer,
             pop_pending=self._requests.pop_pending,
@@ -1101,237 +824,27 @@ class ConnectionHandler:
                 raise ConnectionDropped("socket connection broken")
             sent += bytes_sent
 
+    def _set_client_last_zxid(self, zxid: int) -> None:
+        self.client.last_zxid = zxid
+
     def _find_persistent_recursive_watchers(
         self, path: str
     ) -> list[WatchFunc]:
         return self._watchers.find_persistent_recursive(path)
 
     def _read_watch_event(self, watch: WatchPacket) -> None:
-        client = self.client
-        path = watch.path
-
-        if self.logger.isEnabledFor(logging.DEBUG):
-            self.logger.debug("Received EVENT: %s", watch)
-
-        watchers = self._watchers.collect_for_event(watch.type, path)
-        if watchers is None:
-            self.logger.warning("Received unknown event %r", watch.type)
-            return
-        if not watchers:
-            return
-
-        # Strip the chroot if needed
-        path = client.unchroot(path)
-        ev = WatchedEvent(
-            EVENT_TYPE_MAP[watch.type], client.client_state, path, watch.zxid
-        )
-
-        # Last check to ignore watches if we've been stopped or terminated
-        if self._is_terminal:
-            return
-
-        # Dump the watchers to the watch thread
-        for watch1 in watchers:
-            client.handler.dispatch_callback(Callback("watch", watch1, (ev,)))
+        self._packet_router.read_watch_event(watch)
 
     def _update_watchers_for_response(self, request: Any) -> None:
         """Register or remove client watchers after a successful response."""
         self._watchers.update_for_response(request)
 
     def _read_response(self, packet: ResponsePacket) -> object | None:
-        client = self.client
-        header = packet.header
-        request = packet.request
-        async_object = packet.async_object
-        xid = header.xid
-        if header.zxid and header.zxid > 0:
-            client.last_zxid = header.zxid
-
-        if packet.error is not None:
-            if isinstance(packet.error, ReplyTooLargeError):
-                self.logger.debug(
-                    "Received error(xid=%s) %r", xid, packet.error
-                )
-            else:
-                self.logger.error(
-                    "Exception raised during deserialization of request: %s",
-                    request,
-                    exc_info=packet.error,
-                )
-            if async_object is not None:
-                async_object.set_exception(packet.error)
-            if isinstance(request, Close):
-                self.logger.log(BLATHER, "Read close response")
-                self._emit_event(SessionClosedEvent())
-                return CLOSE_RESPONSE
-            return None
-
-        # Determine if its an exists request and a no node error
-        exists_error = (
-            header.err == NoNodeError.code and request.type == Exists.type
-        )
-
-        # Set the exception if its not an exists error
-        if header.err and not exists_error:
-            callback_exception = _error_for_code(header.err)
-            if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug(
-                    "Received error(xid=%s) %r", xid, callback_exception
-                )
-            if async_object:
-                async_object.set_exception(callback_exception)
-        elif request and async_object:
-            if exists_error:
-                # It's a NoNodeError, which is fine for an exists
-                # request
-                response = None
-            else:
-                response = packet.response
-                if self.logger.isEnabledFor(logging.DEBUG):
-                    self.logger.debug(
-                        "Received response(xid=%s): %r", xid, response
-                    )
-
-                # We special case a Transaction as we have to unchroot things
-                if request.type == Transaction.type:
-                    response = Transaction.unchroot(client, response)
-
-            # Determine if watchers should be registered or unregistered
-            if not self._is_terminal:
-                self._update_watchers_for_response(request)
-
-            async_object.set(response)
-
-        if isinstance(request, Close):
-            self.logger.log(BLATHER, "Read close response")
-            self._emit_event(SessionClosedEvent())
-            return CLOSE_RESPONSE
-        return None
+        return self._packet_router.read_response(packet)
 
     def _process_packet(self, packet: ServerPacket) -> object | None:
         """Process a decoded ServerPacket from FrameDecoder."""
-        client = self.client
-        state = client._state_machine.state
-        match packet:
-            case Connect():
-                self._emit_event(
-                    ConnectResponseReceived(connect_result=packet)
-                )
-            case PingResponse():
-                if not self._is_session_active:
-                    raise ConnectionDropped(
-                        f"Unexpected PingResponse in {type(state).__name__}"
-                    )
-                if self.logger.isEnabledFor(BLATHER):
-                    self.logger.log(BLATHER, "Received Ping")
-                self._emit_event(PING_RECEIVED)
-            case AuthResponse(zxid=zxid, err=err_code):
-                if not (
-                    self._is_session_active
-                    or (
-                        isinstance(state, Authenticating)
-                        and state.stage == AuthStage.INITIAL_AUTH
-                    )
-                ):
-                    raise ConnectionDropped(
-                        f"Unexpected AuthResponse in {type(state).__name__}"
-                    )
-                self.logger.log(BLATHER, "Received AUTH")
-                if zxid and zxid > 0:
-                    client.last_zxid = zxid
-                async_object = self._requests.pop_auth_pending(
-                    ReservedXID.AUTH
-                )
-                if err_code:
-                    err = (
-                        EXCEPTIONS[err_code]()
-                        if err_code in EXCEPTIONS
-                        else AuthFailedError(f"Auth error {err_code}")
-                    )
-                    if async_object is not None:
-                        async_object.set_exception(err)
-                    if isinstance(err, SessionExpiredError):
-                        raise err
-                    if isinstance(
-                        err,
-                        (
-                            ConnectionLoss,
-                            OperationTimeoutError,
-                            SessionMovedError,
-                            ThrottledOpError,
-                        ),
-                    ):
-                        raise ConnectionDropped(
-                            f"Transient auth error: {err!r}"
-                        ) from err
-                    self._emit_event(AuthFailedEvent(error=err))
-                else:
-                    if async_object is not None:
-                        async_object.set(True)
-                    self._emit_event(AuthPacketCompleted())
-            case WatchPacket():
-                if not self._is_session_active:
-                    raise ConnectionDropped(
-                        f"Unexpected WatchPacket in {type(state).__name__}"
-                    )
-                self._read_watch_event(packet)
-            case SASLResponse(
-                xid=xid, zxid=zxid, err=err_code, challenge=challenge
-            ):
-                if not (
-                    isinstance(state, Authenticating)
-                    and state.stage == AuthStage.SASL
-                ):
-                    raise ConnectionDropped(
-                        f"Unexpected SASLResponse in {type(state).__name__}"
-                    )
-                if zxid > 0:
-                    client.last_zxid = zxid
-                if err_code:
-                    if err_code not in EXCEPTIONS:
-                        raise AuthFailedError(f"SASL error {err_code}")
-                    callback_exception = EXCEPTIONS[err_code]()
-                    self.logger.debug(
-                        "Received error(xid=%s) %r",
-                        xid,
-                        callback_exception,
-                    )
-                    if isinstance(
-                        callback_exception,
-                        (
-                            AuthFailedError,
-                            SessionClosedRequireSaslError,
-                            SessionExpiredError,
-                        ),
-                    ):
-                        raise callback_exception
-                    if isinstance(
-                        callback_exception,
-                        (
-                            ConnectionLoss,
-                            OperationTimeoutError,
-                            SessionMovedError,
-                            ThrottledOpError,
-                        ),
-                    ):
-                        raise ConnectionDropped(
-                            f"Transient SASL error: {callback_exception!r}"
-                        ) from callback_exception
-                    raise AuthFailedError(
-                        f"SASL error: {callback_exception!r}"
-                    ) from callback_exception
-                self._emit_event(SASLChallengeReceived(challenge=challenge))
-            case ResponsePacket():
-                if not self._is_session_active:
-                    raise ConnectionDropped(
-                        f"Unexpected ResponsePacket in {type(state).__name__}"
-                    )
-                if self.logger.isEnabledFor(BLATHER):
-                    self.logger.log(
-                        BLATHER, "Reading for header %r", packet.header
-                    )
-                return self._read_response(packet)
-        return None
+        return self._packet_router.process_packet(packet)
 
     def _read_socket(
         self,

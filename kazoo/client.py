@@ -29,11 +29,7 @@ from kazoo.handlers.threading import SequentialThreadingHandler
 from kazoo.handlers.utils import capture_exceptions, wrap
 from kazoo.hosts import collect_hosts
 from kazoo.loggingsupport import BLATHER
-from kazoo.protocol.connection import (
-    ConnectionHandler,
-    RequestManager,
-    WatcherManager,
-)
+from kazoo.protocol.connection import ConnectionHandler
 from kazoo.protocol.paths import _prefix_root, normpath
 from kazoo.protocol.paths import unchroot as _unchroot
 from kazoo.protocol.sasl import SASLConfig
@@ -59,6 +55,7 @@ from kazoo.protocol.serialization import (
     Sync,
     Transaction,
 )
+from kazoo.protocol.session import RequestManager, WatcherManager
 from kazoo.protocol.statemachine import (
     AuthFailed,
     ClientEvent,
@@ -105,7 +102,7 @@ if TYPE_CHECKING:
     from types import TracebackType
     from typing import Annotated
 
-    from kazoo.interfaces import IAsyncResult, IHandler
+    from kazoo.interfaces import IAsyncResult, ICompletion, IHandler
     from kazoo.protocol.states import ZnodeStat
 
     class _Gt:
@@ -578,20 +575,22 @@ class KazooClient:
             )
 
     @property
-    def _queue(self) -> deque[tuple[Any, IAsyncResult | None]]:
+    def _queue(self) -> deque[tuple[Any, ICompletion[Any] | None]]:
         return self._request_manager.queue
 
     @_queue.setter
-    def _queue(self, value: deque[tuple[Any, IAsyncResult | None]]) -> None:
+    def _queue(
+        self, value: deque[tuple[Any, ICompletion[Any] | None]]
+    ) -> None:
         self._request_manager.queue = value
 
     @property
-    def _pending(self) -> deque[tuple[Any, IAsyncResult | None, int]]:
+    def _pending(self) -> deque[tuple[Any, ICompletion[Any] | None, int]]:
         return self._request_manager.pending
 
     @_pending.setter
     def _pending(
-        self, value: deque[tuple[Any, IAsyncResult | None, int]]
+        self, value: deque[tuple[Any, ICompletion[Any] | None, int]]
     ) -> None:
         self._request_manager.pending = value
 
