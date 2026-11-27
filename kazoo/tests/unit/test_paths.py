@@ -88,3 +88,11 @@ class TestNormRoot:
         assert paths._norm_root("/") == "/"
         assert paths._norm_root("//a") == "/a"
         assert paths._norm_root("//a./b") == "/a./b"
+
+
+class TestUnchroot:
+    def test_unchroot(self) -> None:
+        assert paths.unchroot("", "/a/b") == "/a/b"
+        assert paths.unchroot("/app", "/app") == "/"
+        assert paths.unchroot("/app", "/app/node") == "/node"
+        assert paths.unchroot("/app", "/other/node") == "/other/node"

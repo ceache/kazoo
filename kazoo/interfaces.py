@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import selectors
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, TypeVar
 
 from typing_extensions import Buffer
 
@@ -28,6 +28,22 @@ class HasFileNo(Protocol):
     """Protocol for objects that support a fileno method."""
 
     def fileno(self) -> int: ...
+
+
+T_contra = TypeVar("T_contra", contravariant=True)
+
+
+class ICompletion(Protocol[T_contra]):
+    """Minimal completion handle resolved or failed by protocol decoding."""
+
+    def set(self, value: T_contra, /) -> None: ...
+    def set_exception(self, exception: Exception, /) -> None: ...
+
+
+class HasUnchroot(Protocol):
+    """Protocol for stripping a chroot prefix from ZooKeeper paths."""
+
+    def unchroot(self, path: str) -> str: ...
 
 
 FdLike: TypeAlias = int | HasFileNo

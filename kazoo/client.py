@@ -35,6 +35,7 @@ from kazoo.protocol.connection import (
     WatcherManager,
 )
 from kazoo.protocol.paths import _prefix_root, normpath
+from kazoo.protocol.paths import unchroot as _unchroot
 from kazoo.protocol.sasl import SASLConfig
 from kazoo.protocol.serialization import (
     JUTE_MAX_BUFFER,
@@ -1146,14 +1147,7 @@ class KazooClient:
 
     def unchroot(self, path: str) -> str:
         """Strip the chroot if applicable from the path."""
-        if not self.chroot:
-            return path
-        if self.chroot == path:
-            return "/"
-        if path.startswith(self.chroot):
-            return path[len(self.chroot) :]
-        else:
-            return path
+        return _unchroot(self.chroot, path)
 
     def sync_async(self, path: str) -> IAsyncResult:
         """Asynchronous sync.

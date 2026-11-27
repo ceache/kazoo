@@ -23,8 +23,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
     from typing import Any, TypeAlias
 
-    from kazoo.client import KazooClient, WatchFunc
-    from kazoo.interfaces import IAsyncResult
+    from kazoo.client import WatchFunc
+    from kazoo.interfaces import HasUnchroot, ICompletion
 
     _TransOpsTypes: TypeAlias = (
         "Create"
@@ -48,7 +48,9 @@ if TYPE_CHECKING:
         " | ResponsePacket"
     )
 
-    PopPending: TypeAlias = Callable[[], tuple[Any, IAsyncResult | None, int]]
+    PopPending: TypeAlias = Callable[
+        [], tuple[Any, ICompletion[Any] | None, int]
+    ]
 
 
 _T = TypeVar("_T")
@@ -660,7 +662,7 @@ class Transaction:
 
     @staticmethod
     def unchroot(
-        client: KazooClient, response: list[_TransOpsResponse]
+        client: HasUnchroot, response: list[_TransOpsResponse]
     ) -> list[_TransOpsResponse]:
         resp: list[_TransOpsResponse] = []
         for result in response:
@@ -922,7 +924,7 @@ class ResponsePacket:
 
     header: ReplyHeader
     request: Any
-    async_object: IAsyncResult | None
+    async_object: ICompletion[Any] | None
     response: Any = None
     error: Exception | None = None
 
@@ -1207,7 +1209,7 @@ class FrameDecoder:
         finally:
             mv.release()
 
-    def _pop_request(self, xid: int) -> tuple[Any, IAsyncResult | None]:
+    def _pop_request(self, xid: int) -> tuple[Any, ICompletion[Any] | None]:
         """Pop the oldest pending request and verify its XID matches xid."""
         if self._pop_pending is None:
             raise ConnectionDropped(
