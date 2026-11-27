@@ -153,18 +153,18 @@ stateDiagram-v2
 
 ## 4. Connection Handler, Managers & Event Loop (`kazoo.protocol.connection`)
 
-### `RequestManager` & `WatcherManager`
+### `RequestManager` & `WatcherManager` (`kazoo.protocol.session`)
 
-* **`RequestManager`** ([kazoo/protocol/connection.py](kazoo/protocol/connection.py)):
+* **`RequestManager`** ([kazoo/protocol/session.py](kazoo/protocol/session.py)):
   * **`queue`**: `deque[(request, async_object)]` populated by caller threads in `KazooClient._call()`.
-  * **`pending` & `auth_pending`**: `pending` is `deque[(request, async_object, xid)]` populated on the I/O routine as positive-XID requests (including SASL steps) are serialized and written to the socket (`dequeue_to_pending(xid)`). **`Auth` requests use `ReservedXID.AUTH = -4`** and are tracked separately in `auth_pending: deque[IAsyncResult | None]` (`pop_auth_pending()`) so out-of-band auth replies cannot desynchronize positive-XID FIFO `pending`.
+  * **`pending` & `auth_pending`**: `pending` is `deque[(request, async_object, xid)]` populated on the I/O routine as positive-XID requests (including SASL steps) are serialized and written to the socket (`dequeue_to_pending(xid)`). **`Auth` requests use `ReservedXID.AUTH = -4`** and are tracked separately in `auth_pending: deque[ICompletion | None]` (`pop_auth_pending()`) so out-of-band auth replies cannot desynchronize positive-XID FIFO `pending`.
   * **XID discipline**: Reset to `0` at the start of every `_connect_attempt()`. Normal operations and SASL steps receive strictly increasing 31-bit XIDs via `next_xid()` (`1..2147483647`) and ZooKeeper answers them FIFO (`pop_pending()`).
   * **Rate limit**: `has_send_capacity(concurrent_request_limit)` bounds `len(pending) + len(auth_pending)`. During terminal shutdown (`_is_terminal`), `_send_request()` drains remaining queued requests (such as `Close`) even if the pipeline is saturated ([connection.py](kazoo/protocol/connection.py)).
-  * **`fail_all(keeper_state)`**: Empties `pending`, `auth_pending`, and `queue`, failing non-`None` `async_object` handles with `AuthFailedError`, `SessionExpiredError`, or `ConnectionLoss`.
-* **`WatcherManager`** ([kazoo/protocol/connection.py](kazoo/protocol/connection.py)):
+  * **`fail_in_flight(exc)` & `fail_all(keeper_state)`**: `fail_in_flight()` drains `pending` and `auth_pending` on socket teardown (clearing orphaned SASL/in-flight entries while preserving `queue`); `fail_all()` also drains `queue`, failing non-`None` completion handles with `AuthFailedError`, `SessionExpiredError`, or `ConnectionLoss`.
+* **`WatcherManager`** ([kazoo/protocol/session.py](kazoo/protocol/session.py)):
   * Maintains four `defaultdict(set)` tables: `data_watchers`, `child_watchers`, `persistent_watchers`, and `persistent_recursive_watchers`.
   * `update_for_response(request)` registers watchers only after a successful server reply (or removes them on `RemoveWatches`).
-  * `collect_for_event(watch_type, path)` pops one-shot `data_watchers` / `child_watchers` while retaining `persistent_watchers` and ancestor-matched `persistent_recursive_watchers` (short-circuiting immediately when `persistent_recursive_watchers` is empty).
+  * `collect_for_event(watch_type, path)` pops one-shot `data_watchers` / `child_watchers` while retaining `persistent_watchers` and O(d) ancestor-matched `persistent_recursive_watchers` (short-circuiting immediately when `persistent_recursive_watchers` is empty).
 
 ### Selector & Wakeup Socketpair Lifecycle
 
@@ -195,7 +195,7 @@ Why `"wakeup"` is registered per attempt and released via `_release_wakeup()`:
    * Emits `ConnectAttemptStarted`, resets `xid = 0` and `_frame_decoder.reset()`.
    * Creates TCP (optionally SSL-wrapped, reusing a cached `ssl.SSLContext` built from `TLSConfig`) socket via `handler.create_connection()`, sets non-blocking (`setblocking(False)`), caches `_ssl_socket` when SSL is active, registers `"zk_socket"` and `"wakeup"` via `_setup_selector()`.
    * Emits `SocketConnected(...)`, which triggers `SendConnectPacket` (sending the `Connect` handshake frame immediately and arming a monotonic `_phase_deadline`).
-   * Enters `_run_io_loop()` (running only while in `(Handshaking, Authenticating, Connected, ConnectedReadOnly)` with an open socket), catching transport/protocol exceptions and translating them through `_exception_to_event()` ([connection.py](kazoo/protocol/connection.py)):
+   * Enters `_run_io_loop()` (running only while in `(Handshaking, Authenticating, Connected, ConnectedReadOnly)` with an open socket), catching transport/protocol exceptions and translating them through `_exception_to_event()` ([session.py](kazoo/protocol/session.py)):
      * `timeout_exception`, `OSError`, `ConnectionDropped` -> `ConnectionLostEvent` (keep retry backoff).
      * `AuthFailedError`, `SASLException`, `SessionClosedRequireSaslError` -> `AuthFailedEvent` (reset retry, `STOP_CONNECTING`).
      * `SessionExpiredError` -> `SessionExpiredEvent` (reset retry, reconnect with new session).
@@ -311,13 +311,13 @@ Fixed Linear Buffer (_buf, _capacity = READ_WINDOW + 4 + max_buffer + REPLY_OVER
 
 ### Packet Dispatch
 
-`_process_packet(packet)` ([connection.py](kazoo/protocol/connection.py)) pattern-matches on the 6 `ServerPacket` variants (rejecting packets that are invalid for the current `ClientState` with `ConnectionDropped`):
+`PacketRouter.process_packet(packet)` ([session.py](kazoo/protocol/session.py), delegated from `ConnectionHandler._process_packet()`) pattern-matches on the 6 `ServerPacket` variants (rejecting packets that are invalid for the current `ClientState` with `ConnectionDropped`):
 * `Connect` -> `ConnectResponseReceived(connect_result=packet)`
 * `PingResponse` -> `PING_RECEIVED` (clears `ping_outstanding`)
 * `AuthResponse` -> updates `last_zxid`, pops from `RequestManager.auth_pending` (with fallback scan for `ReservedXID.AUTH`), resolves or fails the pending auth `AsyncResult`, raises `SessionExpiredError` / `ConnectionDropped` on transient errors, or emits `AuthFailedEvent` / `AuthPacketCompleted`
 * `WatchPacket` -> collects and dispatches matching watchers via `WatcherManager` + `handler.dispatch_callback` (early-returning before `unchroot()`/`WatchedEvent` if no watchers match)
 * `SASLResponse` -> updates `last_zxid`, classifies non-zero error codes (raising `AuthFailedError`/`SessionExpiredError`/`SessionClosedRequireSaslError` or `ConnectionDropped` for transient errors), else emits `SASLChallengeReceived`
-* `ResponsePacket` -> `_read_response(packet)` ([connection.py](kazoo/protocol/connection.py)): updates `last_zxid`, fails `async_object` with `packet.error` if present (`ReplyTooLargeError` logs at debug and leaves the session alive; `KazooRetry` does not retry it), maps non-`Exists`/`NoNodeError` codes via `_error_for_code(header.err)`, unchroots `Transaction` results, registers/removes request watchers via `WatcherManager.update_for_response`, resolves `async_object`, and emits `SessionClosedEvent` on `Close`.
+* `ResponsePacket` -> `PacketRouter.read_response(packet)` ([session.py](kazoo/protocol/session.py)): updates `last_zxid`, fails `async_object` with `packet.error` if present (`ReplyTooLargeError` logs at debug and leaves the session alive; `KazooRetry` does not retry it), maps non-`Exists`/`NoNodeError` codes via `_error_for_code(header.err)`, unchroots `Transaction` results, registers/removes request watchers via `WatcherManager.update_for_response`, resolves `async_object`, and emits `SessionClosedEvent` on `Close`.
 
 ---
 
