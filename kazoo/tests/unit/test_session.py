@@ -293,3 +293,63 @@ class TestExceptionToEvent:
             )
             is None
         )
+
+
+class TestRequestAndWatcherManagers:
+    def test_fail_in_flight_drains_pending_and_auth_preserves_queue(
+        self,
+    ) -> None:
+        rm = RequestManager()
+        c_pending = _FakeCompletion()
+        c_auth = _FakeCompletion()
+        c_queued = _FakeCompletion()
+
+        rm.pending.append((GetData("/a", None), c_pending, 1))
+        rm.pending.append(("sasl_tok", None, 2))
+        rm.auth_pending.append(c_auth)
+        rm.auth_pending.append(None)
+        rm.enqueue(GetData("/b", None), c_queued)
+
+        err = ConnectionLoss()
+        rm.fail_in_flight(err)
+
+        assert len(rm.pending) == 0
+        assert len(rm.auth_pending) == 0
+        assert c_pending.exc is err
+        assert c_auth.exc is err
+        assert len(rm.queue) == 1
+        assert c_queued.done is False
+
+    def test_remove_queued_returns_bool(self) -> None:
+        rm = RequestManager()
+        req = GetData("/x", None)
+        comp = _FakeCompletion()
+        rm.enqueue(req, comp)
+
+        assert rm.remove_queued(req, comp) is True
+        assert rm.remove_queued(req, comp) is False
+
+    def test_find_persistent_recursive_deep_path_order_and_root(self) -> None:
+        wm = WatcherManager()
+        w_root = lambda ev: None  # noqa: E731
+        w_a = lambda ev: None  # noqa: E731
+        w_abc = lambda ev: None  # noqa: E731
+        w_other = lambda ev: None  # noqa: E731
+
+        wm.persistent_recursive_watchers["/"].add(w_root)
+        wm.persistent_recursive_watchers["/a"].add(w_a)
+        wm.persistent_recursive_watchers["/a/b/c"].add(w_abc)
+        wm.persistent_recursive_watchers["/a/other"].add(w_other)
+
+        assert wm.find_persistent_recursive("/") == [w_root]
+        assert wm.find_persistent_recursive("/a/b/c/d/e") == [
+            w_root,
+            w_a,
+            w_abc,
+        ]
+        assert wm.find_persistent_recursive("/z") == [w_root]
+
+    def test_session_all_excludes_internal_symbols(self) -> None:
+        from kazoo.protocol import session
+
+        assert not any(name.startswith("_") for name in session.__all__)

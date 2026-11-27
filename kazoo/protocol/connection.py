@@ -170,6 +170,7 @@ class RWPinger:
     @last_attempt.setter
     def last_attempt(self, value: float | None) -> None:
         self.schedule.last_attempt = value
+        self.schedule._backoff_until = None
 
     def __iter__(
         self,
@@ -254,7 +255,6 @@ class ConnectionHandler:
             requests=self._requests,
             watchers=self._watchers,
             get_state=lambda: self.client._state_machine.state,
-            get_keeper_state=lambda: self.client.client_state,
             set_last_zxid=self._set_client_last_zxid,
             unchroot=lambda path: self.client.unchroot(path),
             emit_event=lambda ev: self._emit_event(ev),

@@ -313,7 +313,7 @@ class TestPersistentWatchEvents:
 
     def test_child_event_triggers_persistent_watcher(self) -> None:
         client = _make_mock_client()
-        client.client_state = KeeperState.CONNECTED
+        client._state_machine.state = Connected()
         client.unchroot.side_effect = lambda p: p
         w_child = Mock()
         w_pers = Mock()
@@ -344,7 +344,7 @@ class TestPersistentWatchEvents:
         self,
     ) -> None:
         client = _make_mock_client()
-        client.client_state = KeeperState.CONNECTED
+        client._state_machine.state = Connected()
         client.unchroot.side_effect = lambda p: p
         w_data = Mock()
         w_pers = Mock()
@@ -378,7 +378,7 @@ class TestPersistentWatchEvents:
         self,
     ) -> None:
         client = _make_mock_client()
-        client.client_state = KeeperState.CONNECTED
+        client._state_machine.state = Connected()
         client.unchroot.side_effect = lambda p: p
         w_data = Mock()
         w_pers = Mock()
@@ -404,7 +404,7 @@ class TestPersistentWatchEvents:
 
     def test_deleted_event_triggers_all_watchers(self) -> None:
         client = _make_mock_client()
-        client.client_state = KeeperState.CONNECTED
+        client._state_machine.state = Connected()
         client.unchroot.side_effect = lambda p: p
         w_data = Mock()
         w_child = Mock()
@@ -436,7 +436,7 @@ class TestPersistentWatchEvents:
         zxid.
         """
         client = _make_mock_client()
-        client.client_state = KeeperState.CONNECTED
+        client._state_machine.state = Connected()
         client.unchroot.side_effect = lambda p: p
         watcher = Mock()
 
@@ -462,7 +462,7 @@ class TestPersistentWatchEvents:
         persistent recursive watchers.
         """
         client = _make_mock_client()
-        client.client_state = KeeperState.CONNECTED
+        client._state_machine.state = Connected()
         client.unchroot.side_effect = lambda p: p
         w_pers = Mock()
         w_rec = Mock()
@@ -767,6 +767,45 @@ class TestRWServerSelection:
         assert (
             "Pinging server for r/w: rw.example(10.0.0.3):2183" in caplog.text
         )
+
+    def test_rw_pinger_last_attempt_setter_invalidates_backoff_until(
+        self,
+    ) -> None:
+        """[C-11] Mutating RWPinger.last_attempt clears cached backoff."""
+        ro_sock = Mock()
+        ro_sock.recv.return_value = b"ro"
+        dialed: list[str] = []
+
+        def fake_connect(
+            host: str, hostip: str, port: int, timeout: float | None
+        ) -> Mock:
+            dialed.append(host)
+            return ro_sock
+
+        @contextmanager
+        def no_error() -> Iterator[None]:
+            yield
+
+        pinger = RWPinger(
+            [("ro1.example", "10.0.0.1", 2181)], fake_connect, no_error
+        )
+        it = iter(pinger)
+        with (
+            patch("time.monotonic", return_value=100.0),
+            patch("random.randint", return_value=0),
+        ):
+            assert next(it) is False
+            assert len(dialed) == 1
+            # Enter backoff window, caching _backoff_until = 100.5.
+            assert next(it) is False
+            assert len(dialed) == 1
+            assert pinger.schedule._backoff_until == pytest.approx(100.5)
+
+            # Backdating last_attempt must invalidate cached _backoff_until.
+            pinger.last_attempt = 99.0
+            assert pinger.schedule._backoff_until is None
+            assert next(it) is False
+            assert len(dialed) == 2
 
     def test_rw_pinger_exponential_backoff(self) -> None:
         ro_sock = Mock()

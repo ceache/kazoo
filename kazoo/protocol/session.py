@@ -132,15 +132,18 @@ class RequestManager:
 
     def remove_queued(
         self, request: Any, async_object: ICompletion[Any] | None
-    ) -> None:
+    ) -> bool:
         """Remove a specific request pair from the send queue if present.
 
         Uses O(n) ``deque.remove``; for rare wake-failure cleanup only.
+        Returns ``True`` if the pair was found and removed, ``False`` if it
+        had already been popped or failed.
         """
         try:
             self.queue.remove((request, async_object))
+            return True
         except ValueError:
-            pass
+            return False
 
     def peek_queued(self) -> tuple[Any, ICompletion[Any] | None]:
         """Return the head of the send queue without removing it."""
@@ -180,16 +183,13 @@ class RequestManager:
             limit is None or len(self.pending) + len(self.auth_pending) < limit
         )
 
-    def fail_all(self, state: KeeperState) -> None:
-        """Fail all pending and queued requests with the state's exception."""
-        exc: KazooException
-        if state == KeeperState.AUTH_FAILED:
-            exc = AuthFailedError()
-        elif state == KeeperState.EXPIRED_SESSION:
-            exc = SessionExpiredError()
-        else:
-            exc = ConnectionLoss()
+    def fail_in_flight(self, exc: Exception) -> None:
+        """Fail and drain in-flight ``pending`` and ``auth_pending`` entries.
 
+        Preserves ``self.queue`` so queued requests still drain after a
+        reconnect. In-flight entries belong strictly to one transport socket
+        and must be cleared before a new connection resets the XID sequence.
+        """
         pending = self.pending
         while True:
             try:
@@ -207,6 +207,18 @@ class RequestManager:
                     async_object.set_exception(exc)
             except IndexError:
                 break
+
+    def fail_all(self, state: KeeperState) -> None:
+        """Fail all pending and queued requests with the state's exception."""
+        exc: KazooException
+        if state == KeeperState.AUTH_FAILED:
+            exc = AuthFailedError()
+        elif state == KeeperState.EXPIRED_SESSION:
+            exc = SessionExpiredError()
+        else:
+            exc = ConnectionLoss()
+
+        self.fail_in_flight(exc)
 
         queue = self.queue
         while True:
@@ -254,15 +266,17 @@ class WatcherManager:
         if not pr_watchers:
             return []
         watchers: list[WatchFunc] = []
-        candidates = ["/"]
+        root_watchers = pr_watchers.get("/")
+        if root_watchers:
+            watchers.extend(root_watchers)
         stripped = path.strip("/")
         if stripped:
-            parts = stripped.split("/")
-            candidates.extend(
-                "/" + "/".join(parts[: i + 1]) for i in range(len(parts))
-            )
-        for candidate in candidates:
-            watchers.extend(pr_watchers.get(candidate, []))
+            prefix = ""
+            for part in stripped.split("/"):
+                prefix = f"{prefix}/{part}"
+                hit = pr_watchers.get(prefix)
+                if hit:
+                    watchers.extend(hit)
         return watchers
 
     def collect_for_event(
@@ -415,7 +429,6 @@ class PacketRouter:
         "_requests",
         "_watchers",
         "_get_state",
-        "_get_keeper_state",
         "_set_last_zxid",
         "_unchroot",
         "_emit_event",
@@ -434,12 +447,10 @@ class PacketRouter:
         emit_event: Callable[[ClientEvent], None],
         dispatch_watch: Callable[[Callback], None],
         logger: logging.Logger,
-        get_keeper_state: Callable[[], KeeperState] | None = None,
     ) -> None:
         self._requests = requests
         self._watchers = watchers
         self._get_state = get_state
-        self._get_keeper_state = get_keeper_state
         self._set_last_zxid = set_last_zxid
         self._unchroot = unchroot
         self._emit_event = emit_event
@@ -471,13 +482,8 @@ class PacketRouter:
         # Strip the chroot if needed
         path = self._unchroot(path)
         state = self._get_state()
-        keeper_state = (
-            self._get_keeper_state()
-            if self._get_keeper_state is not None
-            else state.keeper_state
-        )
         ev = WatchedEvent(
-            EVENT_TYPE_MAP[watch.type], keeper_state, path, watch.zxid
+            EVENT_TYPE_MAP[watch.type], state.keeper_state, path, watch.zxid
         )
 
         # Last check to ignore watches if we've been stopped or terminated
@@ -727,7 +733,4 @@ __all__ = (
     "RWServerAvailable",
     "STOP_CONNECTING",
     "WatcherManager",
-    "_CONNECTION_DROP",
-    "_SESSION_EXPIRED",
-    "_exception_to_event",
 )
