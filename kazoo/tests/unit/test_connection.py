@@ -3025,3 +3025,36 @@ class TestWakeupOutsideSelect:
             conn._read_packet(timeout=1.0)
 
         assert timeouts == [pytest.approx(1.0), pytest.approx(0.4)]
+
+    def test_call_wake_failure_after_request_consumed_preserves_result(
+        self,
+    ) -> None:
+        """[C-8] Failed wake() after item popped does not overwrite result."""
+        client = KazooClient(hosts="127.0.0.1:2181")
+        client._state_machine.state = Connected(
+            host="127.0.0.1", port=2181, session_id=7, session_passwd=b"pw"
+        )
+        assert client.client_id == (7, b"pw")
+
+        async_obj = client.handler.async_result()
+        callbacks: list[Any] = []
+        async_obj.rawlink(callbacks.append)
+        req = GetData("/raced", None)
+
+        def pop_and_resolve_then_fail_wake() -> bool:
+            _, comp = client._request_manager.dequeue_to_pending(1)
+            assert comp is not None
+            comp.set((b"ok", None))
+            return False
+
+        with patch.object(
+            client._connection,
+            "wake",
+            side_effect=pop_and_resolve_then_fail_wake,
+        ):
+            ret = client._call(req, async_obj)
+
+        assert ret is None
+        assert async_obj.get_nowait() == (b"ok", None)
+        assert async_obj.exception is None
+        assert len(callbacks) == 1

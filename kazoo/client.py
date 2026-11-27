@@ -682,7 +682,7 @@ class KazooClient:
         """
         state = self._state_machine.state
         if isinstance(state, (Connected, ConnectedReadOnly)):
-            return (state.session_id, self._session_passwd)
+            return (state.session_id, state.session_passwd)
         return None
 
     @property
@@ -887,11 +887,11 @@ class KazooClient:
         # (producer acquires non-blocking, consumer releases after
         # _drain_wakeup).
         if not self._connection.wake():
-            self._request_manager.remove_queued(request, async_object)
-            async_object.set_exception(
-                ConnectionClosedError("Connection has been closed")
-            )
-            return False
+            if self._request_manager.remove_queued(request, async_object):
+                async_object.set_exception(
+                    ConnectionClosedError("Connection has been closed")
+                )
+                return False
         return None
 
     def start(self, timeout: float = 15.0) -> None:

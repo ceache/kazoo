@@ -248,6 +248,7 @@ class TestPureTransitionMatrix:
             host="127.0.0.1",
             port=2181,
             session_id=999,
+            session_passwd=b"newpass",
             read_timeout=20.0,
             connect_timeout=15.0,
         )
@@ -367,6 +368,7 @@ class TestPureTransitionMatrix:
             host="127.0.0.1",
             port=2181,
             session_id=555,
+            session_passwd=b"pwd",
             read_timeout=10.0,
             connect_timeout=15.0,
             read_only=False,
@@ -407,6 +409,7 @@ class TestPureTransitionMatrix:
             host="127.0.0.1",
             port=2181,
             session_id=555,
+            session_passwd=b"pwd",
             read_timeout=10.0,
             connect_timeout=15.0,
             read_only=False,
@@ -478,6 +481,7 @@ class TestPureTransitionMatrix:
             host="127.0.0.1",
             port=2181,
             session_id=999,
+            session_passwd=b"pwd",
             read_timeout=6.0,
             connect_timeout=9.0,
             read_only=False,
@@ -519,6 +523,7 @@ class TestPureTransitionMatrix:
             host="127.0.0.1",
             port=2181,
             session_id=999,
+            session_passwd=b"pwd",
             read_timeout=6.0,
             connect_timeout=9.0,
         )
@@ -590,7 +595,7 @@ class TestPureTransitionMatrix:
             assert next_s1 == Connecting(
                 host="127.0.0.2", port=2182, attempt=1
             )
-            assert eff1 == ()
+            assert eff1 == (CloseSocket("Starting new connection attempt"),)
 
             # 2. kazoo_state == SUSPENDED -> Suspended
             s_susp = Authenticating(
@@ -606,7 +611,7 @@ class TestPureTransitionMatrix:
             assert next_s2 == Suspended(
                 host="127.0.0.2", port=2182, session_id=1, attempt=1
             )
-            assert eff2 == ()
+            assert eff2 == (CloseSocket("Starting new connection attempt"),)
 
     def test_auth_sasl_connection_lost_transitions_to_suspended_when_suspended(
         self,
@@ -1860,14 +1865,14 @@ _EXPECTED_MATRIX: dict[
     "ConnectAttemptStarted": {
         "Inactive": (_SAME, ()),
         "Connecting": (Connecting, (LogStateTransition,)),
-        "Handshaking": (Connecting, ()),
-        "Handshaking[SUSPENDED]": (Suspended, ()),
-        "Authenticating.SASL": (Connecting, ()),
-        "Authenticating.SASL[SUSPENDED]": (Suspended, ()),
-        "Authenticating.INITIAL_AUTH": (Connecting, ()),
-        "Authenticating.INITIAL_AUTH[SUSPENDED]": (Suspended, ()),
-        "Connected": (Suspended, _EFF_SUSPEND),
-        "ConnectedReadOnly": (Suspended, _EFF_SUSPEND),
+        "Handshaking": (Connecting, (CloseSocket,)),
+        "Handshaking[SUSPENDED]": (Suspended, (CloseSocket,)),
+        "Authenticating.SASL": (Connecting, (CloseSocket,)),
+        "Authenticating.SASL[SUSPENDED]": (Suspended, (CloseSocket,)),
+        "Authenticating.INITIAL_AUTH": (Connecting, (CloseSocket,)),
+        "Authenticating.INITIAL_AUTH[SUSPENDED]": (Suspended, (CloseSocket,)),
+        "Connected": (Suspended, _EFF_CLOSE_SUSPEND),
+        "ConnectedReadOnly": (Suspended, _EFF_CLOSE_SUSPEND),
         "Suspended": (Suspended, ()),
         "ExpiredSession": (Connecting, (LogStateTransition,)),
         "AuthFailed": (_SAME, (LogStateTransition,)),
@@ -2228,6 +2233,54 @@ class TestExhaustiveTransitionMatrix:
         s_idem, eff_idem = transition(closing_state, CloseRequested())
         assert s_idem == closing_state
         assert eff_idem == ()
+
+        # [C-7] Non-default ConnectionLostEvent in Connecting stays Connecting
+        # and never emits KazooState.SUSPENDED.
+        c_state = Connecting(host="127.0.0.1", port=2181, attempt=2)
+        c_next, c_eff = transition(
+            c_state,
+            ConnectionLostEvent(
+                reason="closed", keeper_state=KeeperState.CLOSED
+            ),
+        )
+        assert c_next == c_state
+        assert c_eff == ()
+
+        # [C-7] Non-default ConnectionLostEvent in Suspended preserves metadata
+        # and is_connecting_allowed=False without emitting KazooState change.
+        susp = Suspended(
+            host="10.0.0.1",
+            port=2181,
+            session_id=77,
+            attempt=3,
+            is_connecting_allowed=False,
+        )
+        susp_next, susp_eff = transition(
+            susp,
+            ConnectionLostEvent(
+                reason="closed", keeper_state=KeeperState.CLOSED
+            ),
+        )
+        assert isinstance(susp_next, Suspended)
+        assert susp_next.host == "10.0.0.1"
+        assert susp_next.port == 2181
+        assert susp_next.session_id == 77
+        assert susp_next.attempt == 3
+        assert susp_next.is_connecting_allowed is False
+        assert susp_next.keeper_state == KeeperState.CLOSED
+        assert not any(isinstance(e, EmitKazooStateChange) for e in susp_eff)
+
+        # [C-11] ConnectResponseReceived populates Connected.session_passwd
+        # atomically so KazooClient.client_id never observes a torn pair.
+        s_conn, _ = transition(
+            Handshaking(host="127.0.0.1", port=2181),
+            ConnectResponseReceived(
+                connect_result=Connect(0, 0, 10000, 42, b"secret16bytes!!!", 0)
+            ),
+        )
+        assert isinstance(s_conn, Connected)
+        assert s_conn.session_id == 42
+        assert s_conn.session_passwd == b"secret16bytes!!!"
 
     def test_dataclasses_use_slots(self) -> None:
         instances = [
