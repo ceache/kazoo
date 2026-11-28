@@ -113,6 +113,25 @@ def _make_mock_client(**kwargs: Any) -> Mock:
     return client
 
 
+@contextmanager
+def _patch_connection_monotonic(
+    values: list[float],
+) -> Iterator[None]:
+    """Patch connection.time.monotonic locally for the current thread."""
+    test_tid = threading.get_ident()
+    real_monotonic = time.monotonic
+    clock = iter(values)
+
+    def monotonic() -> float:
+        if threading.get_ident() != test_tid:
+            return real_monotonic()
+        return next(clock)
+
+    proxy = SimpleNamespace(monotonic=monotonic)
+    with patch.object(connection_mod, "time", proxy):
+        yield
+
+
 @pytest.fixture
 def patch_connection_random(
     monkeypatch: pytest.MonkeyPatch,
@@ -3082,9 +3101,8 @@ class TestWakeupOutsideSelect:
         mock_sock.send.side_effect = BlockingIOError()
         sel2 = _attach_fake_selector(conn, mock_sock, ready=True)
         conn._ssl_socket = None
-        clock = iter([100.0, 100.5, 101.0])
         with (
-            patch("time.monotonic", side_effect=lambda: next(clock)),
+            _patch_connection_monotonic([100.0, 100.5, 101.0]),
             pytest.raises(conn.handler.timeout_exception),
         ):
             conn._write(b"abc", timeout=1.0)
@@ -3146,9 +3164,8 @@ class TestWakeupOutsideSelect:
         )
         conn._ssl_socket = mock_ssl
 
-        clock = iter([100.0, 100.6, 101.2])
         with (
-            patch("time.monotonic", side_effect=lambda: next(clock)),
+            _patch_connection_monotonic([100.0, 100.6, 101.2]),
             pytest.raises(conn.handler.timeout_exception),
         ):
             conn._read_packet(timeout=1.0)
