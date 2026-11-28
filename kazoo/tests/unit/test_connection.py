@@ -874,7 +874,7 @@ class TestRWServerSelection:
     def test_rw_pinger_last_attempt_setter_invalidates_backoff_until(
         self, patch_connection_random: Callable[[int], Mock]
     ) -> None:
-        """[C-11] Mutating RWPinger.last_attempt clears cached backoff."""
+        """Mutating RWPinger.last_attempt clears cached backoff."""
         ro_sock = Mock()
         ro_sock.recv.return_value = b"ro"
         dialed: list[str] = []
