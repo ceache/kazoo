@@ -20,6 +20,7 @@ stateDiagram-v2
     Connecting --> Connecting : ConnectAttemptStarted (next host)
     Connecting --> Handshaking : SocketConnected
     Connecting --> Connecting : ConnectionLostEvent (retry)
+    Connecting --> ExpiredSession : SessionExpiredEvent
     Connecting --> AuthFailed : AuthFailedEvent
     Connecting --> Inactive : SessionClosedEvent / CloseRequested
 
@@ -48,16 +49,16 @@ stateDiagram-v2
 
     %% Active Session States
     Connected --> Connected : AuthPacketCompleted / PingReceived / HeartbeatDeadlineReached / CloseRequested [is_connecting_allowed=False]
-    Connected --> Suspended : ConnectAttemptStarted / ConnectionLostEvent / RWServerFoundEvent / PollTimeoutExpired [ping_outstanding]
+    Connected --> Suspended : ConnectAttemptStarted / ConnectionLostEvent [is_connecting_allowed] / RWServerFoundEvent [is_connecting_allowed] / PollTimeoutExpired [ping_outstanding, is_connecting_allowed]
+    Connected --> Inactive : SessionClosedEvent / ConnectionLostEvent [closing] / RWServerFoundEvent [closing] / PollTimeoutExpired [ping_outstanding, closing]
     Connected --> ExpiredSession : SessionExpiredEvent
     Connected --> AuthFailed : AuthFailedEvent
-    Connected --> Inactive : SessionClosedEvent
 
     ConnectedReadOnly --> ConnectedReadOnly : AuthPacketCompleted / PingReceived / HeartbeatDeadlineReached / CloseRequested [is_connecting_allowed=False]
-    ConnectedReadOnly --> Suspended : ConnectAttemptStarted / ConnectionLostEvent / RWServerFoundEvent / PollTimeoutExpired [ping_outstanding]
+    ConnectedReadOnly --> Suspended : ConnectAttemptStarted / ConnectionLostEvent [is_connecting_allowed] / RWServerFoundEvent [is_connecting_allowed] / PollTimeoutExpired [ping_outstanding, is_connecting_allowed]
+    ConnectedReadOnly --> Inactive : SessionClosedEvent / ConnectionLostEvent [closing] / RWServerFoundEvent [closing] / PollTimeoutExpired [ping_outstanding, closing]
     ConnectedReadOnly --> ExpiredSession : SessionExpiredEvent
     ConnectedReadOnly --> AuthFailed : AuthFailedEvent
-    ConnectedReadOnly --> Inactive : SessionClosedEvent
 
     %% Reconnection & Session Loss
     Suspended --> Suspended : ConnectAttemptStarted / ConnectionLostEvent
@@ -80,7 +81,7 @@ stateDiagram-v2
 
 ## 2. State Taxonomy
 
-`ClientState` is a `TypeAlias` union of 9 frozen slotted dataclasses. Each state defines `is_connecting_allowed: bool` (`False` for `Inactive`, `AuthFailed`, and closing `Connected`/`ConnectedReadOnly` after `CloseRequested`, preserved across subsequent drops/expirations; `True` for normal active/reconnecting states).
+`ClientState` is a `TypeAlias` union of 9 frozen slotted dataclasses. Each state defines `is_connecting_allowed: bool` (`False` for `Inactive`, `AuthFailed`, and closing `Connected`/`ConnectedReadOnly` after `CloseRequested`, where a subsequent `ConnectionLostEvent`, `PollTimeoutExpired` with `ping_outstanding`, or `RWServerFoundEvent` transitions directly to `Inactive` rather than `Suspended`, and `SessionExpiredEvent` preserves `is_connecting_allowed=False`; `True` for normal active/reconnecting states).
 
 | State | Category | Description |
 | :--- | :--- | :--- |

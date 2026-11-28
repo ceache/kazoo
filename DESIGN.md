@@ -14,7 +14,7 @@ Kazoo separates **session/lifecycle policy** from **socket I/O** and **concurren
 1. **Client Facade (`KazooClient`)**: Public ZooKeeper API, recipe factories, retry orchestration, request submission, watcher tables, and state listener dispatch ([kazoo/client.py](kazoo/client.py)).
 2. **Pure Sans-I/O State Machine (`statemachine`)**: Immutable dataclass states, typed events, pure `transition(state, event)` table, and serialized `StateMachineDriver` ([kazoo/protocol/statemachine.py](kazoo/protocol/statemachine.py)).
 3. **Connection & Event Loop (`ConnectionHandler`)**: Persistent selector loop, wakeup socketpair, non-blocking socket read/write engine, SASL stepper, and direct data-plane fast path ([kazoo/protocol/connection.py](kazoo/protocol/connection.py), [kazoo/protocol/session.py](kazoo/protocol/session.py), [kazoo/protocol/sasl.py](kazoo/protocol/sasl.py), [kazoo/protocol/tls.py](kazoo/protocol/tls.py)).
-4. **Wire Framing & Serialization (`FrameDecoder`, packet & security dataclasses)**: Fixed linear-buffer `recv_into` framing with unified `xid` dispatch and in-decoder `ResponsePacket` deserialization ([kazoo/protocol/serialization.py](kazoo/protocol/serialization.py), [kazoo/protocol/paths.py](kazoo/protocol/paths.py), [kazoo/security.py](kazoo/security.py)).
+4. **Wire Framing & Serialization (`FrameDecoder`, packet & security dataclasses)**: Lazily allocated, on-demand-growing linear-buffer `recv_into` framing with unified `xid` dispatch and in-decoder `ResponsePacket` deserialization ([kazoo/protocol/serialization.py](kazoo/protocol/serialization.py), [kazoo/protocol/paths.py](kazoo/protocol/paths.py), [kazoo/security.py](kazoo/security.py)).
 5. **Handler Abstraction (`IHandler`)**: Pluggable OS-thread or greenlet runtime providing sockets, selectors, locks, `IAsyncResult`, cooperative yields, and sequential callback workers ([kazoo/interfaces.py](kazoo/interfaces.py), `kazoo/handlers/`).
 
 ```mermaid
@@ -24,8 +24,8 @@ flowchart LR
     RM -->|"wake() byte on socketpair"| Loop["ConnectionHandler<br/>(zk_loop / _poll_step)"]
     Loop -->|"SocketReadable / Connect / Drop"| SM
     SM -->|"SideEffect tuple"| Exec["KazooClient._execute_effect<br/>& ConnectionHandler.execute_effect"]
-    Exec -->|"EmitKazooStateChange"| Listeners["state_listeners (inline)"]
-    Loop <-->|"recv_into / batched send"| FD["FrameDecoder<br/>(lazy 256 KiB window + max_buffer)"]
+    Exec -->|"EmitKazooStateChange"| Listeners["state_listeners (off-lock FIFO)"]
+    Loop <-->|"recv_into / batched send"| FD["FrameDecoder<br/>(lazy 320 KiB -> max_buffer + hysteresis)"]
     Loop -->|"pop_pending / decode"| RM
     Loop -->|"Watch event / update"| WM["WatcherManager"]
     WM -->|"dispatch_callback"| Handler["IHandler<br/>(callback_queue / completion_queue)"]
@@ -68,7 +68,7 @@ Every asynchronous ZooKeeper operation flows through `KazooClient._call(request,
    * `ExpiredSession` -> sets `SessionExpiredError()`, returns `False`.
    * `Inactive` or `not state.is_connecting_allowed` (e.g., `Connected` with graceful `Close` in flight) -> sets `ConnectionClosedError("Connection has been closed")`, returns `False`.
    * Note: `Suspended` / `Connecting` / `Handshaking` / `Authenticating` are *allowed* to enqueue requests; they sit in `_request_manager.queue` until the session establishes or fails.
-2. **Enqueue & unconditional wake**: Calls `self._request_manager.enqueue(request, async_object)` and then unconditionally calls `self._connection.wake()` to avoid lost-wakeup races between producer threads and the selector loop.
+2. **Enqueue, post-enqueue check & unconditional wake**: Calls `self._request_manager.enqueue(request, async_object)` and immediately re-checks `_terminal_call_exception(self._state_machine.state)` so a concurrent `stop()` / terminal transition cannot leave the entry orphaned in `queue` (removing and failing it if still queued). Otherwise unconditionally calls `self._connection.wake()` to avoid lost-wakeup races between producer threads and the selector loop.
 3. **Closed wakeup recovery**: If `wake()` returns `False` (the wakeup pipe is closed/absent), the item is removed via `_request_manager.remove_queued(request, async_object)` and `async_object` fails with `ConnectionClosedError`.
 
 ### Session State Listeners & Effect Routing
@@ -78,7 +78,7 @@ Every asynchronous ZooKeeper operation flows through `KazooClient._call(request,
 * Client-handled effects:
   * `LogStateTransition` -> `self.logger.log(...)`
   * `ResolveConnectResult` -> resolves or fails `self._conn_result` if not already ready
-  * `EmitKazooStateChange` -> `self._make_state_change(new_state)`
+  * `EmitKazooStateChange` -> queues notification via `self._make_state_change(new_state)` (drained off-lock in FIFO order by `StateMachineDriver`'s `post_dispatch` hook)
   * `FailPendingRequests` -> `self._request_manager.fail_all(keeper_state)`
   * `InvalidateWatchers` -> `self._reset_watchers()` (clears all watcher maps and schedules `WatchedEvent(EventType.NONE, self.client_state, None)` via `handler.dispatch_callback`)
   * `ResetSessionData` -> calls `self._reset()` (resets managers, watchers, `_session_id`, `_session_passwd`, `last_zxid = 0`, `_protocol_version = None`) and forwards to `self._connection.execute_effect(effect)` to reset `FrameDecoder` and retry state.
@@ -112,15 +112,15 @@ stateDiagram-v2
     Authenticating --> Connecting : ConnectionLostEvent / PollTimeoutExpired [was LOST]
     Authenticating --> Suspended : ConnectionLostEvent / PollTimeoutExpired [was SUSPENDED]
     Connected --> Connected : PingReceived / HeartbeatDeadlineReached / CloseRequested [is_connecting_allowed=False]
-    Connected --> Suspended : ConnectionLostEvent / RWServerFoundEvent / PollTimeoutExpired [ping_outstanding]
+    Connected --> Suspended : ConnectionLostEvent / RWServerFoundEvent / PollTimeoutExpired [ping_outstanding, is_connecting_allowed]
+    Connected --> Inactive : SessionClosedEvent / ConnectionLostEvent [closing] / RWServerFoundEvent [closing] / PollTimeoutExpired [ping_outstanding, closing]
     Connected --> ExpiredSession : SessionExpiredEvent
     Connected --> AuthFailed : AuthFailedEvent
-    Connected --> Inactive : SessionClosedEvent
     ConnectedReadOnly --> ConnectedReadOnly : PingReceived / HeartbeatDeadlineReached / CloseRequested [is_connecting_allowed=False]
-    ConnectedReadOnly --> Suspended : RWServerFoundEvent / ConnectionLostEvent / PollTimeoutExpired [ping_outstanding]
+    ConnectedReadOnly --> Suspended : RWServerFoundEvent / ConnectionLostEvent / PollTimeoutExpired [ping_outstanding, is_connecting_allowed]
+    ConnectedReadOnly --> Inactive : SessionClosedEvent / ConnectionLostEvent [closing] / RWServerFoundEvent [closing] / PollTimeoutExpired [ping_outstanding, closing]
     ConnectedReadOnly --> ExpiredSession : SessionExpiredEvent
     ConnectedReadOnly --> AuthFailed : AuthFailedEvent
-    ConnectedReadOnly --> Inactive : SessionClosedEvent
     Suspended --> Suspended : ConnectAttemptStarted
     Suspended --> Handshaking : SocketConnected
     Suspended --> ExpiredSession : SessionExpiredEvent
@@ -259,33 +259,35 @@ Connect Reply:   [4B big-endian len] [proto_ver, timeout, session_id, passwd, (o
 * **Single-copy string decoding**: `_read_required_string(buffer, offset)` ([serialization.py](kazoo/protocol/serialization.py)) decodes UTF-8 directly via `str(buffer[index : index + length], "utf-8")` on `bytes | memoryview`, avoiding an extra `.tobytes()` intermediate copy.
 * **Security dataclasses** ([kazoo/security.py](kazoo/security.py)): `Permissions` is `enum.IntFlag` (`NONE..ALL=31`); `Id` and `ACL` are frozen slotted dataclasses with deprecated sequence compatibility (`__iter__`, `__getitem__`, `__len__`) and `__bool__` returning `True`.
 
-### `FrameDecoder`: Fixed Linear Buffer, Bounds & In-Decoder Dispatch
+### `FrameDecoder`: Growing Linear Buffer, Bounds & In-Decoder Dispatch
 
-`FrameDecoder` ([kazoo/protocol/serialization.py](kazoo/protocol/serialization.py)) decouples OS socket reads from frame boundaries with a single fixed linear buffer and synchronous in-decoder response parsing:
+`FrameDecoder` ([kazoo/protocol/serialization.py](kazoo/protocol/serialization.py)) decouples OS socket reads from frame boundaries with a lazily allocated, on-demand-growing linear buffer and synchronous in-decoder response parsing:
 
 * **Buffer Sizing Constants**:
   * `JUTE_MAX_BUFFER = 0xFFFFF` (`1,048,575` bytes — ZooKeeper default `jute.maxbuffer`, configurable via `KazooClient(..., max_buffer=...)`)
   * `REPLY_OVERHEAD = 88` (`16`B `ReplyHeader` + `4`B data length + `68`B `ZnodeStat`), giving default `_max_payload = max_buffer + REPLY_OVERHEAD = 1,048,663` bytes and `_max_frame = 4 + _max_payload = 1,048,667` bytes
   * `READ_WINDOW = 256 * 1024` (`262,144` bytes — maximum start offset `_head` / `_scan` allowed for an incomplete frame before reads)
-  * `MOVE_MAX = 64 * 1024` (`65,536` bytes — maximum trailing partial-frame size and remaining window threshold that triggers compaction to offset `0`)
-  * Default capacity `_capacity = READ_WINDOW + 4 + max_buffer + REPLY_OVERHEAD` = **`1,310,811` bytes** (~1.25 MiB `bytearray` allocated **lazily** on the first `get_buffer()` call + persistent `_view = memoryview(_buf)` and cached `_empty_view = _view[:READ_WINDOW]`; freed via `release()` in `ConnectionHandler.close()`)
+  * `MOVE_MAX = 64 * 1024` (`65,536` bytes — maximum trailing partial-frame size and remaining window threshold that triggers compaction to offset `0`, and size threshold for shrink hysteresis)
+  * `_SHRINK_HYSTERESIS = 32` — number of consecutive small (`<= MOVE_MAX`) frames draining `_head == _tail` required before shrinking a grown buffer back to `_initial_capacity`, preventing allocation thrashing on mixed large/small workloads (e.g., large reads interleaved with heartbeat pings)
+  * Maximum capacity `_capacity = READ_WINDOW + 4 + max_buffer + REPLY_OVERHEAD` (default `1,310,811` bytes), with initial capacity `_initial_capacity = min(_capacity, READ_WINDOW + MOVE_MAX)` = **`327,680` bytes** (`320 KiB` `bytearray` allocated **lazily** on the first `get_buffer()` call + persistent `_view = memoryview(_buf)` and cached `_empty_view = _view[:READ_WINDOW]`). When a frame exceeds the current buffer length, `_grow_buffer()` compacts live bytes `[head:tail]` directly to offset `0` of a newly sized buffer (doubling up to `_capacity`) without an intermediate copy. `reset()` shrinks back to `_initial_capacity`; `release()` (called in `ConnectionHandler.close()`) drops `_buf`/`_view`/`_empty_view` directly without reallocating `_initial_capacity`.
 
 ```text
-Fixed Linear Buffer (_buf, _capacity = READ_WINDOW + 4 + max_buffer + REPLY_OVERHEAD)
-0                    _head       _scan        READ_WINDOW   _tail                 _capacity
-+--------------------+-----------+------------+-------------+---------------------+
-| consumed [0.._head)| complete  | incomplete | writable [tail..end) <= _capacity |
-+--------------------+-----------+------------+-----------------------------------+
-                      ^ frame starts < READ_WINDOW => 4 + _max_payload always fits contiguously
+Growing Linear Buffer (_buf, len(_buf) in [_initial_capacity .. _capacity])
+0                    _head       _scan        READ_WINDOW   _tail          len(_buf) <= _capacity
++--------------------+-----------+------------+-------------+--------------+
+| consumed [0.._head)| complete  | incomplete | writable [tail..end)       |
++--------------------+-----------+------------+----------------------------+
+                      ^ frame starts < READ_WINDOW => grows on demand up to _capacity (compact-on-grow)
 ```
 
 * **Frame-Start Rule (`< READ_WINDOW`) & Cursor Discipline**:
-  * Cursors track `_head` (start of unpopped frame), `_scan` (where frame header validation stops), `_tail` (write cursor), `_frame_len` (cached payload length at `_head`, or `-1`), and `_skip` (remaining bytes of an oversize frame to discard).
+  * Cursors track `_head` (start of unpopped frame), `_scan` (where frame header validation stops), `_tail` (write cursor), `_frame_len` (cached payload length at `_head`, or `-1`), `_skip` (remaining bytes of an oversize frame to discard), and `_small_frames_since_grow` (hysteresis counter when `len(_buf) > _initial_capacity`).
   * `buffer_updated()` calls `_advance_scan()`, which walks complete frames `[4 + msg_len]` forward from `_scan`, rejecting `msg_len < 16` or oversize non-request frames (`xid <= 0`) at `_head` with `ConnectionDropped` (while deferring corrupt headers that follow valid coalesced replies so earlier replies are delivered first).
-  * Before requesting a write slice in `get_buffer()`, `_scan` must be strictly less than `READ_WINDOW` (if complete frames push `_scan >= READ_WINDOW`, `get_buffer()` raises `BufferError` so callers pop buffered frames first). Because any incomplete frame starts at `_scan < READ_WINDOW` and `_capacity = READ_WINDOW + _max_frame`, every frame within `max_buffer + REPLY_OVERHEAD` fits contiguously without resizing or fallback buffers.
-* **Compaction / Move Rule**:
+  * Before requesting a write slice in `get_buffer()`, `_scan` must be strictly less than `READ_WINDOW` (if complete frames push `_scan >= READ_WINDOW`, `get_buffer()` raises `BufferError` so callers pop buffered frames first). Because any incomplete frame starts at `_scan < READ_WINDOW` and `_capacity = READ_WINDOW + _max_frame`, every frame within `max_buffer + REPLY_OVERHEAD` fits contiguously once `_buf` grows to accommodate it.
+* **Compaction / Move & Shrink Rule**:
   * **Empty fast path**: When `_head == _tail` (all frames consumed), `get_buffer()` resets `_head = _tail = _scan = 0` and returns the pre-sliced `_empty_view` (`_view[:READ_WINDOW]`), avoiding `memoryview` slice allocation on every empty read.
-  * **Lazy partial compaction**: For non-empty buffers, `get_buffer()` targets `end = max(_scan + need, READ_WINDOW)` (where `need` is `4`, `20` for an oversize header, or `4 + msg_len`). Consumed frames advance `_head` without copying; only when `end - _tail < MOVE_MAX` and the buffered remainder `p = _tail - _head <= MOVE_MAX` does `get_buffer()` copy `_view[_head:_tail]` down to `_view[:p]` and reset `_head = 0`.
+  * **Lazy partial compaction & on-demand growth**: For non-empty buffers, `get_buffer()` targets `end = max(_scan + need, READ_WINDOW)` (where `need` is `4`, `20` for an oversize header, or `4 + msg_len`). If `end > len(_buf)`, `get_buffer()` checks whether shifting live bytes `[_head:_tail]` to offset `0` fits (`shifted_end = max(READ_WINDOW, end - _head) <= len(_buf)`); if so, it compacts in place, otherwise it calls `_grow_buffer(shifted_end)` (which compacts live bytes to offset `0` into the new grown buffer). Otherwise, when `end - _tail < MOVE_MAX` and the buffered remainder `p = _tail - _head <= MOVE_MAX`, `get_buffer()` copies `_view[_head:_tail]` down to `_view[:p]` and resets `_head = 0`.
+  * **Shrink hysteresis**: When `len(_buf) > _initial_capacity`, `pop_packet()` resets `_small_frames_since_grow = 0` on frames with `n > MOVE_MAX`, increments it on small (`n <= MOVE_MAX`) frames, and shrinks back to `_initial_capacity` once `_head == _tail` and `_small_frames_since_grow >= _SHRINK_HYSTERESIS`.
 * **Size Limit (`max_buffer + 88`) & Oversize Frame Skipping**:
   * Replies with `msg_len < 16` raise `ConnectionDropped`.
   * Replies with `msg_len > max_buffer + REPLY_OVERHEAD`:
@@ -327,14 +329,14 @@ Fixed Linear Buffer (_buf, _capacity = READ_WINDOW + 4 + max_buffer + REPLY_OVER
 
 | Primitive / Mechanism | `SequentialThreadingHandler` ([threading.py](kazoo/handlers/threading.py)) | `SequentialGeventHandler` ([gevent.py](kazoo/handlers/gevent.py)) | `SequentialEventletHandler` ([eventlet.py](kazoo/handlers/eventlet.py)) |
 | :--- | :--- | :--- | :--- |
-| **Selector (`create_selector()`)** | `selectors.DefaultSelector()` | `gevent.selectors.DefaultSelector()` | `_EventletSelector(selectors.BaseSelector)` (`green_selectors.DefaultSelector()` with `finally: eventlet.sleep(0)`) |
+| **Selector (`create_selector()`)** | `selectors.DefaultSelector()` | `gevent.selectors.DefaultSelector()` | `_EventletSelector(selectors.BaseSelector)` (`green_selectors.DefaultSelector()`) |
 | **Burst Yield (`yield_control()`)** | No-op (inherited default from `IHandler`) | `gevent.sleep(0)` every 64 cached frames | `eventlet.sleep(0)` every 64 cached frames |
 | **Watch Queue (`callback_queue`)** | `queue.Queue` + daemon worker thread | `gevent.queue.Queue` + worker greenlet | `green_queue.LightQueue` + worker greenthread (with `_yield_before_after`) |
 | **Completion Callbacks (`rawlink`)** | `completion_queue` (`queue.Queue`) + worker thread via `utils.AsyncResult` | Native `gevent.event.AsyncResult` hub dispatch | `completion_queue` (`LightQueue`) + worker greenthread via `utils.AsyncResult` |
-| **State Listeners** | Executed inline on `send_event` thread inside `_make_state_change()` | Executed inline on `send_event` greenlet | Executed inline on `send_event` greenthread |
+| **State Listeners** | Queued in `_make_state_change()`, drained off-lock in FIFO order by `post_dispatch` on `send_event` thread | Queued in `_make_state_change()`, drained off-lock in FIFO order by `post_dispatch` on `send_event` greenlet | Queued in `_make_state_change()`, drained off-lock in FIFO order by `post_dispatch` on `send_event` greenthread |
 | **Locks & Async Primitives** | `threading.Lock`, `RLock`, `Event`, `daemon Thread` | `gevent.lock.Semaphore`, `RLock`, `Event`, `Greenlet` | `green_threading.Lock`, `RLock`, `Event`, `eventlet.spawn` |
 
-Because watch callbacks and `AsyncResult` completion callbacks execute on dedicated sequential workers (or hub callbacks on Gevent), blocking user code inside a watch handler stalls subsequent watches **but does not stall the `zk_loop` I/O routine, heartbeats, or `AsyncResult` completions**. Blocking inside a `state_listeners` function, however, runs inline on the `send_event()` caller and delays effect execution until it returns.
+Because watch callbacks and `AsyncResult` completion callbacks execute on dedicated sequential workers (or hub callbacks on Gevent), blocking user code inside a watch handler stalls subsequent watches **but does not stall the `zk_loop` I/O routine, heartbeats, or `AsyncResult` completions**. Blocking inside a `state_listeners` function, however, runs synchronously on the `send_event()` caller (after `_dispatch_lock` is released) and stalls that thread/greenlet—and any subsequent queued state notifications—until it returns.
 
 ---
 
