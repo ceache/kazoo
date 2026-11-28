@@ -117,7 +117,7 @@ class TestBuildSSLContext:
             )
 
     def test_client_tls_config_dynamic_and_ssl_context_cached(self) -> None:
-        """[L-3][E-3] tls_config reflects mutations; SSLContext is cached."""
+        """tls_config reflects mutations; SSLContext is cached."""
         client = KazooClient(
             hosts="127.0.0.1:2181",
             use_ssl=True,
@@ -148,7 +148,7 @@ class TestBuildSSLContext:
             assert spy_build.call_count == 2
 
     def test_create_tcp_connection_reuses_supplied_ssl_context(self) -> None:
-        """[E-3] create_tcp_connection reuses supplied ssl_context."""
+        """create_tcp_connection reuses supplied ssl_context."""
         import socket
         from unittest.mock import Mock
 
@@ -182,7 +182,7 @@ class TestBuildSSLContext:
     def test_client_ssl_context_reloads_when_cert_or_ca_rotates(
         self, tmp_path: Path
     ) -> None:
-        """[M-2] Rewriting or replacing TLS files invalidates the cache."""
+        """Rewriting or replacing TLS files invalidates the cache."""
         import os
 
         ca_file = tmp_path / "ca.pem"
