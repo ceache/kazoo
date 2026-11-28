@@ -16,20 +16,19 @@ from __future__ import annotations
 import atexit
 import logging
 import queue
+import selectors
 import socket
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
 from kazoo.handlers import utils
-from kazoo.handlers.utils import selector_select
 from kazoo.interfaces import IHandler
 
 if TYPE_CHECKING:
     from kazoo.interfaces import (
         Event,
-        FdLike,
         Lockable,
         ReentrantLock,
         Socket,
@@ -41,25 +40,6 @@ if TYPE_CHECKING:
 _STOP = object()
 
 log = logging.getLogger(__name__)
-
-
-def _to_fileno(obj: FdLike) -> int:
-    if isinstance(obj, int):
-        fd = int(obj)
-    elif hasattr(obj, "fileno"):
-        fd = obj.fileno()
-        if not isinstance(fd, int):
-            raise TypeError("fileno() returned a non-integer")
-        fd = int(fd)
-    else:
-        raise TypeError("argument must be an int, or have a fileno() method.")
-
-    if fd < 0:
-        raise ValueError(
-            "file descriptor cannot be a negative integer (%d)" % (fd,)
-        )
-
-    return fd
 
 
 class KazooTimeoutError(Exception):
@@ -104,7 +84,7 @@ class SequentialThreadingHandler(IHandler):
 
     name = "sequential_threading_handler"
     timeout_exception = KazooTimeoutError
-    sleep_func = staticmethod(time.sleep)  # type: ignore[assignment]
+    sleep_func = staticmethod(time.sleep)
     queue_impl = queue.Queue
     queue_empty = queue.Empty
 
@@ -182,10 +162,8 @@ class SequentialThreadingHandler(IHandler):
             self.completion_queue = self.queue_impl()
             atexit.unregister(self.stop)
 
-    def select(
-        self, *args: Any, **kwargs: Any
-    ) -> tuple[Iterable[FdLike], Iterable[FdLike], Iterable[FdLike]]:
-        return selector_select(*args, **kwargs)
+    def create_selector(self) -> selectors.BaseSelector:
+        return selectors.DefaultSelector()
 
     def socket(self) -> Socket:
         return utils.create_tcp_socket(socket)

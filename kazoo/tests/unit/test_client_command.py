@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import Mock, patch
 
 from kazoo.client import KazooClient
+from kazoo.protocol.statemachine import Connected
 
 
 class TestClientCommand:
@@ -12,7 +13,7 @@ class TestClientCommand:
 
     def test_passes_peer_host_as_hostname(self) -> None:
         client = KazooClient(hosts="127.0.0.1:2181")
-        client._live.set()
+        client._state_machine.state = Connected()
         client._connection = Mock()
         client._connection._socket = Mock()
         client._connection._socket.getpeername.return_value = (

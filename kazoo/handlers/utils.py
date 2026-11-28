@@ -2,32 +2,26 @@
 
 from __future__ import annotations
 
-import errno
 import functools
-import select
-import selectors
+import logging
 import socket
 import ssl
 import time
-from collections import defaultdict
-from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, Any, TypeVar
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from typing_extensions import ParamSpec
 
-from kazoo.interfaces import FdLike, IAsyncResult
+from kazoo.interfaces import IAsyncResult
+from kazoo.protocol.tls import TLSConfig, build_ssl_context
 
 if TYPE_CHECKING:
     from types import ModuleType
 
     from kazoo.interfaces import Socket
 
-HAS_FNCTL = True
-try:
-    import fcntl
-except ImportError:  # pragma: nocover
-    HAS_FNCTL = False
 
+log = logging.getLogger(__name__)
 
 # sentinel objects
 # Note: This needs to be a unique object that is not None, as None is used to
@@ -154,69 +148,25 @@ class AsyncResult(IAsyncResult):
                     functools.partial(callback, self)
                 )
             else:
-                functools.partial(callback, self)()
-
-
-def _set_fd_cloexec(fd: Socket) -> None:
-    flags = fcntl.fcntl(fd, fcntl.F_GETFD)
-    fcntl.fcntl(fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+                try:
+                    functools.partial(callback, self)()
+                except Exception:
+                    log.exception("Exception in AsyncResult callback")
 
 
 def _set_default_tcpsock_options(module: ModuleType, sock: Socket) -> Socket:
     sock.setsockopt(module.IPPROTO_TCP, module.TCP_NODELAY, 1)
-    if HAS_FNCTL:
-        _set_fd_cloexec(sock)
     return sock
 
 
-def create_socket_pair(
-    module: ModuleType, port: int = 0
-) -> tuple[Socket, Socket]:
-    """Create socket pair.
-
-    If socket.socketpair isn't available, we emulate it.
-    """
-    # See if socketpair() is available.
-    have_socketpair = hasattr(module, "socketpair")
-    if have_socketpair:
-        client_sock, srv_sock = module.socketpair()
-        return client_sock, srv_sock
-
-    # Create a non-blocking temporary server socket
-    temp_srv_sock = module.socket()
-    temp_srv_sock.setblocking(False)
-    temp_srv_sock.bind(("", port))
-    port = temp_srv_sock.getsockname()[1]
-    temp_srv_sock.listen(1)
-
-    # Create non-blocking client socket
-    client_sock = module.socket()
-    client_sock.setblocking(False)
-    try:
-        client_sock.connect(("localhost", port))
-    except module.error as err:
-        # EWOULDBLOCK is not an error, as the socket is non-blocking
-        if err.errno != errno.EWOULDBLOCK:
-            raise
-
-    # Use select to wait for connect() to succeed.
-    timeout = 1
-    readable = select.select([temp_srv_sock], [], [], timeout)[0]
-    if temp_srv_sock not in readable:
-        raise Exception(
-            "Client socket not connected in %s second(s)" % (timeout)
-        )
-    srv_sock, _ = temp_srv_sock.accept()
-    return client_sock, srv_sock
+def create_socket_pair(module: ModuleType) -> tuple[Socket, Socket]:
+    """Create a connected pair of sockets using ``module.socketpair()``."""
+    return cast("tuple[Socket, Socket]", module.socketpair())
 
 
 def create_tcp_socket(module: ModuleType) -> Socket:
-    """Create a TCP socket with the CLOEXEC flag set."""
-    type_ = module.SOCK_STREAM
-    if hasattr(module, "SOCK_CLOEXEC"):  # pragma: nocover
-        # if available, set cloexec flag during socket creation
-        type_ |= module.SOCK_CLOEXEC
-    sock: Socket = module.socket(module.AF_INET, type_)
+    """Create a TCP socket with default Kazoo options."""
+    sock: Socket = module.socket(module.AF_INET, module.SOCK_STREAM)
     _set_default_tcpsock_options(module, sock)
     return sock
 
@@ -235,6 +185,7 @@ def create_tcp_connection(
     check_hostname: bool = False,
     options: ssl.Options | None = None,
     ciphers: str | None = None,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> Socket:
     end = None
     if timeout is None:
@@ -244,6 +195,22 @@ def create_tcp_connection(
     if timeout is not None:
         end = time.monotonic() + timeout
     sock: Socket | None = None
+    if use_ssl and ssl_context is None:
+        ssl_context = build_ssl_context(
+            TLSConfig(
+                use_ssl=True,
+                ca=ca,
+                certfile=certfile,
+                keyfile=keyfile,
+                keyfile_password=keyfile_password,
+                verify_certs=verify_certs,
+                check_hostname=check_hostname,
+                options=options,
+                ciphers=ciphers,
+            )
+        )
+    elif not use_ssl:
+        ssl_context = None
 
     while True:
         timeout_at = end if end is None else end - time.monotonic()
@@ -252,46 +219,13 @@ def create_tcp_connection(
         if timeout_at is not None and timeout_at <= 0:
             break
 
-        if use_ssl:
-            # Disallow use of SSLv2 and V3 (meaning we require TLSv1.0+)
-            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-
-            if options is not None:
-                context.options = options
-            else:
-                context.options |= ssl.OP_NO_SSLv2
-                context.options |= ssl.OP_NO_SSLv3
-
-            if ciphers:
-                context.set_ciphers(ciphers)
-
-            # Load default CA certs
-            context.load_default_certs(ssl.Purpose.SERVER_AUTH)
-            if check_hostname and not verify_certs:
-                raise ValueError(
-                    "verify_certs must be True when"
-                    + " check_hostname is True"
-                )
-            # We must set check_hostname to False prior to setting
-            # verify_mode to CERT_NONE.
-            context.check_hostname = check_hostname
-            context.verify_mode = (
-                ssl.CERT_REQUIRED if verify_certs else ssl.CERT_NONE
-            )
-            if ca:
-                context.load_verify_locations(ca)
-            if certfile and keyfile:
-                context.load_cert_chain(
-                    certfile=certfile,
-                    keyfile=keyfile,
-                    password=keyfile_password,
-                )
+        if ssl_context is not None:
             try:
-                # Query the address to get back it's address family
+                # Query the address to get back its address family
                 addrs = socket.getaddrinfo(
                     address[0], address[1], 0, socket.SOCK_STREAM
                 )
-                conn = context.wrap_socket(
+                conn = ssl_context.wrap_socket(
                     module.socket(addrs[0][0]), server_hostname=hostname
                 )
                 conn.settimeout(timeout_at)
@@ -383,85 +317,3 @@ def wrap(
         return captured_function
 
     return capture
-
-
-def fileobj_to_fd(fileobj: FdLike) -> int:
-    """Return a file descriptor from a file object.
-
-    Parameters:
-    fileobj -- file object or file descriptor
-
-    Returns:
-    corresponding file descriptor
-
-    Raises:
-    TypeError if the object is invalid
-    """
-    if isinstance(fileobj, int):
-        fd = fileobj
-    else:
-        # FIXME given the protocol I don't think the try/catch/int are
-        # required.
-        try:
-            fd = int(fileobj.fileno())
-        except (AttributeError, TypeError, ValueError):
-            raise TypeError("Invalid file object: {!r}".format(fileobj))
-    # FIXME Questionable, just let select deal with it.
-    if fd < 0:
-        raise TypeError("Invalid file descriptor: {}".format(fd))
-    return fd
-
-
-def selector_select(
-    rlist: Iterable[FdLike],
-    wlist: Iterable[FdLike],
-    xlist: Iterable[FdLike],
-    timeout: float | None = None,
-    selectors_module: ModuleType = selectors,
-) -> tuple[list[FdLike], list[FdLike], list[FdLike]]:
-    """Selector-based drop-in replacement for select to overcome select
-    limitation on a maximum filehandle value.
-    """
-    if timeout is not None:
-        if not isinstance(timeout, (int, float)):
-            raise TypeError("timeout must be a number")
-        if timeout < 0:
-            raise ValueError("timeout must be non-negative")
-
-    events_mapping = {
-        selectors_module.EVENT_READ: rlist,
-        selectors_module.EVENT_WRITE: wlist,
-    }
-    fd_events: defaultdict[int, int] = defaultdict(int)
-    fd_fileobjs: defaultdict[int, list[FdLike]] = defaultdict(list)
-
-    for event, fileobjs in events_mapping.items():
-        for fileobj in fileobjs:
-            fd = fileobj_to_fd(fileobj)
-            fd_events[fd] |= event
-            fd_fileobjs[fd].append(fileobj)
-
-    selector = selectors_module.DefaultSelector()
-    for fd, events in fd_events.items():
-        try:
-            selector.register(fd, events)
-        except (ValueError, OSError) as e:
-            # gevent can raise OSError
-            raise ValueError("Invalid event mask or fd") from e
-
-    revents: list[FdLike] = []
-    wevents: list[FdLike] = []
-    xevents: list[FdLike] = []
-    try:
-        ready = selector.select(timeout)
-    finally:
-        selector.close()
-
-    for info in ready:
-        k, events = info
-        if events & selectors_module.EVENT_READ:
-            revents.extend(fd_fileobjs[k.fd])
-        elif events & selectors_module.EVENT_WRITE:
-            wevents.extend(fd_fileobjs[k.fd])
-
-    return revents, wevents, xevents

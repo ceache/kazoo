@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import atexit
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
 # FIXME This is messy.
@@ -20,12 +20,13 @@ from gevent import socket
 from gevent.lock import RLock, Semaphore
 
 from kazoo.handlers import utils
-from kazoo.handlers.utils import selector_select
 
 if TYPE_CHECKING:
+    import selectors
+
     from gevent import Greenlet
 
-    from kazoo.interfaces import FdLike, Lockable, Socket
+    from kazoo.interfaces import Event, Lockable, Socket
     from kazoo.protocol.states import Callback
 
 _using_libevent = gevent.__version__.startswith("0.")
@@ -145,17 +146,14 @@ class SequentialGeventHandler:
 
             atexit.unregister(self.stop)
 
-    def select(
-        self, *args: Any, **kwargs: Any
-    ) -> tuple[Iterable[FdLike], Iterable[FdLike], Iterable[FdLike]]:
-        # FIXME use the correct arguments, not *args, *kwargs
-        return selector_select(
-            # Likely a bug in mypy (see
-            # https://github.com/python/mypy/issues/6799)
-            *args,
-            selectors_module=gevent.selectors,
-            **kwargs,  # type: ignore[misc]
+    def create_selector(self) -> selectors.BaseSelector:
+        return cast(
+            "selectors.BaseSelector", gevent.selectors.DefaultSelector()
         )
+
+    def yield_control(self) -> None:
+        """Yield to the gevent hub so sibling greenlets can make progress."""
+        gevent.sleep(0)
 
     def socket(self) -> Socket:
         return utils.create_tcp_socket(socket)
@@ -166,9 +164,9 @@ class SequentialGeventHandler:
     def create_socket_pair(self) -> tuple[Socket, Socket]:
         return utils.create_socket_pair(socket)
 
-    def event_object(self) -> gevent.event.Event:
+    def event_object(self) -> Event:
         """Create an appropriate Event object"""
-        return gevent.event.Event()
+        return cast("Event", gevent.event.Event())
 
     def lock_object(self) -> Lockable:
         """Create an appropriate Lock object"""

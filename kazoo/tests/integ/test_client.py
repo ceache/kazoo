@@ -28,6 +28,11 @@ from kazoo.exceptions import (
     UnimplementedError,
 )
 from kazoo.protocol.connection import _CONNECTION_DROP
+from kazoo.protocol.statemachine import (
+    AuthFailed,
+    Connected,
+    ExpiredSession,
+)
 from kazoo.protocol.states import (
     AddWatchMode,
     EventType,
@@ -38,7 +43,26 @@ from kazoo.protocol.states import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from kazoo.client import KazooClient
+
+
+def _wait_until(
+    client: KazooClient,
+    predicate: Callable[[], bool],
+    timeout: float = 5.0,
+    interval: float = 0.01,
+) -> bool:
+    """Poll predicate until it holds or timeout; return its last value.
+
+    Sleeps with the client handler's sleep so that green handlers yield to
+    the hub and their callback workers get to run.
+    """
+    deadline = time.monotonic() + timeout
+    while not predicate() and time.monotonic() < deadline:
+        client.handler.sleep_func(interval)
+    return predicate()
 
 
 class TestClientTransitions:
@@ -318,7 +342,6 @@ class TestConnection:
 
         client.add_listener(listener)
         client._make_state_change(KazooState.CONNECTED)
-        condition.wait(3)
         assert called[0] is False
 
     def test_no_connection(self, zkclient):
@@ -392,8 +415,8 @@ class TestConnection:
 
         # sneak in and patch client to simulate race between a thread
         # calling stop(); close() and one running a command
-        oldstate = client._state
-        client._state = KeeperState.CONNECTED
+        oldstate = client._state_machine.state
+        client._state_machine.state = Connected()
         client._connection._write_sock = write_sock
 
         try:
@@ -409,7 +432,7 @@ class TestConnection:
 
         finally:
             # reset for teardown
-            client._state = oldstate
+            client._state_machine.state = oldstate
             client._connection._write_sock = None
 
     def test_watch_trigger_expire(self, zkclient):
@@ -433,6 +456,17 @@ class TestClient:
         from kazoo.handlers.threading import SequentialThreadingHandler
 
         return SequentialThreadingHandler(*args)
+
+    def test_stopped_client_is_idle(self, zkclient):
+        """A client that is stopped but not closed uses no CPU."""
+        client = zkclient
+        # Twice, so the second round covers a restarted client.
+        for _ in range(2):
+            client.stop()
+            cpu_before = time.process_time()
+            client.handler.sleep_func(0.2)
+            assert time.process_time() - cpu_before < 0.05
+            client.start()
 
     def test_server_version_retries_fail(self, zkclient):
         client = zkclient
@@ -476,12 +510,15 @@ class TestClient:
 
     def test_create_on_broken_connection(self, zkclient):
         client = zkclient
+        # Stop zk_loop first so background reconnection cannot race between
+        # setting ExpiredSession and calling create().
+        client.stop()
 
-        client._state = KeeperState.EXPIRED_SESSION
+        client._state_machine.state = ExpiredSession()
         with pytest.raises(SessionExpiredError):
             client.create("/closedpath", b"bar")
 
-        client._state = KeeperState.AUTH_FAILED
+        client._state_machine.state = AuthFailed(error=AuthFailedError())
         with pytest.raises(AuthFailedError):
             client.create("/closedpath", b"bar")
 
@@ -1038,22 +1075,20 @@ class TestClient:
 
     def test_invalid_auth(self, zkclient):
         from kazoo.exceptions import AuthFailedError
-        from kazoo.protocol.states import KeeperState
+        from kazoo.protocol.statemachine import AuthFailed
 
         client = zkclient
         client.stop()
-        client._state = KeeperState.AUTH_FAILED
+        client._state_machine.state = AuthFailed(error=AuthFailedError())
 
         with pytest.raises(AuthFailedError):
             client.get("/")
 
     def test_client_state(self, zkclient):
-        from kazoo.protocol.states import KeeperState
 
         assert zkclient.client_state == KeeperState.CONNECTED
 
     def test_update_host_list(self, zkensemble):
-        from kazoo.protocol.states import KeeperState
 
         hosts = f"{zkensemble.zk_ip}:{zkensemble.zk1_port}"
         # create a client with only one server in its list
@@ -1090,6 +1125,8 @@ class TestClient:
             assert client.client_state == KeeperState.CONNECTED
         finally:
             zkensemble.start("zoo1")
+            client.stop()
+            client.close()
 
     # utility for test_request_queuing*
     def _make_request_queuing_client(
@@ -1251,8 +1288,10 @@ class TestClient:
         client.remove_all_watches("/a", WatcherType.ANY)
         # Perform one more call that we don't expect to see
         client.create("/a")
-        # Wait in case the callback does arrive
-        time.sleep(3)
+        # Wait for the expected events, then a short grace in case the
+        # unexpected one does arrive
+        _wait_until(client, lambda: len(events) >= 5)
+        client.handler.sleep_func(0.2)
         assert client._persistent_watchers[full_path] == set()
         assert events == [
             dict(type=EventType.CREATED, path="/a"),
@@ -1285,8 +1324,10 @@ class TestClient:
         client.remove_all_watches("/a", WatcherType.ANY)
         # Perform one more call that we don't expect to see
         client.create("/a")
-        # Wait in case the callback does arrive
-        time.sleep(3)
+        # Wait for the expected events, then a short grace in case the
+        # unexpected one does arrive
+        _wait_until(client, lambda: len(events) >= 10)
+        client.handler.sleep_func(0.2)
         assert client._persistent_recursive_watchers[full_path] == set()
         assert events == [
             dict(type=EventType.CREATED, path="/a"),
@@ -1322,8 +1363,10 @@ class TestClient:
         client.remove_all_watches("/", WatcherType.ANY)
         # Perform one more call that we don't expect to see
         client.create("/root_test")
-        # Wait in case the callback does arrive
-        time.sleep(3)
+        # Wait for the expected events, then a short grace in case the
+        # unexpected one does arrive
+        _wait_until(client, lambda: len(events) >= 4)
+        client.handler.sleep_func(0.2)
         assert client._persistent_recursive_watchers[full_path] == set()
         assert events == [
             dict(type=EventType.CREATED, path="/root_test"),
@@ -1335,7 +1378,7 @@ class TestClient:
     @pytest.mark.zk_version(">=3.6")
     def test_remove_data_watch(self, zkclient):
         """Test that removing a data watch leaves a child watch in place."""
-        callback_event = threading.Event()
+        callback_event = zkclient.handler.event_object()
 
         def child_callback(event):
             callback_event.set()
@@ -1350,11 +1393,12 @@ class TestClient:
         client.remove_all_watches("/a", WatcherType.DATA)
         client.create("/a/b")
         callback_event.wait(30)
+        assert callback_event.is_set()
 
     @pytest.mark.zk_version(">=3.6")
     def test_remove_children_watch(self, zkclient):
         """Test that removing a children watch leaves a data watch in place."""
-        callback_event = threading.Event()
+        callback_event = zkclient.handler.event_object()
 
         def data_callback(event):
             callback_event.set()
@@ -1369,6 +1413,7 @@ class TestClient:
         client.remove_all_watches("/a", WatcherType.CHILDREN)
         client.set("/a", b"1")
         callback_event.wait(30)
+        assert callback_event.is_set()
 
     def test_invalid_add_watch_values(self, zkclient):
         def callback(event):
@@ -1421,9 +1466,10 @@ class TestClient:
 
         # Update /a_iso: persistent watch should fire, data watch should not
         client.set("/a_iso", b"v2")
-        time.sleep(1)
-
-        assert any(ev.type == EventType.CHANGED for ev in events)
+        assert _wait_until(
+            client,
+            lambda: any(ev.type == EventType.CHANGED for ev in events),
+        )
 
     @pytest.mark.zk_version(">=3.6")
     def test_persistent_watch_multiple_and_deduplicate(self, zkclient):
@@ -1444,7 +1490,7 @@ class TestClient:
         client.add_watch("/multi", cb1, AddWatchMode.PERSISTENT)
 
         client.create("/multi")
-        time.sleep(1)
+        _wait_until(client, lambda: bool(events_1) and bool(events_2))
 
         assert len(events_1) == 1
         assert len(events_2) == 1
@@ -1494,7 +1540,7 @@ class TestClient:
         client.create("/combo/child")
         client.delete("/combo/child")
         client.delete("/combo")
-        time.sleep(1)
+        client.handler.sleep_func(0.2)
 
         assert len(data_events) == 0
         assert len(child_events) == 0
@@ -1526,16 +1572,21 @@ class TestClient:
 
         # Create child under /hier/mid: both should receive CREATED
         client.create("/hier/mid/leaf", b"v1")
-        time.sleep(1)
 
-        assert any(
-            ev.path == "/hier/mid/leaf" and ev.type == EventType.CREATED
-            for ev in events_root
+        def saw_leaf_created(events):
+            return any(
+                ev.path == "/hier/mid/leaf" and ev.type == EventType.CREATED
+                for ev in events
+            )
+
+        _wait_until(
+            client,
+            lambda: (
+                saw_leaf_created(events_root) and saw_leaf_created(events_mid)
+            ),
         )
-        assert any(
-            ev.path == "/hier/mid/leaf" and ev.type == EventType.CREATED
-            for ev in events_mid
-        )
+        assert saw_leaf_created(events_root)
+        assert saw_leaf_created(events_mid)
 
         # Clean up
         client.remove_all_watches("/hier/mid", WatcherType.ANY)
@@ -1605,38 +1656,47 @@ class TestClient:
         client = zkclient
         nodepath = "/" + uuid.uuid4().hex
         childpath = nodepath + "/child"
-        event = client.handler.event_object()
         pers_events = []
         rec_events = []
 
         def pers_w(watch_event):
             pers_events.append(watch_event)
-            event.set()
 
         def rec_w(watch_event):
             rec_events.append(watch_event)
-            event.set()
+
+        def wait_events(
+            expected_pers: int, expected_rec: int, timeout: float = 5.0
+        ) -> None:
+            _wait_until(
+                client,
+                lambda: (
+                    len(pers_events) >= expected_pers
+                    and len(rec_events) >= expected_rec
+                ),
+                timeout,
+            )
+            assert len(pers_events) >= expected_pers, (
+                f"pers_events: want >={expected_pers}, got {len(pers_events)}"
+            )
+            assert len(rec_events) >= expected_rec, (
+                f"rec_events: want >={expected_rec}, got {len(rec_events)}"
+            )
 
         client.add_watch(nodepath, pers_w, AddWatchMode.PERSISTENT)
         client.add_watch(nodepath, rec_w, AddWatchMode.PERSISTENT_RECURSIVE)
 
         # 1. CREATED
         client.create(nodepath)
-        event.wait(5)
-        event.clear()
-        time.sleep(0.2)
-        assert len(pers_events) >= 1
+        wait_events(1, 1)
         assert pers_events[-1].type == EventType.CREATED
         assert pers_events[-1].zxid > -1
-        assert len(rec_events) >= 1
         assert rec_events[-1].type == EventType.CREATED
         assert rec_events[-1].zxid > -1
 
         # 2. CHANGED
         client.set(nodepath, b"data")
-        event.wait(5)
-        event.clear()
-        time.sleep(0.2)
+        wait_events(2, 2)
         assert pers_events[-1].type == EventType.CHANGED
         assert pers_events[-1].zxid > -1
         assert rec_events[-1].type == EventType.CHANGED
@@ -1644,9 +1704,7 @@ class TestClient:
 
         # 3. CHILD / CREATED on child
         client.create(childpath)
-        event.wait(5)
-        event.clear()
-        time.sleep(0.2)
+        wait_events(3, 3)
         assert pers_events[-1].type == EventType.CHILD
         assert pers_events[-1].zxid > -1
         assert rec_events[-1].path == childpath

@@ -10,11 +10,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, Any, Protocol
+import selectors
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
+
+from typing_extensions import Buffer
 
 if TYPE_CHECKING:
-    import queue
     from types import TracebackType
 
     from kazoo.protocol.states import Callback
@@ -28,7 +30,20 @@ class HasFileNo(Protocol):
     def fileno(self) -> int: ...
 
 
-FdLike = int | HasFileNo
+T_contra = TypeVar("T_contra", contravariant=True)
+
+
+class ICompletion(Protocol[T_contra]):
+    """Minimal completion handle resolved or failed by protocol decoding."""
+
+    def set(self, value: T_contra, /) -> None: ...
+    def set_exception(self, exception: Exception, /) -> None: ...
+
+
+class HasUnchroot(Protocol):
+    """Protocol for stripping a chroot prefix from ZooKeeper paths."""
+
+    def unchroot(self, path: str) -> str: ...
 
 
 class Socket(HasFileNo, Protocol):
@@ -49,6 +64,10 @@ class Socket(HasFileNo, Protocol):
     def getsockname(self) -> tuple[str, int]: ...
 
     def recv(self, bufsize: int, flags: int = 0) -> bytes: ...
+
+    def recv_into(
+        self, buffer: Buffer, nbytes: int = 0, flags: int = 0
+    ) -> int: ...
 
     def send(self, data: bytes | memoryview, flags: int = 0) -> int: ...
 
@@ -94,7 +113,7 @@ class ReentrantLock(Protocol):
     In python 3.14+, it's the same as Lock, which adds to the fun.
     """
 
-    def __enter__(self) -> None: ...
+    def __enter__(self) -> bool | None: ...
 
     def __exit__(
         self,
@@ -122,8 +141,6 @@ class Event(Protocol):
 
 class Threadlike(Protocol):
     """Protocol for something like a thread."""
-
-    def is_alive(self) -> bool: ...
 
     def join(self, timeout: float | None = None) -> None: ...
 
@@ -165,10 +182,16 @@ class IHandler(Protocol):
     """
 
     # FIXME These should be methods but I want to avoid changing the API for
-    # now.
-    timeout_exception: type[Exception] = None  # type: ignore[assignment]
-    sleep_func: staticmethod[[float], None] = None  # type: ignore[assignment]
-    queue_impl: type[queue.Queue[Any]] = None  # type: ignore[assignment]
+    # now. Declared as read-only properties on the Protocol so implementations
+    # may provide class attributes, nested exception classes, or staticmethods.
+    @property
+    def timeout_exception(self) -> type[BaseException]: ...
+
+    @property
+    def sleep_func(self) -> Callable[[float], Any]: ...
+
+    @property
+    def queue_impl(self) -> type[Any]: ...
 
     def start(self) -> None:
         """Start the handler, used for setting up the handler."""
@@ -177,15 +200,24 @@ class IHandler(Protocol):
         """Stop the handler. Should block until the handler is safely
         stopped."""
 
-    def select(
-        self,
-        rlist: Iterable[FdLike],
-        wlist: Iterable[FdLike],
-        xlist: Iterable[FdLike],
-        timeout: float | None = None,
-    ) -> tuple[Iterable[FdLike], Iterable[FdLike], Iterable[FdLike]]:
-        """A select method that implements Python's select.select
-        API"""
+    def create_selector(self) -> selectors.BaseSelector:
+        """Return a new persistent :class:`selectors.BaseSelector` appropriate
+        for this handler.
+
+        This is the sole socket readiness-polling primitive on
+        :class:`IHandler`.
+        """
+        return selectors.DefaultSelector()
+
+    def yield_control(self) -> None:
+        """Yield execution briefly to sibling coroutines/threads when draining
+        large response bursts without returning to the selector.
+
+        Cooperative greenlet handlers (gevent, eventlet) override this to
+        yield to their hub without introducing wall-clock timer sleep. The
+        default implementation is a no-op suitable for OS-thread handlers.
+        """
+        return
 
     def socket(self) -> Socket:
         """A socket method that implements Python's socket.socket API"""
@@ -193,7 +225,12 @@ class IHandler(Protocol):
     # FIXME This should have a proper set of parameters.
     def create_connection(self, *args: Any, **kwargs: Any) -> Socket:
         """A socket method that implements Python's socket.create_connection
-        API"""
+        API.
+
+        When ``use_ssl=True``, Kazoo passes a pre-built ``ssl_context``
+        keyword argument (:class:`ssl.SSLContext`) alongside the legacy TLS
+        keyword arguments so custom handlers can reuse the cached context.
+        """
 
     def create_socket_pair(self) -> tuple[Socket, Socket]:
         """A socket method that implements Python's socket.socketpair API"""
@@ -319,7 +356,7 @@ class IAsyncResult(Protocol):
         :meth:`set_exception` has been called or until the optional
         timeout occurs."""
 
-    def rawlink(self, callback: Callable[[IAsyncResult], Any]) -> None:
+    def rawlink(self, callback: Callable[[Any], Any], /) -> None:
         """Register a callback to call when a value or an exception is
         set
 
@@ -331,7 +368,7 @@ class IAsyncResult(Protocol):
 
         """
 
-    def unlink(self, callback: Callable[[IAsyncResult], None]) -> None:
+    def unlink(self, callback: Callable[[Any], Any], /) -> None:
         """Remove the callback set by :meth:`rawlink`
 
         :param callback: A callback function to remove.
@@ -340,6 +377,6 @@ class IAsyncResult(Protocol):
         """
 
     @property
-    def exception(self) -> Exception | None:
+    def exception(self) -> BaseException | None:
         """The exception set by :meth:`set_exception` or `None` if no
         exception has been set"""

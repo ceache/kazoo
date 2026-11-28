@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import logging
+import selectors
 from collections.abc import Generator
 from typing import TYPE_CHECKING, Any, cast
 
@@ -16,12 +17,10 @@ from eventlet.green import threading as green_threading
 from eventlet.green import time as green_time
 
 from kazoo.handlers import utils
-from kazoo.handlers.utils import selector_select
 
 if TYPE_CHECKING:
     from kazoo.interfaces import (
         Event,
-        FdLike,
         IHandler,
         Lockable,
         ReentrantLock,
@@ -48,6 +47,56 @@ def _yield_before_after() -> Generator[None, None, None]:
         yield
     finally:
         eventlet.sleep(0)  # type: ignore[no-untyped-call]
+
+
+class _EventletSelector(selectors.BaseSelector):
+    """Thin ``selectors.BaseSelector`` adapter over eventlet's green selector.
+
+    ``eventlet.green.selectors.DefaultSelector`` subclasses eventlet's green
+    copy of ``selectors.BaseSelector`` rather than the stdlib class and
+    already yields cooperatively to the eventlet hub inside ``select()``.
+    """
+
+    def __init__(self) -> None:
+        self._selector = green_selectors.DefaultSelector()
+
+    def register(
+        self, fileobj: Any, events: int, data: Any = None
+    ) -> selectors.SelectorKey:
+        return cast(
+            "selectors.SelectorKey",
+            self._selector.register(fileobj, events, data),
+        )
+
+    def unregister(self, fileobj: Any) -> selectors.SelectorKey:
+        return cast(
+            "selectors.SelectorKey", self._selector.unregister(fileobj)
+        )
+
+    def modify(
+        self, fileobj: Any, events: int, data: Any = None
+    ) -> selectors.SelectorKey:
+        return cast(
+            "selectors.SelectorKey",
+            self._selector.modify(fileobj, events, data),
+        )
+
+    def get_key(self, fileobj: Any) -> selectors.SelectorKey:
+        return cast("selectors.SelectorKey", self._selector.get_key(fileobj))
+
+    def get_map(self) -> Any:
+        return self._selector.get_map()
+
+    def select(
+        self, timeout: float | None = None
+    ) -> list[tuple[selectors.SelectorKey, int]]:
+        return cast(
+            "list[tuple[selectors.SelectorKey, int]]",
+            self._selector.select(timeout),
+        )
+
+    def close(self) -> None:
+        self._selector.close()
 
 
 class TimeoutError(Exception):
@@ -206,21 +255,15 @@ class SequentialEventletHandler:
     def create_connection(self, *args: Any, **kwargs: Any) -> Socket:
         return utils.create_tcp_connection(green_socket, *args, **kwargs)
 
-    # FIXME fix parameters
-    def select(
-        self, *args: Any, **kwargs: Any
-    ) -> tuple[list[FdLike], list[FdLike], list[FdLike]]:
-        with _yield_before_after():
-            # Following appears to be a bug in mypy (see
-            # https://github.com/python/mypy/issues/6799)
-            return selector_select(
-                *args,
-                selectors_module=green_selectors,  # type: ignore[misc]
-                **kwargs,
-            )
+    def create_selector(self) -> selectors.BaseSelector:
+        return _EventletSelector()
+
+    def yield_control(self) -> None:
+        """Yield to the eventlet hub so sibling greenlets can make progress."""
+        eventlet.sleep(0)  # type: ignore[no-untyped-call]
 
     def async_result(self) -> AsyncResult:
-        return AsyncResult(self)  # type: ignore[arg-type]
+        return AsyncResult(self)
 
     def spawn(
         self, func: Any, *args: Any, **kwargs: Any

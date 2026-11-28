@@ -8,12 +8,12 @@ from unittest.mock import patch
 
 import pytest
 
-from kazoo.exceptions import ConnectionLoss
+from kazoo.exceptions import ConnectionLoss, ReplyTooLargeError
 from kazoo.protocol.connection import _CONNECTION_DROP
 from kazoo.protocol.serialization import (
     Connect,
+    _write_string_into,
     int_struct,
-    write_string,
 )
 from kazoo.protocol.states import KazooState
 from kazoo.tests.util import wait
@@ -24,7 +24,7 @@ class Delete(namedtuple("Delete", "path version")):
 
     def serialize(self):
         b = bytearray()
-        b.extend(write_string(self.path))
+        _write_string_into(b, self.path)
         b.extend(int_struct.pack(self.version))
         return b
 
@@ -63,15 +63,15 @@ class TestConnectionHandler:
         ev = threading.Event()
         path = "/" + uuid.uuid4().hex
         handler = zkclient.handler
-        _select = handler.select
-        _socket = zkclient._connection._socket
+        conn = zkclient._connection
+        orig_read_packet = conn._read_packet
+        _socket = conn._socket
 
-        def delayed_select(*args, **kwargs):
-            result = _select(*args, **kwargs)
-            if len(args[0]) == 1 and _socket in args[0]:
-                # for any socket read, simulate a timeout
-                return [], [], []
-            return result
+        def timed_out_read(timeout, **kwargs):
+            if conn._socket is _socket:
+                # for any socket read on current socket, simulate a timeout
+                raise handler.timeout_exception("socket time-out during read")
+            return orig_read_packet(timeout, **kwargs)
 
         def back(state):
             if state == KazooState.CONNECTED:
@@ -80,11 +80,11 @@ class TestConnectionHandler:
         zkclient.add_listener(back)
         zkclient.create(path, b"1")
         try:
-            handler.select = delayed_select
+            conn._read_packet = timed_out_read
             with pytest.raises(ConnectionLoss):
                 zkclient.get(path)
         finally:
-            handler.select = _select
+            conn._read_packet = orig_read_packet
         # the client reconnects automatically
         ev.wait(5)
         assert ev.is_set()
@@ -94,15 +94,11 @@ class TestConnectionHandler:
         ev = threading.Event()
         path = "/" + uuid.uuid4().hex
         handler = zkclient.handler
-        _select = handler.select
-        _socket = zkclient._connection._socket
+        orig_write = zkclient._connection._write
 
-        def delayed_select(*args, **kwargs):
-            result = _select(*args, **kwargs)
-            if _socket in args[1]:
-                # for any socket write, simulate a timeout
-                return [], [], []
-            return result
+        def delayed_write(msg, timeout=None):
+            # for any socket write, simulate a timeout
+            raise handler.timeout_exception("socket time-out during write")
 
         def back(state):
             if state == KazooState.CONNECTED:
@@ -111,11 +107,11 @@ class TestConnectionHandler:
         zkclient.add_listener(back)
 
         try:
-            handler.select = delayed_select
+            zkclient._connection._write = delayed_write
             with pytest.raises(ConnectionLoss):
                 zkclient.create(path)
         finally:
-            handler.select = _select
+            zkclient._connection._write = orig_write
         # the client reconnects automatically
         ev.wait(5)
         assert ev.is_set()
@@ -125,15 +121,11 @@ class TestConnectionHandler:
         ev = threading.Event()
         path = "/" + uuid.uuid4().hex
         handler = zkclient.handler
-        _select = handler.select
-        _socket = zkclient._connection._socket
+        orig_write = zkclient._connection._write
 
-        def delayed_select(*args, **kwargs):
-            result = _select(*args, **kwargs)
-            if _socket in args[1]:
-                # for any socket write, simulate a timeout
-                return [], [], []
-            return result
+        def delayed_write(msg, timeout=None):
+            # for any socket write, simulate a timeout
+            raise handler.timeout_exception("socket time-out during write")
 
         def back(state):
             if state == KazooState.CONNECTED:
@@ -155,11 +147,11 @@ class TestConnectionHandler:
         with patch.object(Connect, "deserialize") as mock_deserialize:
             mock_deserialize.side_effect = bad_deserialize
             try:
-                handler.select = delayed_select
+                zkclient._connection._write = delayed_write
                 with pytest.raises(ConnectionLoss):
                     zkclient.create(path)
             finally:
-                handler.select = _select
+                zkclient._connection._write = orig_write
             # the client reconnects automatically but the first attempt will
             # hit a deserialize failure. wait for that.
             deserialize_ev.wait(5)
@@ -210,6 +202,8 @@ class TestConnectionHandler:
         write_sock.getsockname()
 
     def test_dirty_sock(self, zkclient):
+        import selectors
+
         read_sock = zkclient._connection._read_sock
         write_sock = zkclient._connection._write_sock
 
@@ -220,7 +214,66 @@ class TestConnectionHandler:
         write_sock.send(b"\0")
 
         # eventually this byte should disappear from socket
-        wait(lambda: zkclient.handler.select([read_sock], [], [], 0)[0] == [])
+        with zkclient.handler.create_selector() as sel:
+            sel.register(read_sock, selectors.EVENT_READ)
+            wait(lambda: sel.select(0) == [])
+
+    def test_reply_too_large_keeps_session_and_raised_limit_succeeds(
+        self, zkclient, zkensemble
+    ):
+        parent = "/" + uuid.uuid4().hex
+        zkclient.create(parent, b"ok")
+        for i in range(50):
+            zkclient.create(f"{parent}/child-{i:02d}")
+
+        small_client = zkensemble.get_client(max_buffer=256)
+        large_client = zkensemble.get_client(max_buffer=8192)
+        try:
+            small_client.start()
+            small_client.chroot = zkclient.chroot
+            session_id = small_client.client_id[0]
+            states = []
+            small_client.add_listener(states.append)
+
+            with pytest.raises(ReplyTooLargeError, match="max_buffer"):
+                small_client.get_children(parent)
+
+            assert states == []
+            assert small_client.connected is True
+            assert small_client.client_id[0] == session_id
+            data, _ = small_client.get(parent)
+            assert data == b"ok"
+
+            large_client.start()
+            large_client.chroot = zkclient.chroot
+            children = large_client.get_children(parent)
+            assert len(children) == 50
+        finally:
+            small_client.stop()
+            small_client.close()
+            large_client.stop()
+            large_client.close()
+
+    def test_get_max_data_size_succeeds_with_default_max_buffer(
+        self, zkensemble
+    ):
+        # 1,048,494 B znode fits in server jute.maxbuffer (0xFFFFF) on Create
+        # and yields a 1,048,582 B GetData reply (> 0xFFFFF, <= 0xFFFFF + 88).
+        client = zkensemble.get_client()
+        path = "/" + uuid.uuid4().hex[:6]
+        max_data = b"x" * 1_048_494
+        client.start()
+        try:
+            client.create(path, max_data)
+            data, stat = client.get(path)
+            assert data == max_data
+            assert stat.data_length == len(max_data)
+        finally:
+            try:
+                client.delete(path)
+            finally:
+                client.stop()
+                client.close()
 
 
 class TestConnectionDrop:

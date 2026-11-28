@@ -4,10 +4,12 @@ on:
   push:
     branches:
       - master
+      - next
       - release/*
   pull_request:
     branches:
       - master
+      - next
       - release/*
 
 jobs:
@@ -98,6 +100,14 @@ jobs:
       - name: Install required dependencies
         run: |
           pip install -e . --group test
+          if [[ "${{ matrix.python-version }}" != pypy* ]]; then
+            pip install -e '.[gevent]'
+          fi
+          case "${{ matrix.python-version }}" in
+            3.10|3.11|3.12)
+              pip install -e '.[eventlet]'
+              ;;
+          esac
 
       - name: Test with pytest (plain axis)
         run: pytest kazoo/tests/ -q --cov-report=xml --cov=kazoo
@@ -239,6 +249,14 @@ jobs:
       - name: Install required dependencies
         run: |
           pip install -e . --group test
+          if [[ "${{ matrix.python-version }}" != pypy* ]]; then
+            pip install -e '.[gevent]'
+          fi
+          case "${{ matrix.python-version }}" in
+            3.10|3.11|3.12)
+              pip install -e '.[eventlet]'
+              ;;
+          esac
           if [ "${{ matrix.axis }}" = "sasl_digest" ] || [ "${{ matrix.axis }}" = "sasl_gssapi" ]; then pip install -e '.[sasl]'; fi
           if [ "${{ matrix.axis }}" = "sasl_gssapi" ]; then pip install kerberos; fi
 

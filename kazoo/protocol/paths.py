@@ -54,3 +54,14 @@ def _prefix_root(root: str, path: str, trailing: bool = False) -> str:
 
 def _norm_root(root: str) -> str:
     return normpath(join("/", root))
+
+
+def unchroot(chroot: str, path: str) -> str:
+    """Strip ``chroot`` prefix from ``path`` if applicable."""
+    if not chroot:
+        return path
+    if chroot == path:
+        return "/"
+    if path.startswith(chroot):
+        return path[len(chroot) :]
+    return path

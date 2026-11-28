@@ -365,6 +365,70 @@ class TestClientCreateAsync:
         assert len(called_op) == 1
         assert called_op[0].acl == custom_acl
 
+    @pytest.mark.parametrize("backend", ["threading", "eventlet"])
+    @pytest.mark.parametrize(
+        "scenario", ["inactive", "auth_failed", "expired", "wake_failed"]
+    )
+    def test_create_async_short_circuit_fires_callback_once(
+        self, backend: str, scenario: str
+    ) -> None:
+        """Short-circuit create_async() fires rawlink callbacks once."""
+        from kazoo.exceptions import (
+            AuthFailedError,
+            ConnectionClosedError,
+            SessionExpiredError,
+        )
+        from kazoo.protocol.statemachine import (
+            AuthFailed,
+            Connected,
+            ExpiredSession,
+            Inactive,
+        )
+
+        if backend == "threading":
+            from kazoo.handlers.threading import SequentialThreadingHandler
+
+            handler: object = SequentialThreadingHandler()
+        else:
+            pytest.importorskip("eventlet")
+            from kazoo.handlers.eventlet import SequentialEventletHandler
+
+            handler = SequentialEventletHandler()
+
+        handler.start()  # type: ignore[attr-defined]
+        try:
+            client = KazooClient(
+                hosts="127.0.0.1:2181",
+                handler=handler,  # type: ignore[arg-type]
+            )
+            if scenario == "inactive":
+                client._state_machine.state = Inactive()
+                expected_exc: type[Exception] = ConnectionClosedError
+            elif scenario == "auth_failed":
+                client._state_machine.state = AuthFailed()
+                expected_exc = AuthFailedError
+            elif scenario == "expired":
+                client._state_machine.state = ExpiredSession()
+                expected_exc = SessionExpiredError
+            else:
+                client._state_machine.state = Connected()
+                client._connection._write_sock = None
+                expected_exc = ConnectionClosedError
+
+            calls: list[object] = []
+            res = client.create_async("/test")
+            assert res.ready()
+            assert isinstance(res.exception, expected_exc)
+            res.rawlink(calls.append)
+
+            # Drain completion worker so any duplicate scheduled callback runs.
+            done = handler.event_object()  # type: ignore[attr-defined]
+            handler.completion_queue.put(done.set)  # type: ignore[attr-defined]
+            assert done.wait(timeout=2.0)
+            assert len(calls) == 1
+        finally:
+            handler.stop()  # type: ignore[attr-defined]
+
 
 class TestClientCreateErrorHandling:
     """Unit tests verifying error handling when server lacks support for

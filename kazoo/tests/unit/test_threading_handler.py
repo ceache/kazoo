@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import selectors
 import socket
 import threading
 from typing import Any
@@ -61,10 +62,15 @@ class TestThreadingHandler:
             socks.append(sock)
         h = self._makeOne()
         h.start()
-        h.select(socks, [], [], 0)
-        h.stop()
-        for sock in socks:
-            sock.close()
+        try:
+            with h.create_selector() as sel:
+                for sock in socks:
+                    sel.register(sock, selectors.EVENT_READ)
+                sel.select(0)
+        finally:
+            h.stop()
+            for sock in socks:
+                sock.close()
 
 
 class TestThreadingAsync:
@@ -388,3 +394,25 @@ class TestThreadingAsync:
 
         mockback2.assert_called_once_with(async_result)
         mockback1.assert_called_once_with(async_result)
+
+    def test_inline_callback_exception_on_stopped_handler_is_isolated(
+        self,
+    ) -> None:
+        handler = self._makeHandler()
+        assert handler.running is False
+
+        seen: list[str] = []
+
+        def bad_cb(_res: AsyncResult) -> None:
+            seen.append("bad")
+            raise RuntimeError("boom")
+
+        def good_cb(_res: AsyncResult) -> None:
+            seen.append("good")
+
+        async_result = self._makeOne(handler)
+        async_result.rawlink(bad_cb)
+        async_result.rawlink(good_cb)
+        # Must not propagate and must still invoke subsequent callbacks.
+        async_result.set_exception(RuntimeError("closed"))
+        assert seen == ["bad", "good"]
