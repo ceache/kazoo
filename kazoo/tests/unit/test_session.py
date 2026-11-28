@@ -355,7 +355,7 @@ class TestRequestAndWatcherManagers:
         assert not any(name.startswith("_") for name in session.__all__)
 
     def test_request_manager_reset_clears_deques_in_place(self) -> None:
-        """[L-6] reset() clears deques in place without rebinding them."""
+        """reset() clears deques in place without rebinding them."""
         rm = RequestManager()
         q_ref = rm.queue
         p_ref = rm.pending
@@ -370,7 +370,7 @@ class TestRequestAndWatcherManagers:
     def test_packet_router_rejects_unexpected_connect_outside_handshaking(
         self,
     ) -> None:
-        """[L-2] Stray Connect outside Handshaking raises ConnectionDropped."""
+        """Stray Connect outside Handshaking raises ConnectionDropped."""
         import logging
 
         from kazoo.exceptions import ConnectionDropped
