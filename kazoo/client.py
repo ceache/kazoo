@@ -427,7 +427,12 @@ class KazooClient:
         # Curator like simplified state tracking, and listeners for
         # state transitions
         self._listener_lock = self.handler.lock_object()
-        self._pending_state_changes: deque[KazooState] = deque()
+        self._pending_state_changes: deque[
+            tuple[KazooState, tuple[ListenerFunc, ...]]
+        ] = deque()
+        self._pending_connect_resolutions: deque[
+            tuple[IAsyncResult, bool, Exception | None]
+        ] = deque()
         self._notifying_listeners: bool = False
         self._state_machine = StateMachineDriver(
             self._execute_effect,
@@ -831,23 +836,56 @@ class KazooClient:
             listener and callable(listener)  # type: ignore[truthy-function]
         ):
             raise ConfigurationError("listener must be callable")
-        self.state_listeners.add(listener)
+        with self._listener_lock:
+            self.state_listeners.add(listener)
 
     def remove_listener(self, listener: ListenerFunc) -> None:
         """Remove a listener function"""
-        self.state_listeners.discard(listener)
+        with self._listener_lock:
+            self.state_listeners.discard(listener)
 
     def _enqueue_state_change(self, state: KazooState) -> None:
         with self._listener_lock:
             if state == self._last_notified_state:
                 return
             self._last_notified_state = state
-            self._pending_state_changes.append(state)
+            self._pending_state_changes.append(
+                (state, tuple(self.state_listeners))
+            )
 
-    def _dispatch_state_change(self, state: KazooState) -> None:
-        # Create copy of listeners for iteration in case one needs to
-        # remove itself
-        for listener in list(self.state_listeners):
+    def _enqueue_connect_resolution(
+        self, success: bool, exc: Exception | None = None
+    ) -> None:
+        conn_result = self._conn_result
+        if conn_result is None or conn_result.ready():
+            return
+        if not success and exc is None:
+            return
+        with self._listener_lock:
+            self._pending_connect_resolutions.append(
+                (conn_result, success, exc)
+            )
+
+    @staticmethod
+    def _apply_connect_resolution(
+        conn_result: IAsyncResult,
+        success: bool,
+        exc: Exception | None,
+    ) -> None:
+        if conn_result.ready():
+            return
+        if success:
+            conn_result.set(True)
+        elif exc is not None:
+            conn_result.set_exception(exc)
+
+    def _dispatch_state_change(
+        self, state: KazooState, listeners: tuple[ListenerFunc, ...]
+    ) -> None:
+        for listener in listeners:
+            with self._listener_lock:
+                if listener not in self.state_listeners:
+                    continue
             try:
                 remove = listener(state)
                 if remove is True:
@@ -862,12 +900,24 @@ class KazooClient:
             self._notifying_listeners = True
         try:
             while True:
+                state_item: (
+                    tuple[KazooState, tuple[ListenerFunc, ...]] | None
+                ) = None
+                conn_item: (
+                    tuple[IAsyncResult, bool, Exception | None] | None
+                ) = None
                 with self._listener_lock:
-                    if not self._pending_state_changes:
+                    if self._pending_state_changes:
+                        state_item = self._pending_state_changes.popleft()
+                    elif self._pending_connect_resolutions:
+                        conn_item = self._pending_connect_resolutions.popleft()
+                    else:
                         self._notifying_listeners = False
                         return
-                    state = self._pending_state_changes.popleft()
-                self._dispatch_state_change(state)
+                if state_item is not None:
+                    self._dispatch_state_change(*state_item)
+                elif conn_item is not None:
+                    self._apply_connect_resolution(*conn_item)
         except BaseException:
             with self._listener_lock:
                 self._notifying_listeners = False
@@ -888,19 +938,10 @@ class KazooClient:
                 self.logger.log(level, message, *args)
 
             case ResolveConnectResult(success=True):
-                if (
-                    self._conn_result is not None
-                    and not self._conn_result.ready()
-                ):
-                    self._conn_result.set(True)
+                self._enqueue_connect_resolution(True)
 
             case ResolveConnectResult(success=False, exception=exc):
-                if (
-                    self._conn_result is not None
-                    and not self._conn_result.ready()
-                    and exc is not None
-                ):
-                    self._conn_result.set_exception(exc)
+                self._enqueue_connect_resolution(False, exc)
 
             case EmitKazooStateChange(new_state=new_state):
                 self._enqueue_state_change(new_state)

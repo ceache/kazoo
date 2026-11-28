@@ -3614,3 +3614,59 @@ class TestWakeupOutsideSelect:
                     conn._read_sock = None
                 sock_a.close()
                 sock_b.close()
+
+    def test_connect_result_resolves_after_connected_listeners_finish(
+        self,
+    ) -> None:
+        """Listeners added after start() returns never see stale CONNECTED."""
+        from kazoo.protocol.serialization import Connect
+        from kazoo.protocol.statemachine import (
+            ConnectionLostEvent,
+            ConnectResponseReceived,
+            Handshaking,
+        )
+        from kazoo.protocol.states import KazooState
+
+        client = KazooClient(hosts="127.0.0.1:2181")
+        client._conn_result = client.handler.async_result()
+        client._state_machine.state = Handshaking(host="127.0.0.1", port=2181)
+
+        pre_seen: list[KazooState] = []
+        post_seen: list[KazooState] = []
+        conn_ready_during_listener: list[bool] = []
+
+        def pre_listener(state: KazooState) -> None:
+            pre_seen.append(state)
+            assert client._conn_result is not None
+            conn_ready_during_listener.append(client._conn_result.ready())
+
+        client.add_listener(pre_listener)
+
+        waiter_done = threading.Event()
+
+        def simulate_start_caller() -> None:
+            assert client._conn_result is not None
+            client._conn_result.get(timeout=2.0)
+            client.add_listener(post_seen.append)
+            waiter_done.set()
+
+        t = threading.Thread(target=simulate_start_caller)
+        t.start()
+        try:
+            client.send_event(
+                ConnectResponseReceived(
+                    connect_result=Connect(0, 0, 10000, 42, b"pw", False)
+                )
+            )
+            assert waiter_done.wait(timeout=2.0)
+        finally:
+            t.join(timeout=2.0)
+
+        assert pre_seen == [KazooState.CONNECTED]
+        assert conn_ready_during_listener == [False]
+        assert post_seen == []
+        assert client._conn_result.ready() is True
+
+        # Subsequent transitions still reach the post-start listener.
+        client.send_event(ConnectionLostEvent(reason="drop"))
+        assert post_seen == [KazooState.SUSPENDED]
