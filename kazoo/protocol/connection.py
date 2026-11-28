@@ -629,8 +629,9 @@ class ConnectionHandler:
         """Ensure the writer has stopped, wait to see if it does."""
         if not self.connection_stopped.wait(timeout):
             return False
-        if self._connection_routine:
-            self._connection_routine.join()
+        routine = self._connection_routine
+        if routine is not None:
+            routine.join()
             self._connection_routine = None
         # client.stop() runs StopConnectionLoop on this thread. When the
         # routine had already returned, nothing consumed that wake-up.

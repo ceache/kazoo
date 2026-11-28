@@ -49,14 +49,19 @@ def _make_acl_list() -> list[ACL]:
 
 class TestUtils:
     def test_write_read_required_string_roundtrip(self) -> None:
-        b = serialization._write_string("hello-\u03c0")
-        decoded, offset = serialization._read_required_string(b, 0)
+        buf = bytearray()
+        serialization._write_string_into(buf, "hello-\u03c0")
+        decoded, offset = serialization._read_required_string(buf, 0)
         assert decoded == "hello-\u03c0"
-        assert offset == len(b)
+        assert offset == len(buf)
 
     def test_write_empty_or_none_string_encodes_neg_one(self) -> None:
-        assert serialization._write_string(None) == _int_struct.pack(-1)
-        assert serialization._write_string("") == _int_struct.pack(-1)
+        b_none = bytearray()
+        serialization._write_string_into(b_none, None)
+        b_empty = bytearray()
+        serialization._write_string_into(b_empty, "")
+        assert bytes(b_none) == _int_struct.pack(-1)
+        assert bytes(b_empty) == _int_struct.pack(-1)
         with pytest.raises(MarshallingError, match="Invalid string length"):
             serialization._read_required_string(_int_struct.pack(-1), 0)
 
@@ -82,8 +87,8 @@ class TestUtils:
         # build bytes: perms + scheme + id
         b = (
             serialization.int_struct.pack(perms)
-            + serialization._write_string(scheme)
-            + serialization._write_string(idv)
+            + _write_string(scheme)
+            + _write_string(idv)
         )
         acl_obj, offset = serialization._read_acl(b, 0)
         assert isinstance(acl_obj.perms, Permissions)
@@ -91,6 +96,15 @@ class TestUtils:
         assert acl_obj.id.scheme == scheme
         assert acl_obj.id.id == idv
         assert offset == len(b)
+
+    def test_read_acl_rejects_negative_perms(self) -> None:
+        bad = (
+            serialization.int_struct.pack(-1)
+            + _write_string("world")
+            + _write_string("anyone")
+        )
+        with pytest.raises(MarshallingError, match="Invalid ACL permissions"):
+            serialization._read_acl(bad, 0)
 
 
 class TestClose:
@@ -1333,12 +1347,25 @@ class TestDataclassPacketsAndFrameDecoder:
         assert dec._tail == L - 262_000
         assert len(win) == L - dec._tail
 
-        # Large partial frame near L is not moved; window ends at frame end
+        # Large partial frame near L is compacted down to 0 when growing the
+        # initial buffer, and stays in place when the buffer already fits.
         dec.reset()
         dec._head = 249_600
         dec._scan = 249_600
         dec._tail = L
         full_n = 1_000_088
+        dec._buf[249_600:249_604] = _int_struct.pack(full_n)
+        dec._frame_len = full_n
+        win = dec.get_buffer()
+        assert dec._head == 0
+        assert len(win) == 249_600 + 4 + full_n - L
+
+        # When buffer already has full capacity, large partial frame near L
+        # is not moved; window ends at frame end.
+        dec._grow_buffer(dec._capacity)
+        dec._head = 249_600
+        dec._scan = 249_600
+        dec._tail = L
         dec._buf[249_600:249_604] = _int_struct.pack(full_n)
         dec._frame_len = full_n
         win = dec.get_buffer()
@@ -1595,7 +1622,7 @@ class TestDataclassPacketsAndFrameDecoder:
     def test_frame_decoder_lazy_growth_and_shrink_for_large_max_buffer(
         self,
     ) -> None:
-        """[E-1] Large max_buffer starts at initial cap, grows, shrinks."""
+        """Large max_buffer starts at initial cap, grows, and shrinks."""
         pending: collections.deque[tuple[object, object, int]] = (
             collections.deque()
         )
@@ -1615,32 +1642,79 @@ class TestDataclassPacketsAndFrameDecoder:
         stat_b = serialization.stat_struct.pack(
             1, 2, 3, 4, 5, 6, 7, 8, len(big_data), 0, 1
         )
+        ping_b = _reply_header_struct.pack(
+            serialization.ReservedXID.PING, 11, 0
+        )
+        ping_wire = _int_struct.pack(len(ping_b)) + ping_b
+
         body = _reply_header_struct.pack(1, 10, 0) + _write_buffer(big_data)
         body += stat_b
         pending.append((serialization.GetData("/big", None), None, 1))
         dec._feed(_int_struct.pack(len(body)) + body)
         assert len(dec._buf) > dec._initial_capacity
         assert len(dec._buf) <= dec._capacity
+        grown_buf_id = id(dec._buf)
+        grown_cap = len(dec._buf)
         pkt = dec.pop_packet()
         assert isinstance(pkt, serialization.ResponsePacket)
         assert pkt.response[0] == big_data
 
-        # Subsequent small frame draining the buffer shrinks back to initial.
-        ping_b = _reply_header_struct.pack(
-            serialization.ReservedXID.PING, 11, 0
-        )
-        dec._feed(_int_struct.pack(len(ping_b)) + ping_b)
+        # Alternating small frames (e.g. pings) and large replies must not
+        # shrink/reallocate the buffer (hysteresis prevents thrashing).
+        for xid in range(2, 6):
+            dec._feed(ping_wire)
+            assert isinstance(dec.pop_packet(), serialization.PingResponse)
+            assert id(dec._buf) == grown_buf_id
+            assert len(dec._buf) == grown_cap
+
+            pending.append((serialization.GetData("/big", None), None, xid))
+            b = _reply_header_struct.pack(xid, 10 + xid, 0)
+            b += _write_buffer(big_data) + stat_b
+            dec._feed(_int_struct.pack(len(b)) + b)
+            p = dec.pop_packet()
+            assert isinstance(p, serialization.ResponsePacket)
+            assert p.response[0] == big_data
+            assert id(dec._buf) == grown_buf_id
+            assert len(dec._buf) == grown_cap
+
+        # Consecutive small frames below the hysteresis threshold keep the
+        # grown buffer; hitting _SHRINK_HYSTERESIS shrinks back to initial.
+        for _ in range(dec._SHRINK_HYSTERESIS - 1):
+            dec._feed(ping_wire)
+            assert isinstance(dec.pop_packet(), serialization.PingResponse)
+            assert len(dec._buf) == grown_cap
+        dec._feed(ping_wire)
         assert isinstance(dec.pop_packet(), serialization.PingResponse)
         assert len(dec._buf) == dec._initial_capacity
 
-        # Growing and calling reset() also shrinks back to initial capacity.
-        pending.append((serialization.GetData("/big2", None), None, 2))
-        body2 = _reply_header_struct.pack(2, 12, 0) + _write_buffer(big_data)
+        # Growing and calling reset() shrinks back to initial immediately.
+        pending.append((serialization.GetData("/big2", None), None, 10))
+        body2 = _reply_header_struct.pack(10, 20, 0) + _write_buffer(big_data)
         body2 += stat_b
         dec._feed(_int_struct.pack(len(body2)) + body2)
         assert len(dec._buf) > dec._initial_capacity
         dec.reset()
         assert len(dec._buf) == dec._initial_capacity
+
+        # Growing and calling release() drops the backing buffer directly
+        # without allocating an intermediate initial-capacity bytearray.
+        from unittest import mock
+
+        pending.append((serialization.GetData("/big3", None), None, 11))
+        body3 = _reply_header_struct.pack(11, 21, 0) + _write_buffer(big_data)
+        body3 += stat_b
+        dec._feed(_int_struct.pack(len(body3)) + body3)
+        assert len(dec._buf) > dec._initial_capacity
+        with mock.patch.object(
+            serialization.FrameDecoder,
+            "_shrink_to_initial",
+            side_effect=AssertionError("must not shrink"),
+        ):
+            dec.release()
+        assert len(dec._buf) == 0
+        assert dec._view is None
+        assert dec._empty_view is None
+        assert dec._small_frames_since_grow == 0
 
     def test_frame_decoder_short_or_negative_length_rejected(self) -> None:
         for bad_len in (-1, 0, 15):
@@ -2089,7 +2163,7 @@ class TestDataclassPacketsAndFrameDecoder:
             serialization.Transaction.deserialize(tx_bad_op, 0)
 
     def test_deferred_oversize_control_frame_flagged_immediately(self) -> None:
-        """[C-10] Coalesced oversize xid<=0 raises right after frame 1."""
+        """Coalesced oversize xid<=0 raises right after frame 1."""
         dec = serialization.FrameDecoder(max_buffer=64)
         # Valid PingResponse (16-byte payload) followed by 8 bytes of an
         # oversize Watch frame (length > max_payload, xid = -1).
@@ -2111,7 +2185,7 @@ class TestDataclassPacketsAndFrameDecoder:
             dec.pop_packet()
 
     def test_add_watch_deserialize_rejects_short_buffer(self) -> None:
-        """[C-10] AddWatch.deserialize validates 4-byte response length."""
+        """AddWatch.deserialize validates 4-byte response length."""
         with pytest.raises(struct.error):
             serialization.AddWatch.deserialize(b"", 0)
         with pytest.raises(struct.error):
@@ -2123,7 +2197,7 @@ class TestDataclassPacketsAndFrameDecoder:
         assert offset == 4
 
     def test_serialize_into_parity_with_serialize(self) -> None:
-        """[E-1] _serialize_into matches serialize() across all requests."""
+        """_serialize_into matches serialize() across all requests."""
         acls = _make_acl_list()
         requests = [
             serialization.Connect(0, 1, 10000, 42, b"pw", True),

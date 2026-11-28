@@ -2729,7 +2729,7 @@ class TestWakeupOutsideSelect:
     def test_heartbeat_ping_timeout_does_not_collapse_to_jitter(
         self, patch_connection_random: Callable[[int], Mock]
     ) -> None:
-        """[C-1][C-9] Pending ping gets ~read_timeout/2 and fresh deadline."""
+        """Pending ping gets ~read_timeout/2 and fresh deadline."""
         from kazoo.protocol.serialization import PingResponse, WatchPacket
 
         client = KazooClient(hosts="127.0.0.1:2181")
@@ -2788,7 +2788,7 @@ class TestWakeupOutsideSelect:
     def test_sasl_drop_and_timeout_clears_pending_before_reconnect(
         self,
     ) -> None:
-        """[C-2] Mid-SASL drop clears pending so reconnect keeps XIDs valid."""
+        """Mid-SASL drop clears pending so reconnect keeps XIDs valid."""
         from kazoo.protocol.connection import _ACTIVE_CONNECTION_LOOP
         from kazoo.protocol.sasl import SASLConfig
         from kazoo.protocol.serialization import (
@@ -2930,7 +2930,7 @@ class TestWakeupOutsideSelect:
     def test_cross_routine_stop_threading_and_gevent_selector(
         self,
     ) -> None:
-        """[C-3] Cross-routine client.stop() does not close active selector."""
+        """Cross-routine client.stop() does not close active selector."""
         import socket
 
         from kazoo.protocol.statemachine import Handshaking
@@ -3047,7 +3047,7 @@ class TestWakeupOutsideSelect:
             gconn.close()
 
     def test_write_ssl_want_read_gevent_write_and_deadline(self) -> None:
-        """[C-4][C-5] _write handles SSL WANT_READ, .write(), and deadline."""
+        """_write handles SSL WANT_READ, .write(), and deadline."""
         import ssl
 
         client = _make_mock_client()
@@ -3091,7 +3091,7 @@ class TestWakeupOutsideSelect:
         assert sel2.get_key(mock_sock).events == selectors.EVENT_READ
 
     def test_write_releases_memoryview_before_batch_clear(self) -> None:
-        """[C-6] _write releases all memoryviews so bytearray.clear() works."""
+        """_write releases all memoryviews so bytearray.clear() works."""
         client = _make_mock_client()
         conn = ConnectionHandler(client, KazooRetry())
         mock_sock = Mock()
@@ -3132,7 +3132,7 @@ class TestWakeupOutsideSelect:
         buf2.clear()
 
     def test_read_packet_ssl_want_write_cumulative_deadline(self) -> None:
-        """[C-4] Repeated SSL_ERROR_WANT_WRITE uses cumulative deadline."""
+        """Repeated SSL_ERROR_WANT_WRITE uses cumulative deadline."""
         import ssl
 
         client = _make_mock_client()
@@ -3164,7 +3164,7 @@ class TestWakeupOutsideSelect:
     def test_call_wake_failure_after_request_consumed_preserves_result(
         self,
     ) -> None:
-        """[C-8] Failed wake() after item popped does not overwrite result."""
+        """Failed wake() after item popped does not overwrite result."""
         client = KazooClient(hosts="127.0.0.1:2181")
         client._state_machine.state = Connected(
             host="127.0.0.1", port=2181, session_id=7, session_passwd=b"pw"
@@ -3197,7 +3197,7 @@ class TestWakeupOutsideSelect:
     def test_efficiency_send_buf_drain_wakeup_and_ready_singletons(
         self,
     ) -> None:
-        """[E-1][E-2][E-4][L-4] _send_buf, short-read drain, ready sets."""
+        """Verify _send_buf reuse, short-read drain, and ready singletons."""
         from kazoo.protocol import connection as conn_mod
         from kazoo.protocol.serialization import SetData
 
@@ -3209,7 +3209,7 @@ class TestWakeupOutsideSelect:
         conn._socket = Mock()
         conn._socket.send.side_effect = lambda mv: len(mv)
 
-        # 1. [E-1] Persistent _send_buf reused on normal sends, trimmed after
+        # 1. Persistent _send_buf reused on normal sends, trimmed after
         # > _SEND_BATCH_MAX payload.
         initial_buf = conn._send_buf
         conn._requests.enqueue(GetData("/a", None), Mock())
@@ -3225,14 +3225,14 @@ class TestWakeupOutsideSelect:
         assert conn._send_buf is not initial_buf
         assert len(conn._send_buf) == 0
 
-        # 2. [E-2] Hot-path _drain_wakeup stops after a short read (1 recv).
+        # 2. Hot-path _drain_wakeup stops after a short read (1 recv).
         mock_read_sock = Mock()
         mock_read_sock.recv.return_value = b"\0"
         conn._read_sock = mock_read_sock
         conn._drain_wakeup()
         assert mock_read_sock.recv.call_count == 1
 
-        # 3. [E-4] _select returns pre-allocated frozenset singletons.
+        # 3. _select returns pre-allocated frozenset singletons.
         conn._selector = Mock()
         conn._selector.select.return_value = []
         assert conn._select(0.0) is conn_mod._READY_EMPTY
@@ -3249,7 +3249,7 @@ class TestWakeupOutsideSelect:
     def test_short_session_timeout_heartbeat_stays_positive(
         self, patch_connection_random: Callable[[int], Mock]
     ) -> None:
-        """[H-1] Short session_timeout (<=1.2s) never yields 0.0 ping wait."""
+        """Short session_timeout (<=1.2s) never yields 0.0 ping wait."""
         patch_connection_random(40)  # max raw jitter 0.40s
         for session_timeout in (1.0, 0.3):
             client = KazooClient(
@@ -3272,7 +3272,7 @@ class TestWakeupOutsideSelect:
             assert timeout > 0.0
 
     def test_in_flight_requests_get_terminal_exception(self) -> None:
-        """[M-1] In-flight pending/auth match queued terminal errors."""
+        """In-flight pending/auth match queued terminal errors."""
         from kazoo.exceptions import AuthFailedError, SessionExpiredError
         from kazoo.protocol.connection import _ACTIVE_CONNECTION_LOOP
         from kazoo.protocol.statemachine import SessionExpiredEvent
@@ -3306,7 +3306,7 @@ class TestWakeupOutsideSelect:
             assert isinstance(a_queued.exception, expected_exc)
 
     def test_non_active_wakeup_still_enforces_phase_deadline(self) -> None:
-        """[L-1] Wakeups in Handshaking/Authenticating still time out."""
+        """Wakeups in Handshaking/Authenticating still time out."""
         from kazoo.protocol.statemachine import Authenticating, Handshaking
 
         for init_state in (
@@ -3324,7 +3324,7 @@ class TestWakeupOutsideSelect:
     def test_is_on_loop_routine_rejects_inherited_context_on_foreign_thread(
         self,
     ) -> None:
-        """[L-5] Inherited _ACTIVE_CONNECTION_LOOP on another thread fails."""
+        """Inherited _ACTIVE_CONNECTION_LOOP on another thread is False."""
         import contextvars
 
         from kazoo.protocol.connection import _ACTIVE_CONNECTION_LOOP
@@ -3350,11 +3350,11 @@ class TestWakeupOutsideSelect:
             conn.connection_stopped.set()
 
     def test_start_auth_failed_and_closing_window_rejects_calls(self) -> None:
-        """[M-5][L-8] start() keeps AuthFailed; closing Connected rejects."""
+        """start() keeps AuthFailed; closing Connected rejects calls."""
         from kazoo.exceptions import AuthFailedError, ConnectionClosedError
         from kazoo.protocol.states import KeeperState
 
-        # [M-5] start() failing with AuthFailedError preserves AuthFailed.
+        # start() failing with AuthFailedError preserves AuthFailed.
         client = KazooClient(hosts="127.0.0.1:2181")
         res = client.handler.async_result()
         err = AuthFailedError("bad creds")
@@ -3375,12 +3375,13 @@ class TestWakeupOutsideSelect:
         assert client._call(GetData("/x", None), follow_up) is False
         assert isinstance(follow_up.exception, AuthFailedError)
 
-        # [L-8] Connected(is_connecting_allowed=False) rejects _call() and
-        # does not short-circuit start_async() to True.
+        # Connected(is_connecting_allowed=False) reports connected=False,
+        # rejects _call(), and does not short-circuit start()/start_async().
         client2 = KazooClient(hosts="127.0.0.1:2181")
         client2._state_machine.state = Connected(
             host="127.0.0.1", port=2181, is_connecting_allowed=False
         )
+        assert client2.connected is False
         closing_res = client2.handler.async_result()
         assert client2._call(GetData("/x", None), closing_res) is False
         assert isinstance(closing_res.exception, ConnectionClosedError)
@@ -3394,8 +3395,21 @@ class TestWakeupOutsideSelect:
             assert started.ready() is False
             mock_close.assert_called_once()
 
+        # start() must not short-circuit while Connected is closing.
+        client3 = KazooClient(hosts="127.0.0.1:2181")
+        client3._state_machine.state = Connected(
+            host="127.0.0.1", port=2181, is_connecting_allowed=False
+        )
+        start_ar = client3.handler.async_result()
+        start_ar.set(True)
+        with patch.object(
+            client3, "start_async", return_value=start_ar
+        ) as spy_start_async:
+            client3.start(timeout=1.0)
+            spy_start_async.assert_called_once()
+
     def test_listener_runs_outside_dispatch_lock_no_deadlock(self) -> None:
-        """[M-4] Listener taking app_lock does not deadlock send_event."""
+        """Listener taking app_lock does not deadlock send_event."""
         from kazoo.protocol.states import KazooState
 
         client = KazooClient(hosts="127.0.0.1:2181")
@@ -3437,3 +3451,166 @@ class TestWakeupOutsideSelect:
         assert not t.is_alive()
         assert other_done.is_set()
         assert seen == [KazooState.SUSPENDED, KazooState.LOST]
+
+    def test_call_vs_stop_and_reset_never_orphans_async_result(self) -> None:
+        """Concurrent _call() during stop/reset fails cleanly without hang."""
+        from kazoo.exceptions import ConnectionClosedError, ConnectionLoss
+
+        # 1. Enqueue racing right before _reset() (ResetSessionData) is failed.
+        client = KazooClient(hosts="127.0.0.1:2181")
+        client._state_machine.state = Inactive()
+        raced_res = client.handler.async_result()
+        client._request_manager.enqueue(GetData("/raced", None), raced_res)
+        client._reset()
+        assert raced_res.ready() is True
+        assert isinstance(raced_res.exception, ConnectionLoss)
+        assert len(client._request_manager.queue) == 0
+
+        # 2. _call() whose state flips to Inactive between pre-check and
+        # enqueue removes the entry and fails with ConnectionClosedError.
+        client2 = KazooClient(hosts="127.0.0.1:2181")
+        client2._state_machine.state = Connecting()
+        orig_enqueue = RequestManager.enqueue
+
+        def enqueue_after_stop(
+            rm: RequestManager, req: object, comp: Any
+        ) -> None:
+            client2._state_machine.state = Inactive()
+            orig_enqueue(rm, req, comp)
+
+        ar2 = client2.handler.async_result()
+        with patch.object(RequestManager, "enqueue", new=enqueue_after_stop):
+            ret = client2._call(GetData("/after-stop", None), ar2)
+        assert ret is False
+        assert isinstance(ar2.exception, ConnectionClosedError)
+        assert len(client2._request_manager.queue) == 0
+
+    def test_concurrent_start_async_during_reconnect_shares_conn_result(
+        self,
+    ) -> None:
+        """Concurrent start_async() in Suspended shares one AsyncResult."""
+        from kazoo.protocol.statemachine import Suspended
+
+        client = KazooClient(hosts="127.0.0.1:2181")
+        client._state_machine.state = Suspended(
+            host="127.0.0.1", port=2181, session_id=1
+        )
+        client._connection.connection_stopped.clear()
+        old_res = client.handler.async_result()
+        old_res.set(True)
+        client._conn_result = old_res
+
+        results: list[Any] = [None, None]
+        ready_barrier = threading.Barrier(2)
+
+        def call_start(idx: int) -> None:
+            ready_barrier.wait()
+            results[idx] = client.start_async()
+
+        # Hold _dispatch_lock so both threads pass the outer ready() check
+        # before either enters the lock.
+        with client._state_machine._dispatch_lock:
+            t0 = threading.Thread(target=call_start, args=(0,))
+            t1 = threading.Thread(target=call_start, args=(1,))
+            t0.start()
+            t1.start()
+            time.sleep(0.05)
+
+        t0.join(timeout=2.0)
+        t1.join(timeout=2.0)
+        assert results[0] is not None
+        assert results[0] is results[1]
+        assert results[0] is client._conn_result
+
+    def test_concurrent_connection_stop_does_not_raise_attribute_error(
+        self,
+    ) -> None:
+        """Concurrent ConnectionHandler.stop() calls join routine safely."""
+        client = _make_mock_client()
+        conn = ConnectionHandler(client, KazooRetry())
+        conn.connection_stopped.set()
+        join_entered = threading.Event()
+        release_join = threading.Event()
+
+        class SlowRoutine:
+            def join(self, timeout: float | None = None) -> None:
+                join_entered.set()
+                release_join.wait(timeout=2.0)
+
+        conn._connection_routine = SlowRoutine()
+        errors: list[BaseException] = []
+
+        def run_stop() -> None:
+            try:
+                assert conn.stop(timeout=1.0) is True
+            except BaseException as exc:
+                errors.append(exc)
+
+        t1 = threading.Thread(target=run_stop)
+        t2 = threading.Thread(target=run_stop)
+        t1.start()
+        assert join_entered.wait(timeout=2.0)
+        t2.start()
+        release_join.set()
+        t1.join(timeout=2.0)
+        t2.join(timeout=2.0)
+        assert errors == []
+        assert conn._connection_routine is None
+
+    def test_socket_io_wait_parity_across_handlers_with_unread_wakeup(
+        self,
+    ) -> None:
+        """_socket_io_wait preserves unread wakeup bytes on all handlers."""
+        from kazoo.handlers.threading import SequentialThreadingHandler
+
+        handlers: list[Any] = [SequentialThreadingHandler()]
+        try:
+            from kazoo.handlers.gevent import SequentialGeventHandler
+
+            handlers.append(SequentialGeventHandler())
+        except ImportError:
+            pass
+        try:
+            from kazoo.handlers.eventlet import SequentialEventletHandler
+
+            handlers.append(SequentialEventletHandler())
+        except ImportError:
+            pass
+
+        for handler in handlers:
+            client = KazooClient(hosts="127.0.0.1:2181", handler=handler)
+            conn = client._connection
+            sock_a, sock_b = handler.create_socket_pair()
+            try:
+                sock_a.setblocking(False)
+                sock_b.setblocking(False)
+                conn._read_sock, conn._write_sock = (
+                    handler.create_socket_pair()
+                )
+                conn._read_sock.setblocking(False)
+                conn._write_sock.setblocking(False)
+                conn._selector = handler.create_selector()
+                conn._socket = sock_a
+                conn._setup_selector()
+                assert conn.wake() is True
+
+                with conn._socket_io_wait() as wait_ready:
+                    assert conn._wakeup_registered is False
+                    assert wait_ready(selectors.EVENT_WRITE, 1.0) is True
+
+                assert conn._wakeup_registered is True
+                # Unread wake byte must still be present and selectable.
+                ready = conn._select(0.5)
+                assert "wakeup" in ready
+            finally:
+                conn._close_socket()
+                conn._release_wakeup()
+                conn._close_selector()
+                if conn._write_sock is not None:
+                    conn._write_sock.close()
+                    conn._write_sock = None
+                if conn._read_sock is not None:
+                    conn._read_sock.close()
+                    conn._read_sock = None
+                sock_a.close()
+                sock_b.close()

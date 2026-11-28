@@ -639,7 +639,7 @@ class KazooClient:
 
     def _reset(self) -> None:
         """Resets a variety of client states for a new connection."""
-        self._request_manager.reset(None)
+        self._request_manager.reset(self.client_state)
 
         self._reset_watchers()
         self._reset_session()
@@ -741,7 +741,8 @@ class KazooClient:
     def connected(self) -> bool:
         """Returns whether the Zookeeper connection has been
         established."""
-        return self._state_machine.state.is_connected
+        state = self._state_machine.state
+        return state.is_connected and state.is_connecting_allowed
 
     @property
     def is_stopped(self) -> bool:
@@ -937,6 +938,17 @@ class KazooClient:
                 "and wouldn't close after %s seconds" % timeout
             )
 
+    @staticmethod
+    def _terminal_call_exception(state: ClientState) -> Exception | None:
+        """Return the fast-fail exception for non-accepting states, or None."""
+        if isinstance(state, AuthFailed):
+            return AuthFailedError()
+        if isinstance(state, ExpiredSession):
+            return SessionExpiredError()
+        if isinstance(state, Inactive) or not state.is_connecting_allowed:
+            return ConnectionClosedError("Connection has been closed")
+        return None
+
     def _call(
         self, request: object, async_object: IAsyncResult
     ) -> bool | None:
@@ -946,20 +958,25 @@ class KazooClient:
         Returns False if the call short circuits due to AuthFailed,
         Inactive, or ExpiredSession state.
         """
-        state = self._state_machine.state
-        if isinstance(state, AuthFailed):
-            async_object.set_exception(AuthFailedError())
-            return False
-        elif isinstance(state, ExpiredSession):
-            async_object.set_exception(SessionExpiredError())
-            return False
-        elif isinstance(state, Inactive) or not state.is_connecting_allowed:
-            async_object.set_exception(
-                ConnectionClosedError("Connection has been closed")
-            )
+        exc = KazooClient._terminal_call_exception(self._state_machine.state)
+        if exc is not None:
+            if async_object is not None:
+                async_object.set_exception(exc)
             return False
 
         self._request_manager.enqueue(request, async_object)
+
+        # Re-check after enqueue so a concurrent stop()/AuthFailed/Expired
+        # transition cannot leave the entry orphaned in the queue.
+        post_exc = KazooClient._terminal_call_exception(
+            self._state_machine.state
+        )
+        if post_exc is not None:
+            if self._request_manager.remove_queued(request, async_object):
+                if async_object is not None:
+                    async_object.set_exception(post_exc)
+                return False
+            return None
 
         # Wake connection unconditionally on every enqueue to prevent
         # lost-wakeup races. If profiling high-throughput workloads
@@ -968,9 +985,10 @@ class KazooClient:
         # _drain_wakeup).
         if not self._connection.wake():
             if self._request_manager.remove_queued(request, async_object):
-                async_object.set_exception(
-                    ConnectionClosedError("Connection has been closed")
-                )
+                if async_object is not None:
+                    async_object.set_exception(
+                        ConnectionClosedError("Connection has been closed")
+                    )
                 return False
         return None
 
@@ -1040,6 +1058,11 @@ class KazooClient:
                     cur_state.is_connecting_allowed
                     and not self._connection.connection_stopped.is_set()
                 ):
+                    if (
+                        self._conn_result is not None
+                        and not self._conn_result.ready()
+                    ):
+                        return self._conn_result
                     self._conn_result = self.handler.async_result()
                     return self._conn_result
 

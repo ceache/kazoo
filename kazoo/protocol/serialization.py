@@ -110,6 +110,8 @@ def _read_required_string(
 
 def _read_acl(bytes: bytes | memoryview, offset: int) -> tuple[ACL, int]:
     perms = int_struct.unpack_from(bytes, offset)[0]
+    if perms < 0:
+        raise MarshallingError(f"Invalid ACL permissions: {perms}")
     offset += int_struct.size
     scheme, offset = _read_required_string(bytes, offset)
     id, offset = _read_required_string(bytes, offset)
@@ -145,20 +147,6 @@ def _write_acls(buf: bytearray, acls: Sequence[ACL]) -> None:
         buf.extend(int_struct.pack(acl.perms))
         _write_string_into(buf, acl.id.scheme)
         _write_string_into(buf, acl.id.id)
-
-
-def _write_string(bytes: str | None) -> bytes:
-    # FIXME? This doesn't seem to behave sensibly if you pass in an empty
-    # string. It will write a length of -1, which is the same as if you passed
-    # in None. Shouldn't it write a length of 0 for an empty string? Or is
-    # this just how the zookeeper protocol works?. This is different to
-    # write_buffer, which writes a length of 0 for an empty buffer and -1 for
-    # None.
-    if not bytes:
-        return _NEG_ONE_INT
-    else:
-        utf8_str = bytes.encode("utf-8")
-        return int_struct.pack(len(utf8_str)) + utf8_str
 
 
 def _read_buffer(
@@ -965,6 +953,8 @@ class ResponsePacket:
 class FrameDecoder:
     """Sans-I/O length-prefixed frame codec and server packet decoder."""
 
+    _SHRINK_HYSTERESIS = 32
+
     __slots__ = (
         "_max_buffer",
         "_max_payload",
@@ -979,6 +969,7 @@ class FrameDecoder:
         "_scan",
         "_frame_len",
         "_skip",
+        "_small_frames_since_grow",
         "_pop_pending",
     )
 
@@ -1006,6 +997,7 @@ class FrameDecoder:
         self._frame_len = -1
         # Remaining payload/trailing bytes of an oversize frame still to skip.
         self._skip = 0
+        self._small_frames_since_grow = 0
         self._pop_pending = pop_pending
 
     def _ensure_buffer(self) -> memoryview:
@@ -1016,14 +1008,18 @@ class FrameDecoder:
             self._empty_view = self._view[:READ_WINDOW]
         return self._view
 
-    def _grow_buffer(self, min_size: int) -> memoryview:
-        """Grow buffer up to ``_capacity``, preserving ``[head:tail]``."""
-        new_size = min(self._capacity, max(min_size, len(self._buf) * 2))
-        new_buf = bytearray(new_size)
+    def _grow_buffer(self, needed_from_head: int) -> memoryview:
+        """Grow buffer up to ``_capacity``, compacting ``[head:tail]`` to 0."""
         head = self._head
         tail = self._tail
-        if tail > head:
-            new_buf[head:tail] = self._buf[head:tail]
+        p = tail - head
+        new_size = min(
+            self._capacity, max(needed_from_head, len(self._buf) * 2)
+        )
+        new_buf = bytearray(new_size)
+        if p > 0:
+            assert self._view is not None
+            new_buf[:p] = self._view[head:tail]
         if self._empty_view is not None:
             self._empty_view.release()
         if self._view is not None:
@@ -1031,6 +1027,10 @@ class FrameDecoder:
         self._buf = new_buf
         self._view = memoryview(self._buf)
         self._empty_view = self._view[:READ_WINDOW]
+        self._head = 0
+        self._tail = p
+        self._scan -= head
+        self._small_frames_since_grow = 0
         return self._view
 
     def _shrink_to_initial(self) -> None:
@@ -1042,6 +1042,7 @@ class FrameDecoder:
         self._buf = bytearray(self._initial_capacity)
         self._view = memoryview(self._buf)
         self._empty_view = self._view[:READ_WINDOW]
+        self._small_frames_since_grow = 0
 
     def reset(self) -> None:
         """Clear buffered bytes and any pending oversize skip count."""
@@ -1050,6 +1051,7 @@ class FrameDecoder:
         self._scan = 0
         self._frame_len = -1
         self._skip = 0
+        self._small_frames_since_grow = 0
         if len(self._buf) > self._initial_capacity:
             self._shrink_to_initial()
 
@@ -1059,7 +1061,12 @@ class FrameDecoder:
         The decoder may be reused afterward; the next :meth:`get_buffer`
         call allocates a fresh buffer.
         """
-        self.reset()
+        self._head = 0
+        self._tail = 0
+        self._scan = 0
+        self._frame_len = -1
+        self._skip = 0
+        self._small_frames_since_grow = 0
         if self._empty_view is not None:
             self._empty_view.release()
             self._empty_view = None
@@ -1232,7 +1239,17 @@ class FrameDecoder:
         if end <= tail:
             raise BufferError("pop frames before requesting a buffer")
         if end > len(self._buf):
-            view = self._grow_buffer(end)
+            head = self._head
+            shifted_end = max(READ_WINDOW, end - head)
+            if shifted_end <= len(self._buf):
+                view[:p] = view[head:tail]
+                self._head = 0
+                self._tail = p
+                self._scan -= head
+            else:
+                view = self._grow_buffer(shifted_end)
+            tail = self._tail
+            end = shifted_end
         return view[tail:end]
 
     def buffer_updated(self, nbytes: int) -> None:
@@ -1390,12 +1407,16 @@ class FrameDecoder:
             return self._decode_packet(frame_view)
         finally:
             frame_view.release()
-            if (
-                self._head == self._tail
-                and n <= MOVE_MAX
-                and len(self._buf) > self._initial_capacity
-            ):
-                self._shrink_to_initial()
+            if n > MOVE_MAX:
+                self._small_frames_since_grow = 0
+            elif len(self._buf) > self._initial_capacity:
+                self._small_frames_since_grow += 1
+                if (
+                    self._head == self._tail
+                    and self._small_frames_since_grow
+                    >= self._SHRINK_HYSTERESIS
+                ):
+                    self._shrink_to_initial()
 
     def _decode_packet(self, frame: bytes | memoryview) -> ServerPacket:
         """Internal helper to decode a complete raw frame into a ServerPacket.

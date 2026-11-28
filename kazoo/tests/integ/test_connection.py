@@ -12,7 +12,7 @@ from kazoo.exceptions import ConnectionLoss, ReplyTooLargeError
 from kazoo.protocol.connection import _CONNECTION_DROP
 from kazoo.protocol.serialization import (
     Connect,
-    _write_string,
+    _write_string_into,
     int_struct,
 )
 from kazoo.protocol.states import KazooState
@@ -24,7 +24,7 @@ class Delete(namedtuple("Delete", "path version")):
 
     def serialize(self):
         b = bytearray()
-        b.extend(_write_string(self.path))
+        _write_string_into(b, self.path)
         b.extend(int_struct.pack(self.version))
         return b
 
