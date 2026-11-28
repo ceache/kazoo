@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
     from gevent import Greenlet
 
-    from kazoo.interfaces import Lockable, Socket
+    from kazoo.interfaces import Event, Lockable, Socket
     from kazoo.protocol.states import Callback
 
 _using_libevent = gevent.__version__.startswith("0.")
@@ -164,9 +164,9 @@ class SequentialGeventHandler:
     def create_socket_pair(self) -> tuple[Socket, Socket]:
         return utils.create_socket_pair(socket)
 
-    def event_object(self) -> gevent.event.Event:
+    def event_object(self) -> Event:
         """Create an appropriate Event object"""
-        return gevent.event.Event()
+        return cast("Event", gevent.event.Event())
 
     def lock_object(self) -> Lockable:
         """Create an appropriate Lock object"""

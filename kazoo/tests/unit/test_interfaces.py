@@ -132,3 +132,27 @@ def test_handlers_expose_create_selector_and_no_legacy_select() -> None:
         finally:
             s_a.close()
             s_b.close()
+
+
+def test_builtin_handlers_satisfy_ihandler_protocol() -> None:
+    """All built-in handlers satisfy IHandler for KazooClient."""
+    from kazoo.client import KazooClient
+
+    h_thread: IHandler = SequentialThreadingHandler()
+    KazooClient(handler=h_thread)
+
+    try:
+        from kazoo.handlers.gevent import SequentialGeventHandler
+    except ImportError:
+        pass
+    else:
+        h_gevent: IHandler = SequentialGeventHandler()
+        KazooClient(handler=h_gevent)
+
+    try:
+        from kazoo.handlers.eventlet import SequentialEventletHandler
+    except ImportError:
+        pass
+    else:
+        h_eventlet: IHandler = SequentialEventletHandler()
+        KazooClient(handler=h_eventlet)

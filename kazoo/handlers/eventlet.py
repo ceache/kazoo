@@ -263,7 +263,7 @@ class SequentialEventletHandler:
         eventlet.sleep(0)  # type: ignore[no-untyped-call]
 
     def async_result(self) -> AsyncResult:
-        return AsyncResult(self)  # type: ignore[arg-type]
+        return AsyncResult(self)
 
     def spawn(
         self, func: Any, *args: Any, **kwargs: Any

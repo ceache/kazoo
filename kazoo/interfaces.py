@@ -113,7 +113,7 @@ class ReentrantLock(Protocol):
     In python 3.14+, it's the same as Lock, which adds to the fun.
     """
 
-    def __enter__(self) -> None: ...
+    def __enter__(self) -> bool | None: ...
 
     def __exit__(
         self,
@@ -141,8 +141,6 @@ class Event(Protocol):
 
 class Threadlike(Protocol):
     """Protocol for something like a thread."""
-
-    def is_alive(self) -> bool: ...
 
     def join(self, timeout: float | None = None) -> None: ...
 
@@ -184,10 +182,16 @@ class IHandler(Protocol):
     """
 
     # FIXME These should be methods but I want to avoid changing the API for
-    # now.
-    timeout_exception: type[Exception] = None  # type: ignore[assignment]
-    sleep_func: Callable[[float], Any] = None  # type: ignore[assignment]
-    queue_impl: type[Any] = None  # type: ignore[assignment]
+    # now. Declared as read-only properties on the Protocol so implementations
+    # may provide class attributes, nested exception classes, or staticmethods.
+    @property
+    def timeout_exception(self) -> type[BaseException]: ...
+
+    @property
+    def sleep_func(self) -> Callable[[float], Any]: ...
+
+    @property
+    def queue_impl(self) -> type[Any]: ...
 
     def start(self) -> None:
         """Start the handler, used for setting up the handler."""
@@ -352,7 +356,7 @@ class IAsyncResult(Protocol):
         :meth:`set_exception` has been called or until the optional
         timeout occurs."""
 
-    def rawlink(self, callback: Callable[[IAsyncResult], Any]) -> None:
+    def rawlink(self, callback: Callable[[Any], Any], /) -> None:
         """Register a callback to call when a value or an exception is
         set
 
@@ -364,7 +368,7 @@ class IAsyncResult(Protocol):
 
         """
 
-    def unlink(self, callback: Callable[[IAsyncResult], None]) -> None:
+    def unlink(self, callback: Callable[[Any], Any], /) -> None:
         """Remove the callback set by :meth:`rawlink`
 
         :param callback: A callback function to remove.
@@ -373,6 +377,6 @@ class IAsyncResult(Protocol):
         """
 
     @property
-    def exception(self) -> Exception | None:
+    def exception(self) -> BaseException | None:
         """The exception set by :meth:`set_exception` or `None` if no
         exception has been set"""
