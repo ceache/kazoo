@@ -571,6 +571,27 @@ def _reconnect_after_drop(
     )
 
 
+def _closed_effects(
+    reason: str = "Connection closed",
+) -> tuple[SideEffect, ...]:
+    return (
+        CloseSocket(reason),
+        LogStateTransition(
+            logging.INFO,
+            "Zookeeper session closed, state: %s",
+            (KeeperState.CLOSED,),
+        ),
+        ResolveConnectResult(
+            success=False,
+            exception=ConnectionClosedError("Connection closed"),
+        ),
+        EmitKazooStateChange(KazooState.LOST),
+        FailPendingRequests(KeeperState.CLOSED),
+        ResetSessionData(),
+        StopConnectionLoop(),
+    )
+
+
 def _finalize_connected(
     host: str | None,
     port: int | None,
@@ -673,6 +694,8 @@ def transition(
             Connected() | ConnectedReadOnly(),
             HeartbeatDeadlineReached(),
         ):
+            if state.ping_outstanding or not state.is_connecting_allowed:
+                return state, _NO_EFFECTS
             return (
                 replace(state, ping_outstanding=True),
                 _EFFECTS_SEND_PING,
@@ -689,6 +712,18 @@ def transition(
             HeartbeatDeadlineReached(),
         ):
             return state, _NO_EFFECTS
+
+        case (
+            Connected(ping_outstanding=True, is_connecting_allowed=False)
+            | ConnectedReadOnly(
+                ping_outstanding=True, is_connecting_allowed=False
+            ),
+            PollTimeoutExpired(),
+        ):
+            return (
+                Inactive(),
+                _closed_effects("outstanding heartbeat ping not received"),
+            )
 
         case (
             Connected(ping_outstanding=True)
@@ -1153,23 +1188,14 @@ def transition(
             )
 
         case (_, SessionClosedEvent() | CloseRequested()):
-            closed_effects: tuple[SideEffect, ...] = (
-                CloseSocket("Connection closed"),
-                LogStateTransition(
-                    logging.INFO,
-                    "Zookeeper session closed, state: %s",
-                    (KeeperState.CLOSED,),
-                ),
-                ResolveConnectResult(
-                    success=False,
-                    exception=ConnectionClosedError("Connection closed"),
-                ),
-                EmitKazooStateChange(KazooState.LOST),
-                FailPendingRequests(KeeperState.CLOSED),
-                ResetSessionData(),
-                StopConnectionLoop(),
-            )
-            return Inactive(), closed_effects
+            return Inactive(), _closed_effects("Connection closed")
+
+        case (
+            Connected(is_connecting_allowed=False)
+            | ConnectedReadOnly(is_connecting_allowed=False),
+            ConnectionLostEvent(reason=reason),
+        ):
+            return Inactive(), _closed_effects(reason or "Connection lost")
 
         case (
             Connected(
@@ -1219,6 +1245,13 @@ def transition(
             return _reconnect_after_drop(state, k_state), (
                 CloseSocket(reason=reason or "Connection lost"),
             )
+
+        case (
+            Connected(is_connecting_allowed=False)
+            | ConnectedReadOnly(is_connecting_allowed=False),
+            RWServerFoundEvent(),
+        ):
+            return Inactive(), _closed_effects("Found RW server")
 
         case (
             Connected(

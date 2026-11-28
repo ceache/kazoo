@@ -801,23 +801,40 @@ class TestPureTransitionMatrix:
         assert s1_again == s1
         assert eff_again == ()
 
-        s2, _ = transition(s1, ConnectionLostEvent(reason="dropped"))
-        assert isinstance(s2, Suspended)
-        assert s2.is_connecting_allowed is False
+        # Drop during graceful close transitions directly to Inactive
+        # without emitting spurious SUSPENDED or InvalidateWatchers.
+        s2, eff2 = transition(s1, ConnectionLostEvent(reason="dropped"))
+        assert isinstance(s2, Inactive)
+        assert EmitKazooStateChange(KazooState.LOST) in eff2
+        assert EmitKazooStateChange(KazooState.SUSPENDED) not in eff2
+        assert InvalidateWatchers() not in eff2
 
-        # Closing ConnectedReadOnly preserves is_connecting_allowed=False on
-        # RWServerFoundEvent and SessionExpiredEvent.
+        # HeartbeatDeadlineReached while closing or with ping already
+        # outstanding is a no-op.
+        assert transition(s1, HeartbeatDeadlineReached()) == (s1, ())
+        pinging = Connected(
+            host="127.0.0.1", port=2181, session_id=42, ping_outstanding=True
+        )
+        assert transition(pinging, HeartbeatDeadlineReached()) == (pinging, ())
+
+        # PollTimeoutExpired(ping_outstanding=True) and RWServerFoundEvent
+        # while closing transition directly to Inactive.
         closing_ro = ConnectedReadOnly(
             host="127.0.0.1",
             port=2181,
             session_id=42,
+            ping_outstanding=True,
             is_connecting_allowed=False,
         )
-        s_rw, _ = transition(
+        s_to, eff_to = transition(closing_ro, PollTimeoutExpired())
+        assert isinstance(s_to, Inactive)
+        assert EmitKazooStateChange(KazooState.SUSPENDED) not in eff_to
+
+        s_rw, eff_rw = transition(
             closing_ro, RWServerFoundEvent(server=("127.0.0.2", 2181))
         )
-        assert isinstance(s_rw, Suspended)
-        assert s_rw.is_connecting_allowed is False
+        assert isinstance(s_rw, Inactive)
+        assert EmitKazooStateChange(KazooState.SUSPENDED) not in eff_rw
 
         s_exp, _ = transition(closing_ro, SessionExpiredEvent(session_id=42))
         assert isinstance(s_exp, ExpiredSession)
@@ -2234,7 +2251,7 @@ class TestExhaustiveTransitionMatrix:
         assert s_idem == closing_state
         assert eff_idem == ()
 
-        # [C-7] Non-default ConnectionLostEvent in Connecting stays Connecting
+        # Non-default ConnectionLostEvent in Connecting stays Connecting
         # and never emits KazooState.SUSPENDED.
         c_state = Connecting(host="127.0.0.1", port=2181, attempt=2)
         c_next, c_eff = transition(
@@ -2246,7 +2263,7 @@ class TestExhaustiveTransitionMatrix:
         assert c_next == c_state
         assert c_eff == ()
 
-        # [C-7] Non-default ConnectionLostEvent in Suspended preserves metadata
+        # Non-default ConnectionLostEvent in Suspended preserves metadata
         # and is_connecting_allowed=False without emitting KazooState change.
         susp = Suspended(
             host="10.0.0.1",
@@ -2270,7 +2287,7 @@ class TestExhaustiveTransitionMatrix:
         assert susp_next.keeper_state == KeeperState.CLOSED
         assert not any(isinstance(e, EmitKazooStateChange) for e in susp_eff)
 
-        # [C-11] ConnectResponseReceived populates Connected.session_passwd
+        # ConnectResponseReceived populates Connected.session_passwd
         # atomically so KazooClient.client_id never observes a torn pair.
         s_conn, _ = transition(
             Handshaking(host="127.0.0.1", port=2181),
@@ -2358,7 +2375,7 @@ class TestWatcherManager:
 def test_driver_post_dispatch_runs_outside_lock_and_is_terminal_state() -> (
     None
 ):
-    """[M-4][C-5] post_dispatch runs after _dispatch_lock is released."""
+    """post_dispatch runs after _dispatch_lock is released."""
     import threading
 
     from kazoo.protocol.statemachine import is_terminal_state
